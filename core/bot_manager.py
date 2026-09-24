@@ -29,6 +29,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 MODES = ("paper", "live")
 TIMEFRAMES = ("1m", "5m", "15m", "1h", "1d")
 _SYMBOL = re.compile(r"^[A-Z][A-Z.]{0,9}$")
+IS_WINDOWS = os.name == "nt"
 
 
 def mode_env(mode: str, root: Path = PROJECT_ROOT) -> Dict[str, str]:
@@ -59,13 +60,34 @@ def clean_symbols(symbols: Any) -> List[str]:
 
 def tail(path: Path, lines: int = 80) -> List[str]:
     try:
-        with path.open(errors="replace") as fh:
+        with path.open(encoding="utf-8", errors="replace") as fh:
             return [line.rstrip("\n") for line in deque(fh, maxlen=lines)]
     except OSError:
         return []
 
 
+def _win_pid_alive(pid: int) -> bool:
+    """Windows: os.kill(pid, 0) would send a Ctrl+C event (signal 0 is
+    CTRL_C_EVENT there), so query the process handle instead."""
+    import ctypes
+
+    process_query_limited_information, still_active = 0x1000, 259
+    kernel32 = ctypes.windll.kernel32
+    handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
+    if not handle:
+        return False
+    try:
+        code = ctypes.c_ulong()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+            return False
+        return code.value == still_active
+    finally:
+        kernel32.CloseHandle(handle)
+
+
 def _pid_alive(pid: int) -> bool:
+    if IS_WINDOWS:
+        return _win_pid_alive(pid)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -97,7 +119,8 @@ class _Tracked:
 class ProcessSlot:
     """One managed background process (a bot mode, or the validation job)."""
 
-    def __init__(self, name: str, script: str, root: Path, popen: Callable = subprocess.Popen) -> None:
+    def __init__(self, name: str, script: str, root: Path, popen: Callable = subprocess.Popen,
+                 graceful_stop_file: bool = True) -> None:
         self.name = name
         self.script = script
         self.root = root
@@ -106,6 +129,10 @@ class ProcessSlot:
         self.log_path = self.dir / "process.log"
         self.pid_path = self.dir / "process.pid"
         self.meta_path = self.dir / "process.json"
+        # bot.py polls this file and stops gracefully (works on every OS;
+        # Windows has no SIGTERM, only a hard TerminateProcess).
+        self.stop_path = self.dir / "stop.request"
+        self.graceful_stop_file = graceful_stop_file
         self.tracked: Optional[_Tracked] = None
 
     def pid(self) -> Optional[int]:
@@ -130,14 +157,23 @@ class ProcessSlot:
             raise RuntimeError(f"{self.name} is already running")
         self.dir.mkdir(parents=True, exist_ok=True)
         command = [sys.executable, str(self.root / self.script), *args]
-        log = self.log_path.open("a")
+        self.stop_path.unlink(missing_ok=True)  # a stale request must not stop the new run
+        log = self.log_path.open("a", encoding="utf-8")
         stamp = datetime.now(timezone.utc).isoformat()
         log.write(f"\n===== {stamp} starting: {' '.join(command[1:])} =====\n")
         log.flush()
-        kwargs = dict(cwd=str(self.root), env={**os.environ, **env, "PYTHONUNBUFFERED": "1"},
+        child_env = {**os.environ, **env, "PYTHONUNBUFFERED": "1", "PYTHONUTF8": "1",
+                     "PYTHONIOENCODING": "utf-8"}
+        if self.graceful_stop_file:
+            child_env["BOT_STOP_FILE"] = str(self.stop_path)
+        kwargs = dict(cwd=str(self.root), env=child_env,
                       stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
-        if os.name == "posix":
-            kwargs["start_new_session"] = True  # Ctrl-C in the server terminal doesn't kill the bot mid-order
+        # Ctrl-C in the dashboard's terminal must not kill the bot mid-order.
+        if not IS_WINDOWS:
+            kwargs["start_new_session"] = True
+        else:
+            kwargs["creationflags"] = (getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                                       | getattr(subprocess, "CREATE_NO_WINDOW", 0))
         proc = self.popen(command, **kwargs)
         log.close()
         self.tracked = _Tracked(proc, stamp, command, settings)
@@ -146,12 +182,18 @@ class ProcessSlot:
         return self.status()
 
     def stop(self) -> bool:
+        """Ask the process to stop. Bots finish their current cycle first."""
         pid = self.pid()
         if pid is None:
             return False
+        if self.graceful_stop_file:
+            self.dir.mkdir(parents=True, exist_ok=True)
+            self.stop_path.write_text("stop")
+            if IS_WINDOWS:
+                return True  # the bot sees the file within a couple of seconds
         try:
-            os.kill(pid, signal.SIGTERM)
-        except ProcessLookupError:
+            os.kill(pid, signal.SIGTERM)  # POSIX: graceful; Windows (jobs only): immediate
+        except (ProcessLookupError, OSError):
             return False
         return True
 
@@ -180,7 +222,9 @@ class BotManager:
     def __init__(self, root: Path = PROJECT_ROOT, popen: Callable = subprocess.Popen) -> None:
         self.root = root
         self.bots = {mode: ProcessSlot(mode, "bot.py", root, popen) for mode in MODES}
-        self.validation = ProcessSlot("validate", "scripts/validate_and_train.py", root, popen)
+        # The validation job places no orders, so a hard stop is fine everywhere.
+        self.validation = ProcessSlot("validate", "scripts/validate_and_train.py", root, popen,
+                                      graceful_stop_file=False)
 
     # -- bots -----------------------------------------------------------
 

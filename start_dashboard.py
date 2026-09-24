@@ -49,6 +49,9 @@ def main() -> int:
             webbrowser.open(url)
 
     threading.Thread(target=open_browser, daemon=True).start()
+    from core.keep_awake import keep_awake
+
+    keep_awake()
     uvicorn.run("config.api.server:app", host="127.0.0.1", port=port, log_level="warning")
     return 0
 

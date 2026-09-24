@@ -34,6 +34,7 @@ import logging
 import os
 import signal
 import sys
+import time
 
 from dotenv import load_dotenv
 
@@ -52,6 +53,32 @@ def _env_int(name: str, default: int) -> int:
         return int(os.getenv(name, str(default)))
     except ValueError:
         return default
+
+
+def _watch_stop_file(bot, log, interval: float = 2.0) -> None:
+    """Stop gracefully when the dashboard writes BOT_STOP_FILE (portable:
+    Windows has no SIGTERM, only a hard kill)."""
+    path = os.getenv("BOT_STOP_FILE")
+    if not path:
+        return
+    import threading
+    from pathlib import Path
+
+    stop_file = Path(path)
+
+    def watch() -> None:
+        while not bot.stopped:
+            if stop_file.exists():
+                try:
+                    stop_file.unlink()
+                except OSError:
+                    pass
+                log.warning("Stop requested from the dashboard: finishing the current cycle, then stopping")
+                bot.stop("dashboard")
+                return
+            time.sleep(interval)
+
+    threading.Thread(target=watch, name="stop-file-watcher", daemon=True).start()
 
 
 def apply_mode_paths(mode: str) -> None:
@@ -261,6 +288,12 @@ def main(argv: list[str] | None = None) -> int:
 
     signal.signal(signal.SIGTERM, request_stop)
     signal.signal(signal.SIGINT, request_stop)
+    _watch_stop_file(bot, log)
+    if not args.once:
+        from core.keep_awake import keep_awake
+
+        if keep_awake():
+            log.info("Keeping this computer awake while the bot runs (KEEP_AWAKE=false to disable)")
 
     try:
         bot.run(max_cycles=1 if args.once else None)

@@ -42,7 +42,7 @@ def update_env(values: Mapping[str, Optional[str]], path: Optional[Path] = None)
         if value is not None and ("\n" in value or "\r" in value or "\x00" in value):
             raise ValueError(f"{name} must be a single line")
 
-    lines = path.read_text().splitlines() if path.exists() else []
+    lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
     pending: Dict[str, Optional[str]] = dict(values)
     out = []
     for line in lines:
@@ -61,15 +61,19 @@ def update_env(values: Mapping[str, Optional[str]], path: Optional[Path] = None)
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=".env.", dir=str(path.parent))
     try:
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w") as fh:
+        if hasattr(os, "fchmod"):  # POSIX: owner-only before any secret is written
+            os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write("\n".join(out) + "\n")
         os.replace(tmp, path)
     except BaseException:
         if os.path.exists(tmp):
             os.unlink(tmp)
         raise
-    os.chmod(path, 0o600)
+    try:
+        os.chmod(path, 0o600)  # Windows: files in your user folder are already private to your account
+    except OSError:
+        pass
 
     for name, value in values.items():
         if value is None:

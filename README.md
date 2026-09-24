@@ -74,6 +74,37 @@ The bot runs as its own background process (`bot.py --mode paper|live`), with se
 logs and state per mode under `logs/<mode>/` and `data/<mode>/`. It keeps running if you
 close the browser. Stop it from the dashboard.
 
+### Running it on your own computer (Windows or Mac)
+
+**One-time setup**
+1. **Install Python 3.12** from https://www.python.org/downloads/.
+   - Windows: on the first installer screen, tick **"Add python.exe to PATH"**.
+   - Mac: use the python.org installer. The built-in `python3` is often too old.
+2. **Mac only:** install Homebrew (https://brew.sh), then run `brew install libomp` in
+   Terminal. The ML library needs it.
+3. **Get the code:** on GitHub, pick the branch and choose **Code → Download ZIP**, then
+   unzip it somewhere permanent such as Documents. Alternatively, clone it with GitHub
+   Desktop or git.
+
+**Every time**
+- Windows: double-click **`start_dashboard.bat`**.
+- Mac: double-click **`start_dashboard.command`**. The first time, macOS may say it's
+  from an unidentified developer: right-click it, choose **Open**, then **Open** again.
+
+The first launch spends a few minutes installing packages into a private `.venv` folder.
+After that the dashboard opens in your browser at http://127.0.0.1:8000/dashboard. Keep
+the launcher window open while you trade.
+
+**Keep it running during market hours (9:30 am to 4:00 pm ET)**
+- While the bot runs it stops the computer from idle-sleeping, on both Windows and Mac.
+  Closing a laptop lid, shutting down, or losing Wi-Fi still stops it, so plug a laptop
+  in and leave it open.
+- If the computer goes to sleep or offline mid-day, broker-side stop-loss and
+  take-profit orders still protect your positions. But the 3:50 pm "close everything"
+  won't happen, so day trades would stay open overnight until the bot runs again.
+- Windows updates can restart your PC. Set **active hours** to cover the trading day
+  (Settings → Windows Update → Advanced options).
+
 ## Setup
 
 ### 1. Clone the Repository
