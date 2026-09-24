@@ -4,6 +4,7 @@ from typing import Optional
 
 import pytest
 
+from core.alpaca_executor import ExecutionResult
 from core.portfolio_manager import PortfolioManager
 from core.trading_workflow import TradingWorkflow
 
@@ -108,15 +109,15 @@ def test_workflow_submits_alpaca_paper_order_and_records_trade(
     submitted_signals = []
 
     class FakePaperExecutor:
-        def execute_signal(self, signal):
+        def submit(self, signal):
             submitted_signals.append(signal)
-            return {
+            return ExecutionResult(order={
                 "id": "alpaca-order-1",
                 "status": "accepted",
                 "symbol": signal["symbol"],
                 "side": signal["recommendation"].lower(),
                 "qty": str(signal["quantity"]),
-            }
+            })
 
     workflow = TradingWorkflow(
         portfolio_manager,
@@ -151,7 +152,7 @@ def test_workflow_does_not_submit_hold_to_alpaca(
     portfolio_manager.create_portfolio("paper", 10_000)
 
     class FailingPaperExecutor:
-        def execute_signal(self, signal):
+        def submit(self, signal):
             raise AssertionError("HOLD recommendations must not submit orders")
 
     workflow = TradingWorkflow(
@@ -170,3 +171,68 @@ def test_workflow_does_not_submit_hold_to_alpaca(
     assert result.alpaca_order is None
     assert result.recorded_trade_id is None
     assert result.skipped_reason == "No actionable trade recommendation"
+
+
+def test_workflow_records_risk_reduced_quantity_and_reports_blocks(
+    portfolio_manager: PortfolioManager,
+) -> None:
+    portfolio_manager.create_portfolio("paper", 10_000)
+    outcomes = iter(
+        [
+            ExecutionResult(order={"id": "o-1", "status": "accepted", "qty": "2"}),
+            ExecutionResult(skipped_reason="Daily loss limit hit"),
+        ]
+    )
+
+    class RiskAwareExecutor:
+        def submit(self, signal):
+            assert signal["price"] == 125.0
+            return next(outcomes)
+
+    workflow = TradingWorkflow(
+        portfolio_manager,
+        analysis_runner=lambda symbol, api_keys, portfolio_name: {
+            "symbol": symbol,
+            "recommendation": "BUY",
+            "quantity": 5,
+            "all_signals": {"technical": {"current_price": 125.0}},
+        },
+        api_key_loader=_api_keys,
+        paper_order_executor_factory=RiskAwareExecutor,
+    )
+
+    placed = workflow.run("AAPL", "paper", submit_alpaca_paper_order=True)
+    blocked = workflow.run("AAPL", "paper", submit_alpaca_paper_order=True)
+
+    assert portfolio_manager.get_trade_history("paper", 1)[0]["quantity"] == 2
+    assert placed.recorded_trade_id is not None
+    assert blocked.recorded_trade_id is None
+    assert blocked.skipped_reason == "Alpaca paper order was not submitted: Daily loss limit hit"
+
+
+def test_workflow_keeps_placed_order_when_local_record_fails(
+    portfolio_manager: PortfolioManager,
+) -> None:
+    portfolio_manager.create_portfolio("paper", 10_000)  # holds no AAPL locally
+
+    class SellExecutor:
+        def submit(self, signal):
+            return ExecutionResult(order={"id": "sell-1", "status": "accepted", "qty": "2"})
+
+    workflow = TradingWorkflow(
+        portfolio_manager,
+        analysis_runner=lambda symbol, api_keys, portfolio_name: {
+            "symbol": symbol,
+            "recommendation": "SELL",
+            "quantity": 2,
+            "all_signals": {"technical": {"current_price": 125.0}},
+        },
+        api_key_loader=_api_keys,
+        paper_order_executor_factory=SellExecutor,
+    )
+
+    result = workflow.run("AAPL", "paper", submit_alpaca_paper_order=True)
+
+    assert result.alpaca_order["id"] == "sell-1"
+    assert result.recorded_trade_id is None
+    assert result.skipped_reason.startswith("Order placed but not recorded locally")

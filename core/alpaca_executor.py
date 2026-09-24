@@ -12,22 +12,55 @@ Usage:
 
 import os
 import logging
-from typing import Dict, Optional
+from dataclasses import dataclass
+from datetime import datetime, time
+from typing import Any, Callable, Dict, List, Optional
+from zoneinfo import ZoneInfo
 
 import requests
 from dotenv import load_dotenv
 
+from core.risk_manager import RiskManager
+
 load_dotenv()
 logger = logging.getLogger(__name__)
+
+
+MARKET_TZ = ZoneInfo("America/New_York")
+
+
+@dataclass(frozen=True)
+class ExecutionResult:
+    """Outcome of submitting a signal: the broker order, or why it was skipped."""
+
+    order: Optional[Dict[str, Any]] = None
+    skipped_reason: Optional[str] = None
+
+
+def _default_price_lookup(symbol: str) -> float:
+    from core.candle_fetcher_provider import get_candlestick_fetcher
+
+    quote = get_candlestick_fetcher().fetch_realtime_quote(symbol)
+    return float(quote.get("current_price") or 0)
 
 
 class AlpacaExecutor:
     """
     Sends orders to Alpaca and returns results.
     Uses Alpaca paper trading by default.
+
+    Every order passes through a RiskManager first, and every BUY is sent as
+    a bracket order so its stop-loss and take-profit live at the broker.
     """
 
-    def __init__(self, base_url: Optional[str] = None):
+    def __init__(
+        self,
+        base_url: Optional[str] = None,
+        risk_manager: Optional[RiskManager] = None,
+        price_lookup: Optional[Callable[[str], float]] = None,
+    ):
+        self.risk_manager = risk_manager or RiskManager()
+        self.price_lookup = price_lookup or _default_price_lookup
         self.api_key = os.getenv("ALPACA_API_KEY")
         self.secret_key = os.getenv("ALPACA_SECRET_KEY")
         self.base_url = self._normalize_base_url(
@@ -96,47 +129,106 @@ class AlpacaExecutor:
         except requests.exceptions.HTTPError:
             return None
 
-    def is_market_open(self) -> bool:
-        """Return True if the US market is currently open."""
+    def get_orders_today(self) -> List[Dict]:
+        """Return all orders submitted since midnight US/Eastern."""
+        start = datetime.combine(datetime.now(MARKET_TZ).date(), time.min, tzinfo=MARKET_TZ)
+        resp = requests.get(
+            f"{self.base_url}/orders",
+            headers=self.headers,
+            params={
+                "status": "all",
+                "after": start.isoformat(),
+                "limit": 500,
+                "direction": "desc",
+            },
+            timeout=10,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def get_clock(self) -> Dict:
+        """Return Alpaca's market clock (is_open, next_open, next_close)."""
         resp = requests.get(
             f"{self.base_url}/clock", headers=self.headers, timeout=10
         )
         resp.raise_for_status()
-        return resp.json().get("is_open", False)
+        return resp.json()
+
+    def is_market_open(self) -> bool:
+        """Return True if the US market is currently open."""
+        return bool(self.get_clock().get("is_open", False))
 
     # ------------------------------------------------------------------
     # Order execution
     # ------------------------------------------------------------------
 
     def execute_signal(self, signal: Dict) -> Optional[Dict]:
-        """
-        Main entry point.  Pass the dict that pipeline.py returns and
-        this will place the order when conditions are right.
+        """Submit a signal and return the Alpaca order, or None if skipped."""
+        return self.submit(signal).order
 
-        Returns the Alpaca order dict on success, None if skipped.
+    def submit(self, signal: Dict) -> ExecutionResult:
+        """
+        Main entry point.  Pass the dict that pipeline.py returns and this
+        will run risk checks and place the order when conditions are right.
+
+        Recognised keys: symbol, recommendation/signal, quantity, and
+        optionally price and risk_parameters.stop_loss/take_profit.
         """
         action = str(signal.get("recommendation") or signal.get("signal") or "HOLD").upper()
         symbol = str(signal.get("symbol") or "").upper()
         quantity = int(signal.get("quantity") or 0)
 
-        if action == "HOLD" or quantity <= 0 or not symbol:
+        if action not in {"BUY", "SELL"} or quantity <= 0 or not symbol:
             logger.info(f"Skipping execution: {action} {quantity} {symbol}")
-            return None
+            return ExecutionResult(skipped_reason="No actionable BUY/SELL signal")
 
-        # Safety check — don't queue market orders while the market is
-        # closed; they would fill at an unknown price at the next open.
+        # Don't queue market orders while the market is closed; they would
+        # fill at an unknown price at the next open.
         if not self.is_market_open():
-            logger.warning(
-                f"Market is closed. Skipping {action} {quantity} {symbol}."
-            )
-            return None
+            logger.warning(f"Market is closed. Skipping {action} {quantity} {symbol}.")
+            return ExecutionResult(skipped_reason="Market is closed")
 
+        risk = signal.get("risk_parameters") or {}
+        position = self.get_position(symbol)
+        price = float(signal.get("price") or 0)
         if action == "BUY":
-            return self._place_order(symbol, quantity, "buy")
-        elif action == "SELL":
-            return self._verify_and_sell(symbol, quantity)
+            # Analysis prices can be an hour old; size and set stops off a
+            # live quote when one is available.
+            try:
+                live_price = float(self.price_lookup(symbol) or 0)
+            except Exception as exc:
+                logger.warning(f"Live quote for {symbol} failed, using signal price: {exc}")
+                live_price = 0.0
+            price = live_price or price
 
-        return None
+        decision = self.risk_manager.check_order(
+            side=action,
+            symbol=symbol,
+            quantity=quantity,
+            price=price,
+            account=self.get_account(),
+            position=position,
+            orders_today=self.get_orders_today() if action == "BUY" else (),
+            stop_loss=risk.get("stop_loss"),
+            take_profit=risk.get("take_profit"),
+        )
+        if not decision.approved:
+            logger.warning(f"Risk check blocked {action} {quantity} {symbol}: {decision.reason}")
+            return ExecutionResult(skipped_reason=decision.reason)
+
+        try:
+            if action == "SELL":
+                # Bracket stop/target legs reserve the shares; release them first.
+                self.cancel_open_orders(symbol)
+                return ExecutionResult(order=self._place_order(symbol, decision.quantity, "sell"))
+
+            order = self._place_bracket_order(
+                symbol, decision.quantity, decision.stop_loss, decision.take_profit
+            )
+            return ExecutionResult(order=order)
+        except requests.exceptions.HTTPError as exc:
+            detail = exc.response.text if exc.response is not None else str(exc)
+            return ExecutionResult(skipped_reason=f"Alpaca rejected the order: {detail}")
 
     def _place_order(
         self,
@@ -175,22 +267,42 @@ class AlpacaExecutor:
         )
         return order
 
-    def _verify_and_sell(self, symbol: str, quantity: int) -> Optional[Dict]:
-        """Only sell what we actually own — avoids shorting by accident."""
-        position = self.get_position(symbol)
+    def _place_bracket_order(
+        self,
+        symbol: str,
+        quantity: int,
+        stop_loss: float,
+        take_profit: float,
+    ) -> Dict:
+        """Buy at market with a broker-side stop-loss and take-profit attached."""
+        payload = {
+            "symbol": symbol,
+            "qty": str(quantity),
+            "side": "buy",
+            "type": "market",
+            "time_in_force": "gtc",
+            "order_class": "bracket",
+            "take_profit": {"limit_price": str(take_profit)},
+            "stop_loss": {"stop_price": str(stop_loss)},
+        }
 
-        if not position:
-            logger.warning(f"SELL skipped: no position in {symbol}")
-            return None
+        logger.info(
+            f"Placing bracket order: BUY {quantity} {symbol} "
+            f"stop ${stop_loss} target ${take_profit}"
+        )
+        resp = requests.post(
+            f"{self.base_url}/orders",
+            headers=self.headers,
+            json=payload,
+            timeout=10,
+        )
+        if not resp.ok:
+            logger.error(f"Order failed: {resp.status_code} {resp.text}")
+            resp.raise_for_status()
 
-        owned = int(float(position.get("qty", 0)))
-        sell_qty = min(quantity, owned)
-
-        if sell_qty <= 0:
-            logger.warning(f"SELL skipped: qty {sell_qty} for {symbol}")
-            return None
-
-        return self._place_order(symbol, sell_qty, "sell")
+        order = resp.json()
+        logger.info(f"Bracket order placed — ID: {order['id']} | BUY {order['qty']} {order['symbol']}")
+        return order
 
     # ------------------------------------------------------------------
     # Trailing stop helper (from video concept)
@@ -239,6 +351,23 @@ class AlpacaExecutor:
         resp.raise_for_status()
         logger.info("All open orders cancelled")
         return resp.json() if resp.text else []
+
+    def cancel_open_orders(self, symbol: str) -> int:
+        """Cancel open orders for one symbol (e.g. bracket legs) before an exit."""
+        resp = requests.get(
+            f"{self.base_url}/orders",
+            headers=self.headers,
+            params={"status": "open", "symbols": symbol, "nested": "false"},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        cancelled = 0
+        for order in resp.json():
+            if order.get("symbol") == symbol and self.cancel_order(order["id"]):
+                cancelled += 1
+        if cancelled:
+            logger.info(f"Cancelled {cancelled} open order(s) for {symbol} before exit")
+        return cancelled
 
     def cancel_order(self, order_id: str) -> bool:
         """Cancel a single order by ID."""

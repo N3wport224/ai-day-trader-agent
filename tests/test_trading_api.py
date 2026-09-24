@@ -17,6 +17,7 @@ from config.api.trading import (
     router,
 )
 from core.alpaca_executor_provider import clear_alpaca_executor_cache
+from core.alpaca_executor import ExecutionResult
 from core.portfolio_manager import PortfolioManager
 
 
@@ -100,15 +101,15 @@ async def test_submit_paper_order_uses_executor(current_user):
     submitted = []
 
     class FakeExecutor:
-        def execute_signal(self, signal):
+        def submit(self, signal):
             submitted.append(signal)
-            return {
+            return ExecutionResult(order={
                 "id": "order-1",
                 "status": "accepted",
                 "symbol": signal["symbol"],
                 "side": signal["recommendation"].lower(),
                 "qty": str(signal["quantity"]),
-            }
+            })
 
     result = await submit_paper_order(
         request=PaperOrderRequest(symbol="aapl", action="buy", quantity=5),

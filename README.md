@@ -165,6 +165,37 @@ python run.py --analyze-portfolio
 python run.py --analyze-portfolio --portfolio my_portfolio
 ```
 
+### Scheduled Trading Bot
+
+`bot.py` scans a watchlist while the market is open. It is a dry run by
+default: it analyzes and logs, and places no orders.
+
+```bash
+# Dry run every 15 minutes
+python bot.py --symbols AAPL,MSFT,NVDA
+
+# Trade on Alpaca paper with risk limits from .env
+python bot.py --symbols AAPL,MSFT,NVDA --portfolio default --execute
+
+# One cycle and exit (for cron)
+python bot.py --once --execute
+```
+
+Every order, whether from the bot, the CLI (`--paper-trade`), the API or
+the dashboard, goes through the same safeguards:
+
+- **Bracket orders**: each BUY is sent with a broker-side stop-loss and
+  take-profit, so the position is protected even if the bot stops running.
+  The strategy's ATR-based levels are used when they fit the live price,
+  otherwise `STOP_LOSS_PCT` / `TAKE_PROFIT_PCT`.
+- **Risk checks** (`core/risk_manager.py`): kill switch (`TRADING_ENABLED`),
+  daily loss limit (`MAX_DAILY_LOSS_PCT`), daily entry limit
+  (`MAX_DAILY_TRADES`), per-symbol position cap (`MAX_PORTFOLIO_ALLOCATION`
+  of equity), buying power, and `MIN_PRICE`. Orders are shrunk to fit, never
+  enlarged. Exits are allowed even after the loss limit trips.
+- **No orders while the market is closed**, and sells never exceed the shares
+  held (no accidental shorts).
+
 ### REST API Server
 
 The AI Day Trader Agent now includes a professional REST API with WebSocket support for real-time updates.
