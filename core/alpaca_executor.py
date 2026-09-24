@@ -281,14 +281,26 @@ class AlpacaExecutor:
             if action == "SELL":
                 # Bracket stop/target legs reserve the shares; release them first.
                 self.cancel_open_orders(symbol)
-                return ExecutionResult(order=self._place_order(symbol, decision.quantity, "sell"))
+                order = self._place_order(symbol, decision.quantity, "sell")
+                self._record_submitted(order, symbol, "sell", decision.quantity)
+                return ExecutionResult(order=order)
 
             order = self._place_bracket_order(
                 symbol, decision.quantity, decision.stop_loss, decision.take_profit
             )
+            self._record_submitted(order, symbol, "buy", decision.quantity, decision.stop_loss, decision.take_profit)
             return ExecutionResult(order=order)
         except requests.exceptions.HTTPError as exc:
             return self._recover_from_rejection(exc, action, symbol, decision.quantity, price)
+
+    def _record_submitted(self, order: Dict, symbol: str, side: str, qty: int,
+                          stop_loss: Optional[float] = None, take_profit: Optional[float] = None,
+                          recovered: bool = False) -> None:
+        self.telemetry.record(
+            "order_submitted", symbol=symbol, side=side, qty=int(float(order.get("qty") or qty)),
+            order_id=order.get("id"), status=order.get("status"), stop_loss=stop_loss,
+            take_profit=take_profit, recovered=recovered,
+        )
 
     # ------------------------------------------------------------------
     # Rejection handling
@@ -361,6 +373,7 @@ class AlpacaExecutor:
             )
         self.telemetry.record("order_recovered", symbol=symbol, side=action, category=rejection.category,
                               order_id=order.get("id"), plan=plan)
+        self._record_submitted(order, symbol, action.lower(), quantity, recovered=True)
         return ExecutionResult(order=order, rejection=rejection, recovered=True)
 
     def _place_order(

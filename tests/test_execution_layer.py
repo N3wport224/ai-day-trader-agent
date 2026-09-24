@@ -100,7 +100,10 @@ def test_buying_power_rejection_retries_smaller(monkeypatch, executor) -> None:
     assert attempts == [100, 48]  # 5000 * 0.97 // 100
     assert result.recovered and result.order["id"] == "o-2"
     assert result.rejection.category == "buying_power"
-    assert [e["event"] for e in executor.telemetry.events] == ["order_rejected", "order_retry", "order_recovered"]
+    assert [e["event"] for e in executor.telemetry.events] == [
+        "order_rejected", "order_retry", "order_recovered", "order_submitted",
+    ]
+    assert executor.telemetry.events[-1]["recovered"] is True and executor.telemetry.events[-1]["qty"] == 48
 
 
 def test_wash_trade_on_exit_cancels_legs_and_retries(monkeypatch, executor) -> None:

@@ -309,6 +309,38 @@ Backtest the intraday rules (opening lockout, cutoff, 15:50 forced close,
 python scripts/backtest.py --timeframe 5m --days 60 --no-overnight --opening-lockout-minutes 15 --compare
 ```
 
+#### Running unattended: alerts, heartbeat, session report, shutdown
+
+- **Alerts** (`core/alerts.py`): set `ALERT_WEBHOOK_URL` to a Discord or Slack
+  incoming webhook to get one-line messages for order submissions, broker
+  rejections (with root cause), recoveries, the EOD flatten result (including
+  any position that failed to close), drawdown-breaker trips, broker/local
+  mismatches, failed trailing-stop updates, the end-of-session report and bot
+  start/stop/errors. Sending is asynchronous and throttled, and a broken
+  webhook never affects trading. Every event is also in
+  `logs/execution_events.jsonl`.
+- **Session report**: on the first cycle after the close, the bot records the
+  day's P&L (equity vs the previous close), fills and open positions, and
+  flags `NOT FLAT` if anything is still open in no-overnight mode.
+- **Heartbeat**: `logs/heartbeat.json` is rewritten atomically every cycle
+  (phase, positions, errors, entry blocks, seconds to the next cycle). Point
+  your monitoring at its modification time; if it goes stale, the bot is down.
+- **Shutdown**: SIGTERM or Ctrl-C finishes the current cycle and exits
+  cleanly (it interrupts the wait between cycles, never an order in flight);
+  a second signal forces the exit. A cycle that throws is logged and alerted
+  as `bot_error` and the bot keeps running.
+
+Example systemd unit (paper trading, restarts on crash):
+
+```ini
+[Service]
+WorkingDirectory=/opt/ai-day-trader-agent
+ExecStart=/opt/ai-day-trader-agent/venv/bin/python bot.py --timeframe 5m --execute
+Restart=on-failure
+KillSignal=SIGTERM
+TimeoutStopSec=120
+```
+
 #### Backtesting
 
 `scripts/backtest.py` replays the whole path on history using the live code:
@@ -341,6 +373,18 @@ Benchmark the new layers against the old behaviour on identical data with
 
 ```bash
 python scripts/backtest.py --regime suppress --mtf --mtf-gate --sizing kelly --trailing --compare --out reports/cmp
+```
+
+Use `--folds N` for a rolling walk-forward: the unseen period is split into
+N consecutive blocks and a fresh model is trained before each one on all
+earlier data. The report shows each fold, pooled out-of-sample stats and how
+many folds had positive average R; an edge that shows up in only one period
+is flagged. Every report also breaks trades down **by entry regime** and
+(intraday) **by entry hour**, so you can see whether losses cluster in
+CHOPPY/bear regimes or at the open (`by_regime.csv`, `by_entry_hour.csv`).
+
+```bash
+python scripts/backtest.py --timeframe 5m --days 120 --folds 4 --compare --out reports/wf
 ```
 
 The report shows return vs. equal-weight buy-and-hold, max drawdown, daily

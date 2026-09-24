@@ -37,3 +37,5 @@ def _isolate_runtime_files(tmp_path: Path, monkeypatch) -> None:
     """Keep telemetry and trailing-stop state out of the repo during tests."""
     monkeypatch.setenv("EXECUTION_LOG_PATH", str(tmp_path / "execution_events.jsonl"))
     monkeypatch.setenv("TRAILING_STATE_PATH", str(tmp_path / "trailing_state.json"))
+    monkeypatch.setenv("HEARTBEAT_PATH", str(tmp_path / "heartbeat.json"))
+    monkeypatch.delenv("ALERT_WEBHOOK_URL", raising=False)

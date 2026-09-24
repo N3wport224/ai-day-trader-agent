@@ -100,6 +100,11 @@ class Trade:
     costs: float = 0.0
     initial_stop: Optional[float] = None
     high_water: Optional[float] = None
+    regime: Optional[str] = None   # market regime when the entry signal fired
+
+    @property
+    def entry_hour_et(self) -> int:
+        return int(self.entry_time.tz_convert(MARKET_TZ).hour)
 
     def __post_init__(self) -> None:
         if self.initial_stop is None:
@@ -146,6 +151,8 @@ class BacktestResult:
                     "exit_price": round(t.exit_price, 4),
                     "exit_reason": t.exit_reason,
                     "initial_stop": t.initial_stop,
+                    "regime": t.regime,
+                    "entry_hour_et": t.entry_hour_et,
                     "pnl": round(t.pnl, 2),
                     "r_multiple": round(t.r_multiple, 3),
                 }
@@ -197,8 +204,10 @@ class Backtester:
         sentiment: Optional[Dict[str, pd.DataFrame]] = None,
         start: Optional[pd.Timestamp] = None,
         macro_bars: Optional[Dict[str, pd.DataFrame]] = None,
+        end: Optional[pd.Timestamp] = None,
     ) -> BacktestResult:
-        """Simulate from ``start`` (default: first bar). Earlier bars only warm up indicators.
+        """Simulate bars in [``start``, ``end``) (default: all). Earlier bars only
+        warm up indicators; positions still open at ``end`` are closed there.
 
         ``macro_bars`` are higher-timeframe bars per symbol (daily for intraday
         runs). If the strategy needs them and none are given, they are
@@ -225,6 +234,8 @@ class Backtester:
             feats["p_up"] = self.strategy.probabilities(feats, feats[SENTIMENT_FEATURES])
             if start is not None:
                 feats = feats[feats.index >= start]
+            if end is not None:
+                feats = feats[feats.index < end]
             prepared[symbol] = feats
 
         timeline = sorted(set().union(*(f.index for f in prepared.values())))
@@ -335,6 +346,7 @@ class Backtester:
                                 target=round(fill + order["target_distance"], 2),
                                 probability_up=order["p_up"],
                                 costs=cfg.commission_per_share * qty,
+                                regime=order.get("regime"),
                             )
 
                     # 2. Bracket legs (the entry bar included).
@@ -433,6 +445,7 @@ class Backtester:
                             "p_up": signal.probability_up,
                             "price": c,
                             "day": day,
+                            "regime": signal.regime,
                         }
                         entries_by_day[day] = entries_by_day.get(day, 0) + 1
                     else:
@@ -498,6 +511,37 @@ def compute_metrics(result: BacktestResult) -> Dict[str, float]:
     }
 
 
+def attribution(trades: List[Trade], by: str) -> pd.DataFrame:
+    """Per-group trade stats; ``by`` is "regime" or "entry_hour_et".
+
+    Answers "where does the strategy make or lose money?" — e.g. whether
+    losses cluster in CHOPPY regimes or in the first hour of the session.
+    """
+    columns = [by, "trades", "win_rate_pct", "avg_r", "total_pnl", "worst_trade_pnl", "share_of_pnl_pct"]
+    if not trades:
+        return pd.DataFrame(columns=columns)
+    frame = pd.DataFrame(
+        {
+            by: [getattr(t, by) if getattr(t, by) is not None else "n/a" for t in trades],
+            "pnl": [t.pnl for t in trades],
+            "r": [t.r_multiple for t in trades],
+        }
+    )
+    total = frame["pnl"].sum()
+    grouped = frame.groupby(by, sort=True)
+    table = pd.DataFrame(
+        {
+            "trades": grouped.size(),
+            "win_rate_pct": grouped["pnl"].apply(lambda p: (p > 0).mean() * 100).round(1),
+            "avg_r": grouped["r"].mean().round(3),
+            "total_pnl": grouped["pnl"].sum().round(2),
+            "worst_trade_pnl": grouped["pnl"].min().round(2),
+            "share_of_pnl_pct": (grouped["pnl"].sum() / total * 100).round(1) if total else np.nan,
+        }
+    ).reset_index()
+    return table[columns]
+
+
 def format_report(result: BacktestResult, title: str = "Backtest") -> str:
     m = result.metrics
     lines = [
@@ -540,4 +584,10 @@ def format_report(result: BacktestResult, title: str = "Backtest") -> str:
         exits[t.exit_reason] = exits.get(t.exit_reason, 0) + 1
     if exits:
         lines.append(f"Exit reasons:      {exits}")
+    if result.trades:
+        lines.append("\nBy entry regime:")
+        lines.append(attribution(result.trades, "regime").to_string(index=False))
+        if result.config.bar_length < timedelta(days=1):
+            lines.append("\nBy entry hour (ET):")
+            lines.append(attribution(result.trades, "entry_hour_et").to_string(index=False))
     return "\n".join(lines)

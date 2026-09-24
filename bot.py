@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import signal
 import sys
 
 from dotenv import load_dotenv
@@ -166,10 +167,21 @@ def main(argv: list[str] | None = None) -> int:
             broker=broker,
             trailing_manager=trailing,
             session_clock=session_clock,
+            timeframe=timeframe,
         )
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 1
+
+    def request_stop(signum, frame):
+        if bot.stopped:  # second signal: stop waiting
+            raise KeyboardInterrupt
+        log.warning(f"{signal.Signals(signum).name} received: finishing the current cycle, then stopping "
+                    "(send again to force)")
+        bot.stop(signal.Signals(signum).name)
+
+    signal.signal(signal.SIGTERM, request_stop)
+    signal.signal(signal.SIGINT, request_stop)
 
     try:
         bot.run(max_cycles=1 if args.once else None)

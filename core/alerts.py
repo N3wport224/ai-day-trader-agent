@@ -1,0 +1,165 @@
+#!/usr/bin/env python3
+"""
+Operational alerts to a Discord or Slack incoming webhook.
+
+Every execution-telemetry event passes through ``AlertSink.notify``; the ones
+worth waking someone for (fills, rejections, EOD flatten results, breaker
+trips, reconciliation mismatches, bot start/stop, the end-of-session report)
+are formatted as one short line and POSTed to ALERT_WEBHOOK_URL.
+
+- Sending happens on a background thread with a short timeout: a slow or
+  broken webhook never delays trading.
+- Repeated identical alerts are throttled (ALERT_MIN_INTERVAL_SECONDS per
+  event+symbol) and capped per hour (ALERT_MAX_PER_HOUR).
+- The payload carries both ``content`` (Discord) and ``text`` (Slack).
+
+Treat the webhook URL as a secret: anyone with it can post to the channel.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import threading
+import time
+from collections import deque
+from typing import Any, Callable, Deque, Dict, Iterable, Optional
+
+import requests
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_EVENTS = (
+    "order_submitted",
+    "order_rejected",
+    "order_recovered",
+    "flatten",
+    "breaker_tripped",
+    "reconciliation",
+    "trailing_stop_failed",
+    "session_report",
+    "bot_started",
+    "bot_stopped",
+    "bot_error",
+)
+
+
+def format_alert(event: Dict[str, Any]) -> Optional[str]:
+    """One human-readable line per event, or None if it shouldn't alert."""
+    name = event.get("event")
+    sym = event.get("symbol", "")
+    if name == "order_submitted":
+        return (
+            f"🟢 {event.get('side', '').upper()} {event.get('qty')} {sym} submitted"
+            + (f" (stop {event['stop_loss']}, target {event['take_profit']})" if event.get("stop_loss") else "")
+        )
+    if name == "order_rejected":
+        return f"🔴 {sym} {event.get('side', '')} rejected [{event.get('category')}]: {event.get('message')}"
+    if name == "order_recovered":
+        return f"🟡 {sym} recovered after {event.get('category')}: {event.get('plan')}"
+    if name == "flatten":
+        closed = ", ".join(c["symbol"] for c in event.get("closed") or []) or "nothing to close"
+        failures = event.get("failures") or []
+        text = f"🌙 EOD flatten: cancelled {event.get('cancelled_orders', 0)} orders, closed {closed}"
+        if failures:
+            text += "; ⚠️ FAILED: " + ", ".join(f"{f.get('symbol')} ({f.get('category')})" for f in failures)
+        return text
+    if name == "breaker_tripped":
+        return f"🛑 {event.get('reason')}"
+    if name == "reconciliation":
+        discrepancies = event.get("discrepancies") or []
+        if not discrepancies:
+            return None  # clean reconciliations are routine
+        kinds = ", ".join(f"{d['kind']} {d['symbol']}" for d in discrepancies)
+        return f"⚠️ Broker/local mismatch ({event.get('mode')}): {kinds}"
+    if name == "trailing_stop_failed":
+        return f"⚠️ {sym} trailing stop not raised ({event.get('category')}): {event.get('message')}"
+    if name == "session_report":
+        return (
+            f"📊 Session {event.get('date')}: P&L {event.get('pnl', 0):+,.2f} ({event.get('pnl_pct', 0):+.2f}%), "
+            f"equity {event.get('equity', 0):,.2f}, {event.get('fills', 0)} fills, "
+            f"{event.get('open_positions', 0)} open positions"
+            + (" ⚠️ NOT FLAT" if event.get("open_positions") and event.get("no_overnight") else "")
+        )
+    if name == "bot_started":
+        return f"▶️ Bot started: {event.get('mode')}, {event.get('timeframe')}, {event.get('symbols')}"
+    if name == "bot_stopped":
+        return f"⏹️ Bot stopped ({event.get('reason')})"
+    if name == "bot_error":
+        return f"❗ Bot error: {event.get('message')}"
+    return None
+
+
+class AlertSink:
+    def __init__(
+        self,
+        webhook_url: str,
+        *,
+        events: Iterable[str] = DEFAULT_EVENTS,
+        min_interval_seconds: float = 60.0,
+        max_per_hour: int = 60,
+        post: Callable[..., Any] = requests.post,
+        asynchronous: bool = True,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.webhook_url = webhook_url
+        self.events = set(events)
+        self.min_interval = min_interval_seconds
+        self.max_per_hour = max_per_hour
+        self.post = post
+        self.asynchronous = asynchronous
+        self.clock = clock
+        self._last_sent: Dict[str, float] = {}
+        self._recent: Deque[float] = deque()
+        self._lock = threading.Lock()
+
+    @classmethod
+    def from_env(cls) -> Optional["AlertSink"]:
+        url = os.getenv("ALERT_WEBHOOK_URL", "").strip()
+        if not url:
+            return None
+        events = [e.strip() for e in os.getenv("ALERT_EVENTS", ",".join(DEFAULT_EVENTS)).split(",") if e.strip()]
+        return cls(
+            url,
+            events=events,
+            min_interval_seconds=float(os.getenv("ALERT_MIN_INTERVAL_SECONDS", "60")),
+            max_per_hour=int(os.getenv("ALERT_MAX_PER_HOUR", "60")),
+        )
+
+    def _allowed(self, key: str) -> bool:
+        now = self.clock()
+        with self._lock:
+            while self._recent and now - self._recent[0] > 3600:
+                self._recent.popleft()
+            if len(self._recent) >= self.max_per_hour:
+                return False
+            last = self._last_sent.get(key)
+            if last is not None and now - last < self.min_interval:
+                return False
+            self._last_sent[key] = now
+            self._recent.append(now)
+            return True
+
+    def notify(self, event: Dict[str, Any]) -> bool:
+        """Send if the event is selected, formattable and not throttled."""
+        if event.get("event") not in self.events:
+            return False
+        text = format_alert(event)
+        if not text:
+            return False
+        key = f"{event.get('event')}:{event.get('symbol', '')}:{event.get('category', '')}"
+        if not self._allowed(key):
+            return False
+        if self.asynchronous:
+            threading.Thread(target=self._send, args=(text,), daemon=True).start()
+        else:
+            self._send(text)
+        return True
+
+    def _send(self, text: str) -> None:
+        try:
+            resp = self.post(self.webhook_url, json={"content": text[:1900], "text": text}, timeout=5)
+            if getattr(resp, "status_code", 200) >= 400:
+                logger.warning(f"Alert webhook returned HTTP {resp.status_code}")
+        except Exception as exc:  # alerts must never break trading
+            logger.warning(f"Alert webhook failed: {exc}")

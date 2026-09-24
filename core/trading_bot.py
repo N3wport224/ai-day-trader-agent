@@ -9,14 +9,18 @@ and bracket orders before anything reaches Alpaca paper trading.
 
 from __future__ import annotations
 
+import json
 import logging
-import time
+import os
+import threading
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
+from core.execution_telemetry import EventLog
 from core.portfolio_manager import PortfolioManager
-from core.session_clock import SessionClock, SessionPhase
+from core.session_clock import SessionClock, SessionPhase, to_market_time
 from core.trading_workflow import TradingWorkflow, WorkflowResult
 
 logger = logging.getLogger(__name__)
@@ -52,6 +56,7 @@ class CycleReport:
     phase: str = "OPEN"                            # core.session_clock.SessionPhase value
     entry_block: Optional[str] = None              # why BUYs were vetoed this cycle
     flatten: Optional[Any] = None                  # core.alpaca_executor.FlattenReport
+    session_report: Optional[Dict[str, Any]] = None  # end-of-session summary (first closed cycle)
 
     @property
     def orders(self) -> List[WorkflowResult]:
@@ -68,12 +73,15 @@ class TradingBot:
         execute: bool = False,
         interval_seconds: int = 900,
         market_clock: Optional[Callable[[], Dict[str, Any]]] = None,
-        sleep: Callable[[float], None] = time.sleep,
+        sleep: Optional[Callable[[float], None]] = None,
         broker: Optional[Any] = None,
         trailing_manager: Optional[Any] = None,
         reconcile_fn: Optional[Callable[..., Any]] = None,
         session_clock: Optional[SessionClock] = None,
         now_fn: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+        telemetry: Optional[EventLog] = None,
+        heartbeat_path: Optional[str] = None,
+        timeframe: Optional[str] = None,
     ) -> None:
         """``broker`` (an AlpacaExecutor) enables the start-of-cycle broker
         snapshot and reconciliation; ``trailing_manager`` raises stops on
@@ -89,7 +97,17 @@ class TradingBot:
         self.execute = execute
         self.interval_seconds = max(60, interval_seconds)
         self.market_clock = market_clock
-        self.sleep = sleep
+        self._stop_event = threading.Event()
+        self._stop_reason: Optional[str] = None
+        # Default sleep is interruptible, so stop() takes effect between cycles
+        # without waiting out the interval (and never interrupts an order).
+        self.sleep = sleep or (lambda seconds: self._stop_event.wait(seconds))
+        self.telemetry = telemetry or EventLog.from_env()
+        self.heartbeat_path = Path(heartbeat_path or os.getenv("HEARTBEAT_PATH", "logs/heartbeat.json"))
+        self.timeframe = timeframe
+        self._session_seen: Optional[date] = None
+        self._session_reported: Optional[date] = None
+        self._breaker_alerted: Optional[date] = None
         self.broker = broker
         self.trailing_manager = trailing_manager
         if reconcile_fn is None and broker is not None:
@@ -116,7 +134,15 @@ class TradingBot:
             return SessionPhase.OPEN if clock.get("is_open") else SessionPhase.CLOSED
         return self.session_clock.phase_from_alpaca_clock(clock)
 
+    def _market_date(self) -> date:
+        return to_market_time(self.now_fn()).date()
+
     def run_cycle(self) -> CycleReport:
+        report = self._run_cycle()
+        self._write_heartbeat(report)
+        return report
+
+    def _run_cycle(self) -> CycleReport:
         clock = self._last_clock = self._read_clock()
         phase = self._phase(clock)
         report = CycleReport(
@@ -125,8 +151,11 @@ class TradingBot:
             phase=phase.value,
         )
         if phase is SessionPhase.CLOSED:
+            self._maybe_session_report(report)
             logger.info("Market closed; skipping cycle")
             return report
+        if clock is not None:
+            self._session_seen = self._market_date()
 
         if self.broker is not None and not self._sync_with_broker(report):
             return report
@@ -201,6 +230,10 @@ class TradingBot:
             if reason:
                 report.entry_block = reason
                 logger.warning(reason)
+                today = self._market_date()
+                if self._breaker_alerted != today:
+                    self._breaker_alerted = today
+                    self.telemetry.record("breaker_tripped", logging.WARNING, reason=reason)
 
         report.reconciliation = self.reconcile_fn(
             snapshot,
@@ -252,16 +285,91 @@ class TradingBot:
             return until + 1
         return self.interval_seconds
 
+    def _maybe_session_report(self, report: CycleReport) -> None:
+        """After a session the bot traded through, summarise it once."""
+        if self.broker is None or self._session_seen is None or self._session_reported == self._session_seen:
+            return
+        session_date = self._session_seen
+        self._session_reported = session_date
+        try:
+            account = self.broker.get_account()
+            positions = self.broker.get_positions()
+            orders = self.broker.get_orders_today() if hasattr(self.broker, "get_orders_today") else []
+        except Exception as exc:
+            logger.error(f"Session report unavailable: {exc}")
+            return
+        equity = float(account.get("equity") or 0)
+        start = float(account.get("last_equity") or 0)
+        fills = [o for o in orders if o.get("status") == "filled" or float(o.get("filled_qty") or 0) > 0]
+        no_overnight = bool(self.session_clock and self.session_clock.config.no_overnight)
+        report.session_report = {
+            "date": str(session_date),
+            "equity": round(equity, 2),
+            "pnl": round(equity - start, 2) if start else 0.0,
+            "pnl_pct": round((equity - start) / start * 100, 3) if start else 0.0,
+            "fills": len(fills),
+            "open_positions": len(positions),
+            "open_symbols": [p.get("symbol") for p in positions],
+            "no_overnight": no_overnight,
+        }
+        level = logging.WARNING if (no_overnight and positions) else logging.INFO
+        self.telemetry.record("session_report", level, **report.session_report)
+
+    def _write_heartbeat(self, report: CycleReport) -> None:
+        """Small JSON file external monitoring can check for freshness."""
+        snapshot = self._last_snapshot
+        beat = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "phase": report.phase,
+            "execute": self.execute,
+            "timeframe": self.timeframe,
+            "symbols": self.symbols,
+            "orders_this_cycle": len(report.orders),
+            "errors": report.errors,
+            "entry_block": report.entry_block,
+            "broker_error": report.broker_error,
+            "positions": len(snapshot.positions) if snapshot is not None else None,
+            "next_cycle_in_seconds": None if self._stop_event.is_set() else round(self._next_sleep(), 1),
+        }
+        try:
+            self.heartbeat_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.heartbeat_path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(beat, default=str, indent=2))
+            tmp.replace(self.heartbeat_path)  # atomic: monitors never read half a file
+        except OSError as exc:
+            logger.error(f"Could not write heartbeat: {exc}")
+
+    def stop(self, reason: str = "requested") -> None:
+        """Finish the current cycle, then exit ``run`` (safe from signal handlers)."""
+        self._stop_reason = reason
+        self._stop_event.set()
+
+    @property
+    def stopped(self) -> bool:
+        return self._stop_event.is_set()
+
     def run(self, max_cycles: Optional[int] = None) -> List[CycleReport]:
         mode = "EXECUTE (paper orders)" if self.execute else "DRY RUN (no orders)"
         logger.info(
             f"Trading bot started: {mode}, {len(self.symbols)} symbols, "
             f"every {self.interval_seconds}s, portfolio '{self.portfolio_name}'"
         )
+        self.telemetry.record("bot_started", mode=mode, timeframe=self.timeframe, symbols=",".join(self.symbols))
         reports: List[CycleReport] = []
-        while max_cycles is None or len(reports) < max_cycles:
-            reports.append(self.run_cycle())
-            if max_cycles is not None and len(reports) >= max_cycles:
-                break
-            self.sleep(self._next_sleep())
+        attempts = 0  # counts failed cycles too, so --once can't loop forever
+        try:
+            while not self.stopped and (max_cycles is None or attempts < max_cycles):
+                attempts += 1
+                try:
+                    reports.append(self.run_cycle())
+                except Exception as exc:  # one bad cycle must not kill an unattended bot
+                    logger.exception(f"Cycle failed: {exc}")
+                    self.telemetry.record("bot_error", logging.ERROR, message=str(exc))
+                if self.stopped or (max_cycles is not None and attempts >= max_cycles):
+                    break
+                self.sleep(self._next_sleep())
+        finally:
+            reason = self._stop_reason or ("completed" if max_cycles is not None else "exited")
+            self.telemetry.record("bot_stopped", reason=reason, cycles=attempts)
+            logger.info(f"Trading bot stopped ({reason})")
         return reports
