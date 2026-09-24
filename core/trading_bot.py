@@ -127,9 +127,12 @@ class TradingBot:
                     f"{ml['sentiment_score']:+.2f}/{ml['sentiment_articles']} articles"
                     if ml.get("sentiment_available") else "n/a"
                 )
+                macro = ml.get("macro_aligned")
+                mtf = "n/a" if macro is None else ("aligned" if macro == 1.0 else "not aligned")
+                gate = f" vetoed by {ml['gated_by']}" if ml.get("gated_by") else ""
                 summary += (
                     f" [{ml['mode']} P(up)={ml['probability_up']:.2f} regime {ml.get('regime') or 'n/a'}"
-                    f" sentiment {sentiment}]"
+                    f" daily trend {mtf}{gate} sentiment {sentiment}]"
                 )
             if result.alpaca_order:
                 logger.info(f"{summary} -> ORDER {result.alpaca_order.get('id')}")
@@ -153,8 +156,13 @@ class TradingBot:
             self.portfolio_name,
             mode=None if self.execute else "report",
         )
-        if report.reconciliation.discrepancies:
-            logger.warning(f"Reconciliation: {report.reconciliation.kinds()} (synced: {report.reconciliation.synced})")
+        recon = report.reconciliation
+        if recon.discrepancies:
+            logger.warning(f"Reconciliation: {recon.kinds()} (synced: {recon.synced})")
+        else:
+            logger.info(
+                f"Reconciliation clean: {recon.positions} positions, {recon.open_orders} open orders match local book"
+            )
 
         if self.execute and self.trailing_manager is not None:
             report.stop_adjustments = self.trailing_manager.update(snapshot)
