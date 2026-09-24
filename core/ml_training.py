@@ -195,3 +195,43 @@ def synthetic_bars(n: int = 1500, seed: int = 7, start: str = "2025-01-02 14:30"
     volume = rng.integers(10_000, 100_000, n).astype(float)
     index = pd.date_range(start, periods=n, freq="h", tz="UTC")
     return pd.DataFrame({"open": open_, "high": high, "low": low, "close": close, "volume": volume}, index=index)
+
+
+def threshold_table(
+    proba: Sequence[float],
+    labels: Sequence[float],
+    params: LabelParams,
+    thresholds: Sequence[float] = (0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7),
+) -> pd.DataFrame:
+    """Bar-level hit rate and approximate expectancy if we entered whenever P >= threshold.
+
+    Expectancy assumes every trade ends at a barrier (+target/stop R on a win,
+    -1R otherwise); it ignores risk limits, costs and horizon timeouts, so it
+    is a guide for choosing ML_CONFIDENCE_THRESHOLD, not a P&L forecast.
+    """
+    proba = np.asarray(proba, dtype=float)
+    labels = np.asarray(labels, dtype=float)
+    reward_ratio = params.target_atr_mult / params.stop_atr_mult
+    rows = []
+    for threshold in thresholds:
+        taken = proba >= threshold
+        hit = float(labels[taken].mean()) if taken.any() else float("nan")
+        rows.append(
+            {
+                "threshold": threshold,
+                "signals": int(taken.sum()),
+                "hit_rate": round(hit, 4) if taken.any() else float("nan"),
+                "approx_expectancy_r": round(hit * reward_ratio - (1 - hit), 3) if taken.any() else float("nan"),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def calibration_table(proba: Sequence[float], labels: Sequence[float], bins: int = 10) -> pd.DataFrame:
+    """Predicted probability vs realised hit rate per probability bucket."""
+    frame = pd.DataFrame({"p": np.asarray(proba, dtype=float), "label": np.asarray(labels, dtype=float)})
+    frame["bucket"] = pd.cut(frame["p"], np.linspace(0, 1, bins + 1), include_lowest=True)
+    table = frame.groupby("bucket", observed=True).agg(
+        bars=("label", "size"), mean_p=("p", "mean"), hit_rate=("label", "mean")
+    )
+    return table.reset_index().round(4)

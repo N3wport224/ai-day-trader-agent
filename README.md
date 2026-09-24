@@ -258,8 +258,12 @@ python scripts/backtest.py --synthetic
 ```
 
 The report shows return vs. equal-weight buy-and-hold, max drawdown, daily
-Sharpe, trade count, win rate, average R, profit factor, exit reasons and how
-often each risk limit blocked an entry. Treat fewer than ~30 trades as
+Sharpe, trade count, win rate, average R, profit factor, exit reasons, how
+often each risk limit blocked an entry, and how many BUY-level signals fell
+outside market hours. Walk-forward runs also print a **threshold audit** for
+the unseen period (hit rate and approximate expectancy at each
+`ML_CONFIDENCE_THRESHOLD`, plus a calibration table), saved as
+`threshold_sweep.csv` / `calibration.csv` with `--out`. Treat fewer than ~30 trades as
 inconclusive, and only use `--execute` if the walk-forward result beats
 buy-and-hold with positive average R after slippage.
 

@@ -216,4 +216,43 @@ def test_backtest_script_walkforward_writes_reports(tmp_path: Path) -> None:
 
     assert code == 0
     assert (out / "trades.csv").exists() and (out / "equity.csv").exists()
+    assert (out / "threshold_sweep.csv").exists() and (out / "calibration.csv").exists()
     assert "total_return_pct" in (out / "summary.json").read_text()
+
+
+def test_threshold_and_calibration_tables() -> None:
+    from core.ml_training import LabelParams, calibration_table, threshold_table
+
+    proba = [0.1, 0.3, 0.5, 0.7, 0.9]
+    labels = [0, 0, 1, 0, 1]
+    table = threshold_table(proba, labels, LabelParams(stop_atr_mult=1.0, target_atr_mult=2.0), thresholds=(0.4, 0.8, 0.95))
+
+    assert table["signals"].tolist() == [3, 1, 0]
+    assert table["hit_rate"].iloc[0] == pytest.approx(2 / 3, abs=1e-4)
+    assert table["approx_expectancy_r"].iloc[0] == pytest.approx(2 / 3 * 2 - 1 / 3, abs=1e-3)
+    assert np.isnan(table["hit_rate"].iloc[2])
+
+    calib = calibration_table(proba, labels, bins=2)
+    # Buckets are right-closed: [0, 0.5] holds 0.1, 0.3, 0.5; (0.5, 1] holds 0.7, 0.9.
+    assert calib["bars"].tolist() == [3, 2]
+    assert calib["hit_rate"].tolist() == pytest.approx([1 / 3, 1 / 2], abs=1e-4)
+
+
+def test_buy_signals_outside_market_hours_are_counted_not_traded() -> None:
+    idx = pd.date_range("2026-03-02 14:00", periods=60, freq="h", tz="UTC")  # includes nights
+    close = np.full(60, 100.0)
+    bars = pd.DataFrame(
+        {"open": close, "high": close + 0.5, "low": close - 0.5, "close": close, "volume": 1e5}, index=idx
+    )
+    night = pd.Timestamp("2026-03-03 04:00", tz="UTC")   # 23:00 ET
+    session = pd.Timestamp("2026-03-03 15:00", tz="UTC")  # 10:00 ET bar, closes 11:00
+    config = BacktestConfig(initial_capital=10_000, slippage_bps=0)
+
+    result = Backtester(
+        _strategy({night: 0.9, session: 0.9}),
+        RiskManager(RiskLimits(min_price=1.0, max_position_pct=1.0)),
+        config,
+    ).run({"AAA": bars})
+
+    assert result.skipped_outside_session == 1
+    assert [t.entry_time for t in result.trades] == [session + timedelta(hours=1)]

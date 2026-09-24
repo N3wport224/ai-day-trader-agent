@@ -83,6 +83,7 @@ class BacktestResult:
     trades: List[Trade]
     equity: pd.Series
     blocked: Dict[str, int]
+    skipped_outside_session: int
     signals: Dict[str, int]
     benchmark_return: float
     config: BacktestConfig
@@ -181,6 +182,7 @@ class Backtester:
         trades: List[Trade] = []
         blocked: Dict[str, int] = {}
         signals = {"BUY": 0, "SELL": 0, "HOLD": 0}
+        skipped_outside_session = 0
         equity_points: Dict[pd.Timestamp, float] = {}
         entries_by_day: Dict[object, int] = {}
         prev_day_equity: Optional[float] = None
@@ -252,7 +254,12 @@ class Backtester:
                 last_close[symbol] = c
 
                 # 3. Decide at this bar's close.
-                if not _can_decide(ts, cfg) or not np.isfinite(row["p_up"]):
+                if not np.isfinite(row["p_up"]):
+                    continue
+                if not _can_decide(ts, cfg):
+                    # The live bot doesn't run while the market is closed.
+                    if row["p_up"] >= self.strategy.threshold:
+                        skipped_outside_session += 1
                     continue
                 signal = self.strategy.decide(float(row["p_up"]), row, _snapshot_from_row(row))
                 signals[signal.signal] += 1
@@ -309,6 +316,7 @@ class Backtester:
             trades=trades,
             equity=pd.Series(equity_points, dtype=float).sort_index(),
             blocked=blocked,
+            skipped_outside_session=skipped_outside_session,
             signals=signals,
             benchmark_return=float(np.mean(benchmark)) if benchmark else float("nan"),
             config=cfg,
@@ -362,6 +370,7 @@ def format_report(result: BacktestResult, title: str = "Backtest") -> str:
     ]
     if result.blocked:
         lines.append(f"Blocked by risk:   {result.blocked}")
+    lines.append(f"BUY-level signals outside market hours (not traded): {result.skipped_outside_session}")
     exits: Dict[str, int] = {}
     for t in result.trades:
         exits[t.exit_reason] = exits.get(t.exit_reason, 0) + 1

@@ -40,8 +40,15 @@ import pandas as pd  # noqa: E402
 
 from core.backtester import Backtester, BacktestConfig, format_report  # noqa: E402
 from core.market_history import bar_length, get_history  # noqa: E402
-from core.ml_strategy import DEFAULT_MODEL_PATH, MLStrategy, load_artifact  # noqa: E402
-from core.ml_training import LabelParams, build_dataset, synthetic_bars, train  # noqa: E402
+from core.ml_strategy import DEFAULT_MODEL_PATH, FEATURE_COLUMNS, MLStrategy, load_artifact  # noqa: E402
+from core.ml_training import (  # noqa: E402
+    LabelParams,
+    build_dataset,
+    calibration_table,
+    synthetic_bars,
+    threshold_table,
+    train,
+)
 from core.news_sentiment import (  # noqa: E402
     AlpacaNewsClient,
     get_scorer,
@@ -126,6 +133,7 @@ def main(argv: list[str] | None = None) -> int:
     sentiment, scored = _load_sentiment(bars, bar_len, end) if (args.news and not args.synthetic) else (None, None)
 
     start = None
+    audit = None
     if args.mode == "walkforward":
         timeline = sorted(set().union(*(f.index for f in bars.values())))
         start = timeline[int(len(timeline) * args.train_fraction)]
@@ -144,6 +152,22 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         logger.info(f"Trained on bars before {start}; trading {start} onward (never seen by the model)")
         strategy = MLStrategy(artifact, confidence_threshold=args.threshold)
+
+        # Threshold audit on the unseen period: how often did setups at each
+        # confidence level actually hit the target before the stop?
+        test_sets = [
+            build_dataset(frame, params, bar_len, (scored or {}).get(symbol), half_life=half_life_from_env())
+            for symbol, frame in bars.items()
+        ]
+        test = pd.concat([d[d.index >= start] for d in test_sets])
+        proba = artifact["pipeline"].predict_proba(test[FEATURE_COLUMNS])[:, 1]
+        audit = {
+            "train_base_rate": artifact["train_base_rate"],
+            "test_base_rate": float(test["label"].mean()),
+            "exit_threshold_in_use": strategy.exit_threshold,
+            "thresholds": threshold_table(proba, test["label"], params),
+            "calibration": calibration_table(proba, test["label"]),
+        }
     elif args.mode == "model":
         artifact = load_artifact(args.model)
         if artifact is None:
@@ -175,6 +199,20 @@ def main(argv: list[str] | None = None) -> int:
     print()
     print(format_report(result, title))
 
+    if audit:
+        print(
+            f"\n== Threshold audit (out-of-sample bars, before risk limits and costs) ==\n"
+            f"Base rate (target hit before stop): train {audit['train_base_rate']:.1%}, "
+            f"test {audit['test_base_rate']:.1%}; exit threshold in use {audit['exit_threshold_in_use']:.3f}\n"
+        )
+        print(audit["thresholds"].to_string(index=False))
+        print("\nCalibration (does predicted P match what happened?):")
+        print(audit["calibration"].to_string(index=False))
+        print(
+            "\nNote: picking the threshold that looks best here and reporting its result"
+            " overstates performance; confirm any change with a fresh walk-forward over a different period."
+        )
+
     m = result.metrics
     if m["trades"] < 30:
         print(f"\n⚠️  Only {m['trades']} trades: too few to judge the strategy. Use more symbols or history.")
@@ -186,10 +224,22 @@ def main(argv: list[str] | None = None) -> int:
         out.mkdir(parents=True, exist_ok=True)
         result.trades_frame().to_csv(out / "trades.csv", index=False)
         result.equity.rename("equity").to_csv(out / "equity.csv", index_label="time")
-        (out / "summary.json").write_text(
-            json.dumps({"metrics": m, "signals": result.signals, "blocked": result.blocked}, indent=2, default=str)
-        )
-        print(f"\nWrote {out}/trades.csv, equity.csv, summary.json")
+        summary = {
+            "metrics": m,
+            "signals": result.signals,
+            "blocked": result.blocked,
+            "skipped_outside_session": result.skipped_outside_session,
+        }
+        if audit:
+            audit["thresholds"].to_csv(out / "threshold_sweep.csv", index=False)
+            audit["calibration"].to_csv(out / "calibration.csv", index=False)
+            summary.update(
+                train_base_rate=audit["train_base_rate"],
+                test_base_rate=audit["test_base_rate"],
+                exit_threshold_in_use=audit["exit_threshold_in_use"],
+            )
+        (out / "summary.json").write_text(json.dumps(summary, indent=2, default=str))
+        print(f"\nWrote reports to {out}/")
     return 0
 
 
