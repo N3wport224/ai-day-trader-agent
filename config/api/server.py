@@ -4,7 +4,14 @@ Main FastAPI server for AI Day Trader Agent API Layer.
 Implements secure, standards-compliant REST endpoints for portfolio management and trading.
 """
 
-from fastapi import FastAPI
+from dotenv import load_dotenv
+
+from core.env_store import env_path
+
+# Load the same .env the API Keys tab writes to (DOTENV_PATH or the project's .env).
+load_dotenv(env_path())
+
+from fastapi import FastAPI  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
@@ -20,6 +27,8 @@ from config.api.auth import router as auth_router, limiter
 from config.api.portfolios import router as portfolios_router
 from config.api.analysis import router as analysis_router
 from config.api.trading import router as trading_router
+from config.api.settings import router as settings_router
+from config.api.control import router as control_router
 from config.api.websockets import websocket_endpoint
 
 # Configure logging
@@ -59,6 +68,8 @@ app.include_router(auth_router, prefix="/api/auth", tags=["auth"])
 app.include_router(portfolios_router, prefix="/api/portfolios", tags=["portfolios"])
 app.include_router(analysis_router, prefix="/api/analysis", tags=["analysis"])
 app.include_router(trading_router, prefix="/api/trading", tags=["trading"])
+app.include_router(settings_router, prefix="/api/settings", tags=["settings"])
+app.include_router(control_router, prefix="/api/control", tags=["control"])
 
 # Global error handler
 @app.exception_handler(Exception)
@@ -78,6 +89,13 @@ app.websocket("/ws")(websocket_endpoint)
 
 # Dashboard
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parent.parent.parent
+
+@app.get("/", include_in_schema=False)
+async def root():
+    from fastapi.responses import RedirectResponse
+
+    return RedirectResponse("/dashboard")
+
 
 @app.get("/dashboard", response_class=HTMLResponse, include_in_schema=False)
 async def dashboard():

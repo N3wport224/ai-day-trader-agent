@@ -39,6 +39,72 @@ A sophisticated, multi-strategy AI-powered trading agent that combines technical
 
 ---
 
+## Quick start (dashboard, no command line needed after this)
+
+```bash
+pip install -r requirements.txt
+python start_dashboard.py
+```
+
+Your browser opens the dashboard at http://127.0.0.1:8000/dashboard. From there:
+
+1. **Create your account.** The first visit asks you to create the owner account.
+2. **API Keys tab:** paste your Alpaca **paper** keys. It has step-by-step instructions
+   for getting them, and a **Test connection** button. Keys are saved to `.env` on this
+   computer only, with owner-only permissions, and are never shown again. For safety they
+   can only be changed from the computer running the dashboard.
+3. **Get Started tab → Validate strategy:** a walk-forward test on real data. The bot
+   only places trades if this test finds an edge; if it does, the model is trained
+   automatically.
+4. **Paper Trading tab** (green, fake money): start or stop the auto-trader, watch it in
+   one of two modes (placing paper orders, or watch-only), see positions, activity and
+   the day's P&L, place manual paper orders, and use the emergency **Close everything**
+   button.
+5. **Live Trading tab** (red, real money), optional and only after weeks of paper
+   trading. It requires all of these:
+   - separate live keys;
+   - **arming**: type `I UNDERSTAND THIS USES REAL MONEY` plus your password;
+   - a passing validation;
+   - a confirmation tick box every time you start the bot.
+
+   **Disarm** stops the live bot instantly. Real-money trading can't be switched on from
+   another machine, and the edge gate can't be bypassed in live mode.
+
+The bot runs as its own background process (`bot.py --mode paper|live`), with separate
+logs and state per mode under `logs/<mode>/` and `data/<mode>/`. It keeps running if you
+close the browser. Stop it from the dashboard.
+
+### Running it on your own computer (Windows or Mac)
+
+**One-time setup**
+1. **Install Python 3.12** from https://www.python.org/downloads/.
+   - Windows: on the first installer screen, tick **"Add python.exe to PATH"**.
+   - Mac: use the python.org installer. The built-in `python3` is often too old.
+2. **Mac only:** install Homebrew (https://brew.sh), then run `brew install libomp` in
+   Terminal. The ML library needs it.
+3. **Get the code:** on GitHub, pick the branch and choose **Code → Download ZIP**, then
+   unzip it somewhere permanent such as Documents. Alternatively, clone it with GitHub
+   Desktop or git.
+
+**Every time**
+- Windows: double-click **`start_dashboard.bat`**.
+- Mac: double-click **`start_dashboard.command`**. The first time, macOS may say it's
+  from an unidentified developer: right-click it, choose **Open**, then **Open** again.
+
+The first launch spends a few minutes installing packages into a private `.venv` folder.
+After that the dashboard opens in your browser at http://127.0.0.1:8000/dashboard. Keep
+the launcher window open while you trade.
+
+**Keep it running during market hours (9:30 am to 4:00 pm ET)**
+- While the bot runs it stops the computer from idle-sleeping, on both Windows and Mac.
+  Closing a laptop lid, shutting down, or losing Wi-Fi still stops it, so plug a laptop
+  in and leave it open.
+- If the computer goes to sleep or offline mid-day, broker-side stop-loss and
+  take-profit orders still protect your positions. But the 3:50 pm "close everything"
+  won't happen, so day trades would stay open overnight until the bot runs again.
+- Windows updates can restart your PC. Set **active hours** to cover the trading day
+  (Settings → Windows Update → Advanced options).
+
 ## Setup
 
 ### 1. Clone the Repository
@@ -300,7 +366,21 @@ python bot.py --timeframe 1h --overnight                                        
   recovers. It is checked every cycle, not only when a buy is attempted.
 - **Data**: 1Min and 5Min bars from Alpaca (paginated) with Yahoo fallback
   (Yahoo keeps ~7 days of 1m and ~60 days of 5m history). Default lookback is
-  30 days for 1m and 45 for 5m so EMA200 and RVOL are warmed up.
+  30 days for 1m and 45 for 5m so EMA200 and RVOL are warmed up. The live bot
+  caches history per symbol and fetches only the newest bars each cycle
+  (re-fetching the last 3 so revised bars are replaced), with a full reload
+  each market day and every 6 hours (`BAR_CACHE=false` turns it off).
+- **Stale-data guard**: during regular hours, if the newest completed bar is
+  more than `MAX_BAR_AGE_BARS` (3) bars old, e.g. during a feed outage or
+  when falling back to delayed data, the symbol gets no signal that cycle.
+  Open positions stay protected by their broker-side brackets and the EOD
+  flatten.
+- **Re-entry cooldown**: after a stop-out, the risk manager rejects a new
+  entry in that symbol for `REENTRY_COOLDOWN_MINUTES` (30), so a stop doesn't
+  turn straight into a revenge trade. Live, it reads the stop leg's fill time
+  from Alpaca's orders (restart-safe); the backtester applies the same rule
+  (`--reentry-cooldown-minutes`). `REENTRY_COOLDOWN_STOPS_ONLY=false` applies
+  it after every exit.
 
 Backtest the intraday rules (opening lockout, cutoff, 15:50 forced close,
 2 bps spread on top of slippage, simulated PDT day-trade count):
@@ -308,6 +388,112 @@ Backtest the intraday rules (opening lockout, cutoff, 15:50 forced close,
 ```bash
 python scripts/backtest.py --timeframe 5m --days 60 --no-overnight --opening-lockout-minutes 15 --compare
 ```
+
+#### Running unattended: alerts, heartbeat, session report, shutdown
+
+- **Alerts** (`core/alerts.py`): set `ALERT_WEBHOOK_URL` to a Discord or Slack
+  incoming webhook to get one-line messages for order submissions, broker
+  rejections (with root cause), recoveries, the EOD flatten result (including
+  any position that failed to close), drawdown-breaker trips, broker/local
+  mismatches, failed trailing-stop updates, the end-of-session report and bot
+  start/stop/errors. Sending is asynchronous and throttled, and a broken
+  webhook never affects trading. Every event is also in
+  `logs/execution_events.jsonl`.
+- **Session report**: on the first cycle after the close, the bot records the
+  day's P&L (equity vs the previous close), fills and open positions, and
+  flags `NOT FLAT` if anything is still open in no-overnight mode.
+- **Heartbeat**: `logs/heartbeat.json` is rewritten atomically every cycle
+  (phase, positions, errors, entry blocks, seconds to the next cycle). Point
+  your monitoring at its modification time; if it goes stale, the bot is down.
+- **Fill quality** (`core/fill_quality.py`, execute mode): every fill is
+  compared with the price the bot expected (the live quote for market
+  entries/exits, the stop price for stop legs, the limit for take-profits)
+  and logged as `order_filled` with signed slippage in bps (positive = worse
+  for you). Fills worse than `SLIPPAGE_ALERT_BPS` (25) alert, and the session
+  report includes mean, notional-weighted and worst slippage plus its dollar
+  cost. Compare it with the backtest's `--slippage-bps`/`--spread-bps`: if
+  live is consistently worse, the backtest is flattering the strategy.
+- **Shutdown**: SIGTERM or Ctrl-C finishes the current cycle and exits
+  cleanly (it interrupts the wait between cycles, never an order in flight);
+  a second signal forces the exit. A cycle that throws is logged and alerted
+  as `bot_error` and the bot keeps running.
+
+Example systemd unit (paper trading, restarts on crash):
+
+```ini
+[Service]
+WorkingDirectory=/opt/ai-day-trader-agent
+ExecStart=/opt/ai-day-trader-agent/venv/bin/python bot.py --timeframe 5m --execute
+Restart=on-failure
+KillSignal=SIGTERM
+TimeoutStopSec=120
+```
+
+#### Tactics for a better chance of profit (and fewer ways to lose)
+
+No setting makes a trading bot profitable, and most automated intraday
+strategies lose money after costs. These tactics are about only trading
+when there's evidence of an edge, cutting costs, and limiting the damage
+when there isn't one.
+
+1. **Edge gate: prove it before trading it** (`core/edge_gate.py`). With
+   `--execute`, the bot opens **no new positions** unless a walk-forward
+   backtest of exactly this setup passed on real data within the last 30
+   days. "Exactly this setup" means the same timeframe, ATR stop/target,
+   feature set, threshold and entry gates. The minimums: ≥100 trades, ≥3
+   folds, profit factor ≥1.2, avg R ≥0.05, ≥60% of folds positive and
+   drawdown ≤15%. They're configurable with `EDGE_*`. Exits, stops and the
+   EOD flatten always run. `EDGE_GATE=false` overrides it, at your own risk.
+   ```bash
+   python scripts/backtest.py --timeframe 5m --days 120 --folds 4 --market --promote
+   python scripts/train_model.py --timeframe 5m --days 120 --market   # same flags as the promoted run
+   python bot.py --timeframe 5m --execute
+   ```
+   Don't try dozens of settings until one passes. The winner of many tries is
+   usually luck, so keep the variants you test few.
+2. **Edge-decay monitor** (`core/edge_monitor.py`). Live fills are paired
+   into round trips and measured in R. Over the last 30 trades (evaluated
+   from 20 on), entries pause if the live profit factor falls below 0.8, or
+   if the live mean R is statistically below the backtest's (t < −2). The
+   pause persists across restarts until you review it and run
+   `bot.py --reset-edge-monitor`.
+3. **Market context** (`core/market_context.py`).
+   - `--market` trains with relative strength vs SPY over 12 and 48 bars,
+     plus SPY's trend and VWAP distance.
+   - `--market-filter` (`MARKET_FILTER=true`) pauses longs while SPY is below
+     both its EMA50 and its session VWAP. Longs in a falling tape start with
+     a headwind.
+   - Test both with `--compare` before relying on them.
+4. **Lower execution costs**.
+   - Entries are marketable limits 10 bps through the ask
+     (`ENTRY_ORDER_TYPE`, `ENTRY_LIMIT_OFFSET_BPS`). They cap what a gap or a
+     thin book can cost, and the backtester simulates the missed fills.
+   - Entries are skipped when the bid/ask spread is wider than 20 bps
+     (`MAX_SPREAD_BPS`).
+   - Unfilled entries are cancelled after 120 s (`ENTRY_ORDER_TTL_SECONDS`).
+   - Slippage is measured on every fill, so you can check the backtest's
+     cost assumptions (see Running unattended).
+   - With the free IEX feed, quotes are IEX-only and often wider than the
+     national best bid/offer; `ALPACA_DATA_FEED=sip` is better if your plan
+     includes it.
+5. **Portfolio heat and position caps**. Total risk to the stops across all
+   open positions is capped at 4% of equity (`MAX_PORTFOLIO_HEAT_PCT`), and
+   at most 5 positions can be open at once (`MAX_OPEN_POSITIONS`). This
+   matters because correlated positions all stop out together on a market
+   drop. Both apply live and in backtests (`--max-heat-pct`,
+   `--max-open-positions`).
+6. **Already in place**: regime filter, daily-trend confirmation,
+   volatility/Kelly sizing, trailing stops, the re-entry cooldown after
+   stop-outs, the intraday drawdown breaker, the PDT gate and no overnight
+   risk in day-trading mode.
+
+A reasonable path to live trading:
+1. Run a walk-forward with `--compare` on 6–12 months of data for 5–10
+   liquid symbols.
+2. Promote only a setup that passes.
+3. Paper trade it for several weeks.
+4. Compare live R and slippage with the backtest.
+5. Only then consider real money, starting small.
 
 #### Backtesting
 
@@ -341,6 +527,18 @@ Benchmark the new layers against the old behaviour on identical data with
 
 ```bash
 python scripts/backtest.py --regime suppress --mtf --mtf-gate --sizing kelly --trailing --compare --out reports/cmp
+```
+
+Use `--folds N` for a rolling walk-forward: the unseen period is split into
+N consecutive blocks and a fresh model is trained before each one on all
+earlier data. The report shows each fold, pooled out-of-sample stats and how
+many folds had positive average R; an edge that shows up in only one period
+is flagged. Every report also breaks trades down **by entry regime** and
+(intraday) **by entry hour**, so you can see whether losses cluster in
+CHOPPY/bear regimes or at the open (`by_regime.csv`, `by_entry_hour.csv`).
+
+```bash
+python scripts/backtest.py --timeframe 5m --days 120 --folds 4 --compare --out reports/wf
 ```
 
 The report shows return vs. equal-weight buy-and-hold, max drawdown, daily

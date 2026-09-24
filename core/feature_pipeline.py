@@ -4,7 +4,7 @@ One place that turns raw bars into the full feature frame, so live inference,
 training and backtesting can't drift apart:
 
     compute_features -> add_regime_columns -> add_intraday_features (1m/5m/15m)
-                     -> add_macro_features (optional)
+                     -> add_macro_features (optional) -> add_market_features (optional)
 
 Macro (higher-timeframe) anchor: daily bars for intraday timeframes, weekly
 bars (resampled from the dailies) when the primary timeframe is already 1Day.
@@ -26,6 +26,7 @@ from core.features import (
     compute_features,
     resample_bars,
 )
+from core.market_context import add_market_features
 from core.market_history import bar_length, is_intraday, normalize_timeframe
 from core.regime import add_regime_columns
 
@@ -50,7 +51,10 @@ def build_feature_frame(
     *,
     macro_bars: Optional[pd.DataFrame] = None,
     adx_threshold: Optional[float] = None,
+    market_bars: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
+    """``market_bars``: the index (SPY) on the same timeframe, for relative
+    strength / market-context features (NaN without it)."""
     timeframe = normalize_timeframe(timeframe)
     features = add_regime_columns(compute_features(bars), adx_threshold=adx_threshold)
     if is_intraday(timeframe):
@@ -64,12 +68,15 @@ def build_feature_frame(
         for column in INTRADAY_FEATURES:
             features[column] = np.nan
     if macro_bars is not None and len(macro_bars):
-        return add_macro_features(
+        features = add_macro_features(
             features,
             macro_bars,
             primary_bar_length=pd.Timedelta(bar_length(timeframe)),
             macro_bar_length=MACRO_LENGTH[macro_timeframe(timeframe)],
         )
-    for column in MACRO_FEATURES:
-        features[column] = np.nan
-    return features
+    else:
+        for column in MACRO_FEATURES:
+            features[column] = np.nan
+    return add_market_features(
+        features, market_bars, bar_length=pd.Timedelta(bar_length(timeframe)), intraday=is_intraday(timeframe)
+    )

@@ -44,9 +44,12 @@ from dotenv import load_dotenv  # noqa: E402
 
 load_dotenv()
 
+import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 
-from core.backtester import Backtester, BacktestConfig, format_report  # noqa: E402
+from core.backtester import Backtester, BacktestConfig, attribution, format_report  # noqa: E402
+from core.edge_gate import build_verdict, strategy_fingerprint, write_report  # noqa: E402
+from core.market_context import market_symbol  # noqa: E402
 from core.market_history import bar_length, get_history  # noqa: E402
 from core.ml_strategy import DEFAULT_MODEL_PATH, REGIME_POLICIES, MLStrategy, load_artifact  # noqa: E402
 from dataclasses import replace  # noqa: E402
@@ -125,17 +128,20 @@ def _variant(args, *, baseline: bool) -> dict:
         return {
             "name": "baseline",
             "use_macro": False,
-            "strategy": {"regime_policy": "off", "mtf_confirmation": False},
+            "use_market": False,
+            "strategy": {"regime_policy": "off", "mtf_confirmation": False, "market_filter": False},
             "sizing": "fixed",
             "trailing": TrailingConfig(enabled=False),
         }
     return {
         "name": "enhanced" if args.compare else "run",
         "use_macro": args.mtf,
+        "use_market": args.market,
         "strategy": {
             "regime_policy": args.regime,
             "regime_bump": args.regime_bump,
             "mtf_confirmation": args.mtf_gate,
+            "market_filter": args.market_filter,
         },
         "sizing": args.sizing,
         "trailing": TrailingConfig(
@@ -147,58 +153,25 @@ def _variant(args, *, baseline: bool) -> dict:
     }
 
 
-def _run_variant(args, variant, bars, macro, sentiment, scored, bar_len):
-    """Build the strategy for one variant (training it in walk-forward mode) and backtest it."""
-    start = audit = None
-    kwargs = dict(confidence_threshold=args.threshold, **variant["strategy"])
-    if args.mode == "walkforward":
-        timeline = sorted(set().union(*(f.index for f in bars.values())))
-        start = timeline[int(len(timeline) * args.train_fraction)]
-        params = LabelParams(horizon=args.horizon, stop_atr_mult=args.stop_atr, target_atr_mult=args.target_atr)
-        purge = params.horizon * bar_len
+def fold_windows(timeline, train_fraction: float, folds: int):
+    """Split the out-of-sample part of ``timeline`` into ``folds`` consecutive
+    blocks. Returns [(start, end_exclusive_or_None), ...]."""
+    first = int(len(timeline) * train_fraction)
+    if first <= 0 or first >= len(timeline):
+        raise ValueError("--train-fraction leaves no training or no test data")
+    test_positions = np.array_split(np.arange(first, len(timeline)), folds)
+    if any(len(block) == 0 for block in test_positions):
+        raise ValueError(f"Not enough bars for {folds} folds")
+    windows = []
+    for k, block in enumerate(test_positions):
+        start = timeline[block[0]]
+        end = timeline[test_positions[k + 1][0]] if k + 1 < folds else None
+        windows.append((start, end))
+    return windows
 
-        def dataset(symbol, frame):
-            return build_dataset(
-                frame, params, bar_len, (scored or {}).get(symbol), half_life=half_life_from_env(),
-                macro_bars=(macro or {}).get(symbol), use_macro=variant["use_macro"],
-            )
 
-        datasets = {}
-        for symbol, frame in bars.items():
-            data = dataset(symbol, frame[frame.index < start])
-            datasets[symbol] = data[data.index < start - purge]  # labels must not see the test period
-        artifact = train(
-            datasets, params, bar_len, threshold=args.threshold, timeframe=args.timeframe,
-            use_macro=variant["use_macro"],
-        )
-        logger.info(f"[{variant['name']}] trained on bars before {start}; trading {start} onward (unseen)")
-        strategy = MLStrategy(artifact, **kwargs)
-
-        test = pd.concat([d[d.index >= start] for d in (dataset(s, f) for s, f in bars.items())])
-        proba = artifact["pipeline"].predict_proba(test[artifact["feature_columns"]])[:, 1]
-        audit = {
-            "train_base_rate": artifact["train_base_rate"],
-            "test_base_rate": float(test["label"].mean()),
-            "exit_threshold_in_use": strategy.exit_threshold,
-            "thresholds": threshold_table(proba, test["label"], params),
-            "calibration": calibration_table(proba, test["label"]),
-        }
-    elif args.mode == "model":
-        artifact = load_artifact(args.model)
-        if artifact is None:
-            raise ValueError(f"No usable model at {args.model}; train one or use --mode walkforward")
-        data_end = artifact.get("data_end")
-        first_bar = min(f.index[0] for f in bars.values())
-        if data_end and pd.Timestamp(data_end) >= first_bar:
-            logger.warning(
-                f"Model was trained on data up to {data_end}, which overlaps this test period. "
-                "Results are IN-SAMPLE and overstate performance; prefer --mode walkforward."
-            )
-        strategy = MLStrategy(artifact, **kwargs)
-    else:
-        strategy = MLStrategy(artifact=None, model_path="/nonexistent", **kwargs)
-
-    config = BacktestConfig(
+def _config(args, variant, bar_len) -> BacktestConfig:
+    return BacktestConfig(
         initial_capital=args.capital,
         risk_per_trade_pct=args.risk_pct,
         slippage_bps=args.slippage_bps,
@@ -209,12 +182,141 @@ def _run_variant(args, variant, bars, macro, sentiment, scored, bar_len):
         trailing=variant["trailing"],
         session=args.session,
         spread_bps=args.spread_bps,
+        entry_limit_bps=args.entry_limit_offset_bps if args.entry_order_type == "limit" else None,
     )
+
+
+def _run_variant(args, variant, bars, macro, sentiment, scored, bar_len, market=None):
+    """Backtest one variant. Walk-forward mode trains a fresh model per fold on
+    everything before that fold's test block (expanding window, purged), so every
+    traded bar is out-of-sample. Returns ([(fold_label, result), ...], audit)."""
+    kwargs = dict(confidence_threshold=args.threshold, **variant["strategy"])
     limits = replace(RiskLimits.from_env(), day_trading=bool(args.session and args.session.no_overnight))
-    result = Backtester(strategy, RiskManager(limits), config).run(
-        bars, sentiment, start=start, macro_bars=macro
-    )
-    return result, audit
+    if args.reentry_cooldown_minutes is not None:
+        limits = replace(limits, reentry_cooldown_minutes=args.reentry_cooldown_minutes)
+    if args.max_heat_pct is not None:
+        limits = replace(limits, max_portfolio_heat_pct=args.max_heat_pct)
+    if args.max_open_positions is not None:
+        limits = replace(limits, max_open_positions=args.max_open_positions)
+    config = _config(args, variant, bar_len)
+
+    def backtest(strategy, start=None, end=None):
+        return Backtester(strategy, RiskManager(limits), config).run(
+            bars, sentiment, start=start, macro_bars=macro, end=end,
+            market_bars=market if (variant["use_market"] or variant["strategy"].get("market_filter")) else None,
+        )
+
+    if args.mode != "walkforward":
+        if args.folds > 1:
+            logger.warning("--folds only applies to --mode walkforward; running a single pass")
+        if args.mode == "model":
+            artifact = load_artifact(args.model)
+            if artifact is None:
+                raise ValueError(f"No usable model at {args.model}; train one or use --mode walkforward")
+            data_end = artifact.get("data_end")
+            first_bar = min(f.index[0] for f in bars.values())
+            if data_end and pd.Timestamp(data_end) >= first_bar:
+                logger.warning(
+                    f"Model was trained on data up to {data_end}, which overlaps this test period. "
+                    "Results are IN-SAMPLE and overstate performance; prefer --mode walkforward."
+                )
+            strategy = MLStrategy(artifact, **kwargs)
+        else:
+            strategy = MLStrategy(artifact=None, model_path="/nonexistent", **kwargs)
+        return [("all", backtest(strategy))], {"setup": strategy_fingerprint(strategy, args.timeframe)}
+
+    timeline = sorted(set().union(*(f.index for f in bars.values())))
+    params = LabelParams(horizon=args.horizon, stop_atr_mult=args.stop_atr, target_atr_mult=args.target_atr)
+    purge = params.horizon * bar_len
+    full = {
+        symbol: build_dataset(
+            frame, params, bar_len, (scored or {}).get(symbol), half_life=half_life_from_env(),
+            macro_bars=(macro or {}).get(symbol), use_macro=variant["use_macro"],
+            market_bars=market if variant["use_market"] else None,
+        )
+        for symbol, frame in bars.items()
+    }
+
+    results, probas, labels, base_rates, exit_threshold = [], [], [], [], None
+    windows = fold_windows(timeline, args.train_fraction, args.folds)
+    for k, (start, end) in enumerate(windows, 1):
+        # Features are causal and labels only look forward, so slicing the full
+        # dataset equals rebuilding it on the history; the purge keeps training
+        # labels from peeking into this fold's test block.
+        datasets = {s: d[d.index < start - purge] for s, d in full.items()}
+        artifact = train(
+            datasets, params, bar_len, threshold=args.threshold, timeframe=args.timeframe,
+            use_macro=variant["use_macro"], use_market=variant["use_market"],
+        )
+        strategy = MLStrategy(artifact, **kwargs)
+        exit_threshold = strategy.exit_threshold
+        label = f"fold {k}/{len(windows)}" if len(windows) > 1 else "all"
+        logger.info(f"[{variant['name']}] {label}: trained on bars before {start}; trading [{start}, {end or 'end'})")
+        results.append((label, backtest(strategy, start, end)))
+
+        test = pd.concat([d[(d.index >= start) & ((d.index < end) if end is not None else True)] for d in full.values()])
+        if len(test):
+            probas.append(artifact["pipeline"].predict_proba(test[artifact["feature_columns"]])[:, 1])
+            labels.append(test["label"].to_numpy())
+        base_rates.append(artifact["train_base_rate"])
+
+    proba, label_arr = np.concatenate(probas), np.concatenate(labels)
+    audit = {
+        "train_base_rate": float(np.mean(base_rates)),
+        "test_base_rate": float(label_arr.mean()),
+        "exit_threshold_in_use": exit_threshold,
+        "thresholds": threshold_table(proba, label_arr, params),
+        "calibration": calibration_table(proba, label_arr),
+        "setup": strategy_fingerprint(strategy, args.timeframe),
+    }
+    return results, audit
+
+
+def pooled_metrics(results) -> dict:
+    """Combine folds: trade stats pooled across all out-of-sample trades,
+    returns averaged per fold, drawdown = the worst fold."""
+    trades = [t for _, r in results for t in r.trades]
+    if len(results) == 1:
+        return dict(results[0][1].metrics, folds=1, positive_folds=int(results[0][1].metrics["avg_r"] > 0))
+    pnls = np.array([t.pnl for t in trades])
+    wins, losses = pnls[pnls > 0], pnls[pnls <= 0]
+    folds = [r.metrics for _, r in results]
+
+    def mean(key):
+        values = [f[key] for f in folds if f.get(key) == f.get(key)]  # skip NaN
+        return round(float(np.mean(values)), 2) if values else float("nan")
+
+    return {
+        "trades": len(trades),
+        "win_rate_pct": round(len(wins) / len(trades) * 100, 1) if trades else float("nan"),
+        "avg_r": round(float(np.nanmean([t.r_multiple for t in trades])), 3) if trades else float("nan"),
+        "profit_factor": round(float(wins.sum() / -losses.sum()), 2) if len(losses) and losses.sum() < 0 else float("nan"),
+        "total_return_pct": mean("total_return_pct"),
+        "benchmark_return_pct": mean("benchmark_return_pct"),
+        "max_drawdown_pct": round(min(f["max_drawdown_pct"] for f in folds), 2),
+        "sharpe_daily": mean("sharpe_daily"),
+        "exposure_pct": mean("exposure_pct"),
+        "folds": len(folds),
+        "positive_folds": sum(1 for f in folds if f.get("avg_r", float("nan")) > 0),
+    }
+
+
+def fold_table(results) -> pd.DataFrame:
+    rows = []
+    for label, r in results:
+        m = r.metrics
+        rows.append({
+            "fold": label,
+            "start": r.equity.index[0] if len(r.equity) else None,
+            "end": r.equity.index[-1] if len(r.equity) else None,
+            "trades": m["trades"],
+            "win_rate_pct": m["win_rate_pct"],
+            "avg_r": m["avg_r"],
+            "return_pct": m["total_return_pct"],
+            "buy_hold_pct": m["benchmark_return_pct"],
+            "max_dd_pct": m["max_drawdown_pct"],
+        })
+    return pd.DataFrame(rows)
 
 
 def _print_audit(audit) -> None:
@@ -242,23 +344,49 @@ COMPARE_METRICS = [
     ("max_drawdown_pct", "Max drawdown %"),
     ("sharpe_daily", "Sharpe (daily)"),
     ("exposure_pct", "Time in market %"),
+    ("positive_folds", "Folds with avg R > 0"),
 ]
 
 
-def comparison_table(results: dict) -> pd.DataFrame:
+def comparison_table(metrics_by_variant: dict) -> pd.DataFrame:
+    """``metrics_by_variant``: {variant name: pooled_metrics(...)}"""
     rows = []
     for key, label in COMPARE_METRICS:
         row = {"metric": label}
-        for name, result in results.items():
-            row[name] = result.metrics.get(key)
+        for name, metrics in metrics_by_variant.items():
+            row[name] = metrics.get(key)
         rows.append(row)
     return pd.DataFrame(rows)
+
+
+def _write_variant_reports(out: Path, results, audit) -> None:
+    """One fold: files directly in ``out``. Several: pooled files in ``out``
+    plus ``out/fold_<k>/`` per fold and ``folds.csv``."""
+    if len(results) == 1:
+        _write_reports(out, results[0][1], audit)
+        return
+    out.mkdir(parents=True, exist_ok=True)
+    trades = [t for _, r in results for t in r.trades]
+    pd.concat([r.trades_frame() for _, r in results], ignore_index=True).to_csv(out / "trades.csv", index=False)
+    attribution(trades, "regime").to_csv(out / "by_regime.csv", index=False)
+    attribution(trades, "entry_hour_et").to_csv(out / "by_entry_hour.csv", index=False)
+    fold_table(results).to_csv(out / "folds.csv", index=False)
+    summary = {"pooled": pooled_metrics(results)}
+    if audit and "thresholds" in audit:
+        audit["thresholds"].to_csv(out / "threshold_sweep.csv", index=False)
+        audit["calibration"].to_csv(out / "calibration.csv", index=False)
+        summary.update(train_base_rate=audit["train_base_rate"], test_base_rate=audit["test_base_rate"])
+    (out / "summary.json").write_text(json.dumps(summary, indent=2, default=str))
+    for k, (_, result) in enumerate(results, 1):
+        _write_reports(out / f"fold_{k}", result, None)
 
 
 def _write_reports(out: Path, result, audit) -> None:
     out.mkdir(parents=True, exist_ok=True)
     result.trades_frame().to_csv(out / "trades.csv", index=False)
     result.equity.rename("equity").to_csv(out / "equity.csv", index_label="time")
+    attribution(result.trades, "regime").to_csv(out / "by_regime.csv", index=False)
+    attribution(result.trades, "entry_hour_et").to_csv(out / "by_entry_hour.csv", index=False)
     summary = {
         "metrics": result.metrics,
         "signals": result.signals,
@@ -267,7 +395,7 @@ def _write_reports(out: Path, result, audit) -> None:
         "regime_mix": result.regime_mix,
         "skipped_outside_session": result.skipped_outside_session,
     }
-    if audit:
+    if audit and "thresholds" in audit:
         audit["thresholds"].to_csv(out / "threshold_sweep.csv", index=False)
         audit["calibration"].to_csv(out / "calibration.csv", index=False)
         summary.update(
@@ -286,7 +414,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--timeframe", default=os.getenv("ML_TIMEFRAME", "1Hour"),
                         help="1m, 5m, 15m, 1h (default) or 1d")
     parser.add_argument("--days", type=int, default=730)
-    parser.add_argument("--train-fraction", type=float, default=0.6, help="walkforward: share of history used to train")
+    parser.add_argument("--train-fraction", type=float, default=0.6,
+                        help="walkforward: share of history before the first test block")
+    parser.add_argument("--folds", type=int, default=1,
+                        help="walkforward: split the unseen period into N blocks, retraining before each "
+                             "(expanding window). Checks the edge holds across periods, not just one.")
     parser.add_argument("--horizon", type=int, default=12, help="walkforward: label horizon in bars")
     parser.add_argument("--stop-atr", type=float, default=float(os.getenv("ATR_STOP_MULT", "1.5")))
     parser.add_argument("--target-atr", type=float, default=float(os.getenv("ATR_TARGET_MULT", "3.0")))
@@ -306,6 +438,11 @@ def main(argv: list[str] | None = None) -> int:
     gates.add_argument("--adx-threshold", type=float, default=float(os.getenv("ADX_TREND_THRESHOLD", "25")))
     gates.add_argument("--mtf", action="store_true",
                        help="Train with higher-timeframe (daily/weekly) trend features")
+    gates.add_argument("--market", action="store_true",
+                       default=_env_bool("ML_MARKET_FEATURES", False),
+                       help="Train with market-context features (relative strength vs SPY, SPY trend/VWAP)")
+    gates.add_argument("--market-filter", action="store_true", default=_env_bool("MARKET_FILTER", False),
+                       help="No longs while the index is below its EMA50 and session VWAP")
     gates.add_argument("--mtf-gate", action="store_true", default=_env_bool("MTF_CONFIRMATION", False),
                        help="Only enter longs aligned with the higher-timeframe trend")
 
@@ -326,8 +463,23 @@ def main(argv: list[str] | None = None) -> int:
                           default=int(os.getenv("ENTRY_CUTOFF_MINUTES_BEFORE_CLOSE", "15")))
     intraday.add_argument("--flatten-minutes", type=int,
                           default=int(os.getenv("FLATTEN_MINUTES_BEFORE_CLOSE", "10")))
+    intraday.add_argument("--reentry-cooldown-minutes", type=float, default=None,
+                          help="No re-entry into a symbol this soon after a stop-out (default: "
+                               "REENTRY_COOLDOWN_MINUTES or 30; 0 disables)")
+    execution = parser.add_argument_group("execution and portfolio risk")
+    execution.add_argument("--entry-order-type", choices=("limit", "market"),
+                           default=os.getenv("ENTRY_ORDER_TYPE", "limit"),
+                           help="limit (default, as live): marketable limit that can miss on a gap; market: always fills")
+    execution.add_argument("--entry-limit-offset-bps", type=float,
+                           default=float(os.getenv("ENTRY_LIMIT_OFFSET_BPS", "10")))
+    execution.add_argument("--max-heat-pct", type=float, default=None,
+                           help="Max total $ at risk to stops, %% of equity (default MAX_PORTFOLIO_HEAT_PCT or 4)")
+    execution.add_argument("--max-open-positions", type=int, default=None,
+                           help="Max concurrent positions (default MAX_OPEN_POSITIONS or 5)")
     intraday.add_argument("--spread-bps", type=float, default=None,
                           help="Full bid/ask spread cost in bps, half paid per fill (default 2 intraday, 0 otherwise)")
+    parser.add_argument("--promote", action="store_true",
+                        help="Write the edge-gate verdict to EDGE_REPORT_PATH, which bot.py --execute requires")
     parser.add_argument("--compare", action="store_true",
                         help="Also run a baseline (all new layers off) on the same data and print both")
     args = parser.parse_args(argv)
@@ -364,42 +516,97 @@ def main(argv: list[str] | None = None) -> int:
         macro = {s: get_history(s, "1Day", args.days + 120, end=end) for s in bars}
         macro = {s: m for s, m in macro.items() if len(m)}  # missing ones are resampled from the primary bars
 
+    market = None
+    if args.market or args.market_filter:
+        if args.synthetic:
+            market = (synthetic_intraday_bars(days=args.days, freq=str(bar_len), seed=0) if intraday_run
+                      else synthetic_bars(n=max(args.days * 7, 1000), seed=0))
+        else:
+            market = get_history(market_symbol(), args.timeframe, args.days, end=end)
+        if market is None or len(market) < 300:
+            logger.error(f"--market/--market-filter need {market_symbol()} history; got "
+                         f"{0 if market is None else len(market)} bars")
+            return 1
+
     variants = [_variant(args, baseline=True)] if args.compare else []
     variants.append(_variant(args, baseline=False))
     results, audits = {}, {}
     for variant in variants:
         try:
             results[variant["name"]], audits[variant["name"]] = _run_variant(
-                args, variant, bars, macro, sentiment, scored, bar_len
+                args, variant, bars, macro, sentiment, scored, bar_len, market
             )
         except ValueError as exc:
             logger.error(f"[{variant['name']}] {exc}")
             return 1
 
     suffix = f"{args.mode}, {args.timeframe}, {', '.join(bars)}" + (" (synthetic)" if args.synthetic else "")
-    for name, result in results.items():
-        print()
-        print(format_report(result, f"{name} backtest: {suffix}"))
+    pooled = {name: pooled_metrics(fold_results) for name, fold_results in results.items()}
+    for name, fold_results in results.items():
+        if len(fold_results) == 1:
+            print()
+            print(format_report(fold_results[0][1], f"{name} backtest: {suffix}"))
+            continue
+        print(f"\n== {name} backtest: {suffix}, {len(fold_results)} walk-forward folds ==")
+        print(fold_table(fold_results).to_string(index=False))
+        p = pooled[name]
+        print(
+            f"Pooled out-of-sample: {p['trades']} trades, win rate {p['win_rate_pct']}%, avg R {p['avg_r']}, "
+            f"profit factor {p['profit_factor']}; mean fold return {p['total_return_pct']}% vs buy & hold "
+            f"{p['benchmark_return_pct']}%; worst fold drawdown {p['max_drawdown_pct']}%; "
+            f"{p['positive_folds']}/{p['folds']} folds with positive avg R"
+        )
+        trades = [t for _, r in fold_results for t in r.trades]
+        if trades:
+            print("\nBy entry regime (all folds):")
+            print(attribution(trades, "regime").to_string(index=False))
+            if bar_len < timedelta(days=1):
+                print("\nBy entry hour ET (all folds):")
+                print(attribution(trades, "entry_hour_et").to_string(index=False))
     main_name = variants[-1]["name"]
-    if audits.get(main_name):
+    if audits.get(main_name) and "thresholds" in audits[main_name]:
         _print_audit(audits[main_name])
 
     if args.compare:
         print("\n== Baseline vs enhanced (same data, same unseen period) ==")
-        print(comparison_table(results).to_string(index=False))
+        print(comparison_table(pooled).to_string(index=False))
 
-    m = results[main_name].metrics
+    m = pooled[main_name]
     if m["trades"] < 30:
         print(f"\n⚠️  Only {m['trades']} trades: too few to judge the strategy. Use more symbols or history.")
     elif m["total_return_pct"] <= m["benchmark_return_pct"] or not m["avg_r"] > 0:
         print("\n⚠️  The strategy did not beat buy-and-hold or lost money per trade. Keep the bot in dry-run.")
+    elif m["folds"] > 1 and m["positive_folds"] < m["folds"]:
+        print(
+            f"\n⚠️  Only {m['positive_folds']} of {m['folds']} folds had positive avg R: the edge is not "
+            "consistent across periods."
+        )
+
+    verdict = build_verdict(m, audits[main_name]["setup"], list(bars))
+    print("\n== Edge gate (live trading requires a pass) ==")
+    if verdict.passed:
+        print(f"PASS: {m['trades']} trades, profit factor {m['profit_factor']}, avg R {m['avg_r']}, "
+              f"{m['positive_folds']}/{m['folds']} positive folds, worst drawdown {m['max_drawdown_pct']}%")
+    else:
+        for failure in verdict.failures:
+            print(f"FAIL: {failure}")
+    if args.promote:
+        if args.mode == "model" or args.synthetic:
+            print("Not promoted: only walk-forward (or heuristic) runs on real data can validate live trading.")
+        elif not verdict.passed:
+            print("Not promoted: the setup failed the edge gate; the bot will keep entries blocked.")
+            write_report(verdict)  # record the failure so a stale pass can't linger
+        else:
+            print(f"Promoted: wrote {write_report(verdict)}; bot.py --execute may now open positions "
+                  "with exactly this setup.")
 
     if args.out:
         out = Path(args.out)
-        for name, result in results.items():
-            _write_reports(out / name if args.compare else out, result, audits.get(name))
+        write_report(verdict, out / "edge_report.json")
+        for name, fold_results in results.items():
+            _write_variant_reports(out / name if args.compare else out, fold_results, audits.get(name))
         if args.compare:
-            comparison_table(results).to_csv(out / "comparison.csv", index=False)
+            comparison_table(pooled).to_csv(out / "comparison.csv", index=False)
         print(f"\nWrote reports to {out}/")
     return 0
 

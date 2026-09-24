@@ -13,7 +13,7 @@ Usage:
 import os
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, time
+from datetime import datetime, time, timezone
 from typing import Any, Callable, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
@@ -21,7 +21,7 @@ import requests
 from dotenv import load_dotenv
 
 from core.execution_telemetry import EventLog, Rejection, classify_rejection
-from core.risk_manager import RiskManager
+from core.risk_manager import RiskManager, last_exit_fill, portfolio_risk
 from core.session_clock import SessionClock, SessionPhase
 
 load_dotenv()
@@ -29,6 +29,13 @@ logger = logging.getLogger(__name__)
 
 
 MARKET_TZ = ZoneInfo("America/New_York")
+TRADING_MODES = ("paper", "live")
+PAPER_BASE_URL = "https://paper-api.alpaca.markets/v2"
+LIVE_BASE_URL = "https://api.alpaca.markets/v2"
+
+
+def live_trading_armed() -> bool:
+    return os.getenv("LIVE_TRADING_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
 
 
 @dataclass(frozen=True)
@@ -87,10 +94,54 @@ def _default_price_lookup(symbol: str) -> float:
     return float(quote.get("current_price") or 0)
 
 
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
+@dataclass(frozen=True)
+class ExecutionConfig:
+    """How entries are sent (execution cost control).
+
+    entry_order_type   "limit" (default): a marketable limit ENTRY_LIMIT_OFFSET_BPS
+                       through the ask. It fills like a market order in normal
+                       conditions but caps what a gap or thin book can cost;
+                       "market" sends a plain market bracket.
+    max_spread_bps     Skip entries when the quoted bid/ask spread is wider
+                       (0 disables). A missing quote does not block.
+    entry_ttl_seconds  Unfilled entry orders older than this are cancelled
+                       each cycle so a missed limit never fills much later.
+    """
+
+    entry_order_type: str = "limit"
+    entry_limit_offset_bps: float = 10.0
+    max_spread_bps: float = 20.0
+    entry_ttl_seconds: float = 120.0
+
+    @classmethod
+    def from_env(cls) -> "ExecutionConfig":
+        kind = os.getenv("ENTRY_ORDER_TYPE", cls.entry_order_type).strip().lower()
+        return cls(
+            entry_order_type=kind if kind in {"limit", "market"} else cls.entry_order_type,
+            entry_limit_offset_bps=_env_float("ENTRY_LIMIT_OFFSET_BPS", cls.entry_limit_offset_bps),
+            max_spread_bps=_env_float("MAX_SPREAD_BPS", cls.max_spread_bps),
+            entry_ttl_seconds=_env_float("ENTRY_ORDER_TTL_SECONDS", cls.entry_ttl_seconds),
+        )
+
+
+def spread_bps(bid: float, ask: float) -> Optional[float]:
+    if bid <= 0 or ask <= 0 or ask < bid:
+        return None
+    return (ask - bid) / ((ask + bid) / 2) * 10_000
+
+
 class AlpacaExecutor:
     """
     Sends orders to Alpaca and returns results.
-    Uses Alpaca paper trading by default.
+    Uses Alpaca paper trading by default; ``mode="live"`` trades real money
+    and requires separate live keys plus LIVE_TRADING_ENABLED=true.
 
     Every order passes through a RiskManager first, and every BUY is sent as
     a bracket order so its stop-loss and take-profit live at the broker.
@@ -103,37 +154,68 @@ class AlpacaExecutor:
         price_lookup: Optional[Callable[[str], float]] = None,
         telemetry: Optional[EventLog] = None,
         session_clock: Optional[SessionClock] = None,
+        execution: Optional[ExecutionConfig] = None,
+        quote_lookup: Optional[Callable[[str], Optional[Dict[str, float]]]] = None,
+        mode: str = "paper",
+        require_armed: bool = True,
     ):
+        self.execution = execution or ExecutionConfig.from_env()
+        self.quote_lookup = quote_lookup
         self.risk_manager = risk_manager or RiskManager()
         # Optional intraday session rules (opening lockout / EOD cutoff) for entries.
         self.session_clock = session_clock
         self.telemetry = telemetry or EventLog.from_env()
+        # order id -> price we expected to fill at (for slippage measurement,
+        # see core/fill_quality.py). Bracket legs carry their own stop/limit.
+        self.expected_prices: Dict[str, float] = {}
         self.price_lookup = price_lookup or _default_price_lookup
-        self.api_key = os.getenv("ALPACA_API_KEY")
-        self.secret_key = os.getenv("ALPACA_SECRET_KEY")
-        self.base_url = self._normalize_base_url(
-            base_url
-            or os.getenv("ALPACA_TRADING_BASE_URL")
-            or os.getenv("ALPACA_BASE_URL")
-            or "https://paper-api.alpaca.markets/v2"
-        )
+        mode = (mode or "paper").strip().lower()
+        if mode not in TRADING_MODES:
+            raise ValueError(f"Unknown trading mode {mode!r}; use 'paper' or 'live'")
+        self.mode = mode
 
-        if not self.api_key or not self.secret_key:
-            raise ValueError(
-                "ALPACA_API_KEY and ALPACA_SECRET_KEY must be set in your .env file"
+        if mode == "live":
+            # Real money: separate keys, a fixed endpoint (never from config),
+            # and an explicit arming switch that the GUI/CLI sets deliberately.
+            self.api_key = os.getenv("ALPACA_LIVE_API_KEY")
+            self.secret_key = os.getenv("ALPACA_LIVE_SECRET_KEY")
+            if not self.api_key or not self.secret_key:
+                raise ValueError("Live trading needs ALPACA_LIVE_API_KEY and ALPACA_LIVE_SECRET_KEY")
+            # require_armed=False is only for read-only views and the emergency
+            # flatten (which can only reduce risk); the bot never uses it.
+            if require_armed and not live_trading_armed():
+                raise ValueError(
+                    "Live trading is not armed. Arm it on the dashboard's Live Trading tab "
+                    "(or set LIVE_TRADING_ENABLED=true) after reading the warnings."
+                )
+            self.base_url = LIVE_BASE_URL
+        else:
+            self.api_key = os.getenv("ALPACA_API_KEY")
+            self.secret_key = os.getenv("ALPACA_SECRET_KEY")
+            self.base_url = self._normalize_base_url(
+                base_url
+                or os.getenv("ALPACA_TRADING_BASE_URL")
+                or os.getenv("ALPACA_BASE_URL")
+                or PAPER_BASE_URL
             )
-
-        if "paper-api.alpaca.markets" not in self.base_url:
-            raise ValueError(
-                "Paper trading requires ALPACA_TRADING_BASE_URL=https://paper-api.alpaca.markets/v2"
-            )
+            if not self.api_key or not self.secret_key:
+                raise ValueError(
+                    "ALPACA_API_KEY and ALPACA_SECRET_KEY must be set in your .env file"
+                )
+            if "paper-api.alpaca.markets" not in self.base_url:
+                raise ValueError(
+                    "Paper trading requires ALPACA_TRADING_BASE_URL=https://paper-api.alpaca.markets/v2"
+                )
 
         self.headers = {
             "APCA-API-KEY-ID": self.api_key,
             "APCA-API-SECRET-KEY": self.secret_key,
             "Content-Type": "application/json",
         }
-        logger.info("AlpacaExecutor ready in PAPER mode")
+        if mode == "live":
+            logger.warning("AlpacaExecutor ready in LIVE mode: orders use REAL MONEY")
+        else:
+            logger.info("AlpacaExecutor ready in PAPER mode")
 
     def _normalize_base_url(self, base_url: str) -> str:
         """Accept either the Alpaca root URL or the versioned v2 URL."""
@@ -185,6 +267,7 @@ class AlpacaExecutor:
             headers=self.headers,
             params={
                 "status": "all",
+                "nested": "true",  # bracket legs under their parent (stop-out detection)
                 "after": start.isoformat(),
                 "limit": 500,
                 "direction": "desc",
@@ -255,6 +338,19 @@ class AlpacaExecutor:
                 live_price = 0.0
             price = live_price or price
 
+            quote = self._quote(symbol)
+            if quote:
+                spread = spread_bps(quote["bid"], quote["ask"])
+                limit = self.execution.max_spread_bps
+                if spread is not None and limit > 0 and spread > limit:
+                    self.telemetry.record("entry_skipped_spread", symbol=symbol, bid=quote["bid"],
+                                          ask=quote["ask"], spread_bps=round(spread, 1), limit_bps=limit)
+                    return ExecutionResult(
+                        skipped_reason=f"Spread too wide for {symbol}: {spread:.1f} bps > MAX_SPREAD_BPS {limit:g}"
+                    )
+                if quote["ask"] > 0:
+                    price = quote["ask"]  # a buy pays the ask: size and place stops from it
+
         stop_loss, take_profit = risk.get("stop_loss"), risk.get("take_profit")
         stop_distance = float(risk.get("stop_distance") or 0)
         target_distance = float(risk.get("target_distance") or 0)
@@ -262,6 +358,12 @@ class AlpacaExecutor:
             # ATR-based distances re-centred on the live entry price.
             stop_loss, take_profit = price - stop_distance, price + target_distance
 
+        orders_today = self.get_orders_today() if action == "BUY" else []
+        exposure = None
+        if action == "BUY":
+            snapshot = self.get_snapshot()
+            exposure = portfolio_risk(snapshot.positions, snapshot.open_orders,
+                                      self.risk_manager.limits.stop_loss_pct)
         decision = self.risk_manager.check_order(
             side=action,
             symbol=symbol,
@@ -269,9 +371,11 @@ class AlpacaExecutor:
             price=price,
             account=self.get_account(),
             position=position,
-            orders_today=self.get_orders_today() if action == "BUY" else (),
+            orders_today=orders_today,
             stop_loss=stop_loss,
             take_profit=take_profit,
+            last_exit=last_exit_fill(orders_today, symbol),
+            portfolio=exposure,
         )
         if not decision.approved:
             logger.warning(f"Risk check blocked {action} {quantity} {symbol}: {decision.reason}")
@@ -281,14 +385,29 @@ class AlpacaExecutor:
             if action == "SELL":
                 # Bracket stop/target legs reserve the shares; release them first.
                 self.cancel_open_orders(symbol)
-                return ExecutionResult(order=self._place_order(symbol, decision.quantity, "sell"))
+                order = self._place_order(symbol, decision.quantity, "sell")
+                self._record_submitted(order, symbol, "sell", decision.quantity, expected_price=price)
+                return ExecutionResult(order=order)
 
             order = self._place_bracket_order(
-                symbol, decision.quantity, decision.stop_loss, decision.take_profit
+                symbol, decision.quantity, decision.stop_loss, decision.take_profit, **self._entry_kwargs(price)
             )
+            self._record_submitted(order, symbol, "buy", decision.quantity, decision.stop_loss,
+                                   decision.take_profit, expected_price=price)
             return ExecutionResult(order=order)
         except requests.exceptions.HTTPError as exc:
             return self._recover_from_rejection(exc, action, symbol, decision.quantity, price)
+
+    def _record_submitted(self, order: Dict, symbol: str, side: str, qty: int,
+                          stop_loss: Optional[float] = None, take_profit: Optional[float] = None,
+                          recovered: bool = False, expected_price: Optional[float] = None) -> None:
+        if order.get("id") and expected_price:
+            self.expected_prices[order["id"]] = float(expected_price)
+        self.telemetry.record(
+            "order_submitted", symbol=symbol, side=side, qty=int(float(order.get("qty") or qty)),
+            order_id=order.get("id"), status=order.get("status"), stop_loss=stop_loss,
+            take_profit=take_profit, recovered=recovered, expected_price=expected_price,
+        )
 
     # ------------------------------------------------------------------
     # Rejection handling
@@ -322,7 +441,8 @@ class AlpacaExecutor:
                 stop, target = self.risk_manager.bracket_prices(price)
                 if stop is not None:
                     plan = f"retry with {affordable} shares (buying power ${buying_power:,.2f})"
-                    retry = lambda: self._place_bracket_order(symbol, affordable, stop, target)  # noqa: E731
+                    retry = lambda: self._place_bracket_order(  # noqa: E731
+                        symbol, affordable, stop, target, **self._entry_kwargs(price))
         elif action == "BUY" and rejection.category == "invalid_price":
             try:
                 fresh = float(self.price_lookup(symbol) or 0)
@@ -331,7 +451,8 @@ class AlpacaExecutor:
             stop, target = self.risk_manager.bracket_prices(fresh) if fresh > 0 else (None, None)
             if stop is not None:
                 plan = f"retry with levels from fresh quote ${fresh:.2f}: stop {stop}, target {target}"
-                retry = lambda: self._place_bracket_order(symbol, quantity, stop, target)  # noqa: E731
+                retry = lambda: self._place_bracket_order(  # noqa: E731
+                    symbol, quantity, stop, target, **self._entry_kwargs(fresh))
         elif action == "SELL" and rejection.category in {"wash_trade", "qty_held"}:
             self.cancel_open_orders(symbol)
             position = self.get_position(symbol) or {}
@@ -361,6 +482,7 @@ class AlpacaExecutor:
             )
         self.telemetry.record("order_recovered", symbol=symbol, side=action, category=rejection.category,
                               order_id=order.get("id"), plan=plan)
+        self._record_submitted(order, symbol, action.lower(), quantity, recovered=True, expected_price=price)
         return ExecutionResult(order=order, rejection=rejection, recovered=True)
 
     def _place_order(
@@ -406,18 +528,22 @@ class AlpacaExecutor:
         quantity: int,
         stop_loss: float,
         take_profit: float,
+        limit_price: Optional[float] = None,
     ) -> Dict:
-        """Buy at market with a broker-side stop-loss and take-profit attached."""
+        """Buy (market, or marketable limit when ``limit_price`` is given) with a
+        broker-side stop-loss and take-profit attached."""
         payload = {
             "symbol": symbol,
             "qty": str(quantity),
             "side": "buy",
-            "type": "market",
+            "type": "limit" if limit_price else "market",
             "time_in_force": "gtc",
             "order_class": "bracket",
             "take_profit": {"limit_price": str(take_profit)},
             "stop_loss": {"stop_price": str(stop_loss)},
         }
+        if limit_price:
+            payload["limit_price"] = str(limit_price)
 
         logger.info(
             f"Placing bracket order: BUY {quantity} {symbol} "
@@ -515,7 +641,10 @@ class AlpacaExecutor:
             if qty == 0:
                 continue
             try:
-                order = self.close_position(symbol, qty, float(position.get("current_price") or 0))
+                last_price = float(position.get("current_price") or 0)
+                order = self.close_position(symbol, qty, last_price)
+                if order.get("id") and last_price > 0:
+                    self.expected_prices[order["id"]] = last_price
                 report.closed.append({"symbol": symbol, "qty": qty, "order_id": order.get("id")})
             except requests.exceptions.HTTPError as exc:
                 rejection = self._rejection(exc, symbol=symbol, side="close", qty=qty, attempt=1)
@@ -543,6 +672,62 @@ class AlpacaExecutor:
     # ------------------------------------------------------------------
     # Broker state (reconciliation / trailing stops)
     # ------------------------------------------------------------------
+
+    def _entry_kwargs(self, price: float) -> Dict[str, float]:
+        """Marketable-limit price for an entry (empty = market order)."""
+        if self.execution.entry_order_type != "limit" or price <= 0:
+            return {}
+        return {"limit_price": round(price * (1 + self.execution.entry_limit_offset_bps / 10_000), 2)}
+
+    def _quote(self, symbol: str) -> Optional[Dict[str, float]]:
+        try:
+            quote = (self.quote_lookup or self.get_quote)(symbol)
+        except Exception as exc:
+            logger.warning(f"Quote for {symbol} unavailable ({exc}); spread filter skipped")
+            return None
+        if not quote or float(quote.get("bid") or 0) <= 0 or float(quote.get("ask") or 0) <= 0:
+            return None
+        return {"bid": float(quote["bid"]), "ask": float(quote["ask"])}
+
+    def get_quote(self, symbol: str) -> Optional[Dict[str, float]]:
+        """Latest bid/ask from Alpaca market data. With the free IEX feed this is
+        IEX's book, usually wider than the national best bid/offer, so set
+        ALPACA_DATA_FEED=sip if your plan has it."""
+        base = os.getenv("ALPACA_DATA_BASE_URL", "https://data.alpaca.markets").rstrip("/")
+        resp = requests.get(
+            f"{base}/v2/stocks/{symbol}/quotes/latest",
+            headers=self.headers,
+            params={"feed": os.getenv("ALPACA_DATA_FEED", "iex")},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        quote = resp.json().get("quote") or {}
+        return {"bid": float(quote.get("bp") or 0), "ask": float(quote.get("ap") or 0)}
+
+    def cancel_stale_entries(self, open_orders: List[Dict], now: Optional[datetime] = None) -> List[str]:
+        """Cancel unfilled entry orders (bracket parents) older than the TTL.
+        Partially filled ones are left alone: their filled shares are protected
+        by the bracket legs."""
+        ttl = self.execution.entry_ttl_seconds
+        if ttl <= 0:
+            return []
+        now = now or datetime.now(timezone.utc)
+        cancelled = []
+        for order in open_orders:
+            if order.get("parent_id") or str(order.get("side", "")).lower() != "buy":
+                continue
+            if str(order.get("status", "")).lower() not in {"new", "accepted", "pending_new"}:
+                continue
+            submitted = order.get("submitted_at") or order.get("created_at")
+            try:
+                age = (now - datetime.fromisoformat(str(submitted).replace("Z", "+00:00"))).total_seconds()
+            except ValueError:
+                continue
+            if age > ttl and self.cancel_order(order["id"]):
+                cancelled.append(order["id"])
+                self.telemetry.record("entry_expired", symbol=order.get("symbol"), order_id=order["id"],
+                                      age_seconds=round(age), limit_price=order.get("limit_price"))
+        return cancelled
 
     def get_open_orders(self) -> List[Dict]:
         """All open orders with bracket legs flattened into the list."""

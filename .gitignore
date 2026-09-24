@@ -161,3 +161,8 @@ models/
 # Runtime telemetry and bot state
 logs/
 data/trailing_state.json
+data/fill_state.json
+data/edge_monitor.json
+data/paper/
+data/live/
+reports/

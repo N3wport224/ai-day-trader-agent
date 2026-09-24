@@ -118,17 +118,33 @@ def classify_rejection(http_status: Optional[int], body: str) -> Rejection:
     return Rejection(category, root_cause, remediation, http_status, code, message)
 
 
-class EventLog:
-    """Append-only JSONL telemetry. ``path=None`` keeps events in memory only."""
+_DEFAULT_ALERTS: Dict[str, Any] = {}
 
-    def __init__(self, path: Optional[str] = None, keep_last: int = 500) -> None:
+
+def default_alert_sink():
+    """One process-wide AlertSink (shared throttling) or None if not configured."""
+    from core.alerts import AlertSink
+
+    url = os.getenv("ALERT_WEBHOOK_URL", "").strip()
+    if url not in _DEFAULT_ALERTS:
+        _DEFAULT_ALERTS[url] = AlertSink.from_env() if url else None
+    return _DEFAULT_ALERTS[url]
+
+
+class EventLog:
+    """Append-only JSONL telemetry. ``path=None`` keeps events in memory only.
+    Events are also offered to ``alerts`` (see core/alerts.py)."""
+
+    def __init__(self, path: Optional[str] = None, keep_last: int = 500, alerts: Optional[Any] = None) -> None:
         self.path = Path(path) if path else None
         self.keep_last = keep_last
         self.events: List[Dict[str, Any]] = []
+        self.alerts = alerts
 
     @classmethod
     def from_env(cls) -> "EventLog":
-        return cls(os.getenv("EXECUTION_LOG_PATH", "logs/execution_events.jsonl") or None)
+        return cls(os.getenv("EXECUTION_LOG_PATH", "logs/execution_events.jsonl") or None,
+                   alerts=default_alert_sink())
 
     def record(self, event: str, level: int = logging.INFO, **fields: Any) -> Dict[str, Any]:
         entry = {"ts": datetime.now(timezone.utc).isoformat(), "event": event, **fields}
@@ -143,4 +159,9 @@ class EventLog:
                     fh.write(line + "\n")
             except OSError as exc:  # telemetry must never break trading
                 logger.error(f"Could not write telemetry to {self.path}: {exc}")
+        if self.alerts is not None:
+            try:
+                self.alerts.notify(entry)
+            except Exception as exc:
+                logger.warning(f"Alert dispatch failed: {exc}")
         return entry

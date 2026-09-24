@@ -37,3 +37,16 @@ def _isolate_runtime_files(tmp_path: Path, monkeypatch) -> None:
     """Keep telemetry and trailing-stop state out of the repo during tests."""
     monkeypatch.setenv("EXECUTION_LOG_PATH", str(tmp_path / "execution_events.jsonl"))
     monkeypatch.setenv("TRAILING_STATE_PATH", str(tmp_path / "trailing_state.json"))
+    monkeypatch.setenv("HEARTBEAT_PATH", str(tmp_path / "heartbeat.json"))
+    monkeypatch.setenv("FILL_STATE_PATH", str(tmp_path / "fill_state.json"))
+    monkeypatch.setenv("EDGE_MONITOR_STATE_PATH", str(tmp_path / "edge_monitor.json"))
+    monkeypatch.setenv("EDGE_REPORT_PATH", str(tmp_path / "edge_report.json"))
+    # Tests feed historical synthetic bars; the live stale-bar guard is tested explicitly.
+    monkeypatch.setenv("MAX_BAR_AGE_BARS", "0")
+    monkeypatch.delenv("ALERT_WEBHOOK_URL", raising=False)
+    # Entries read open positions/stops for the portfolio heat cap; default to
+    # an empty account so executor tests never touch the network.
+    from core.alpaca_executor import AlpacaExecutor, BrokerSnapshot
+
+    monkeypatch.setattr(AlpacaExecutor, "get_snapshot", lambda self: BrokerSnapshot(positions=[], open_orders=[]))
+    monkeypatch.setattr(AlpacaExecutor, "get_quote", lambda self, symbol: None)  # no quote: spread filter skipped

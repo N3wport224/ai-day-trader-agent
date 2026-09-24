@@ -41,14 +41,15 @@ import numpy as np
 import pandas as pd
 
 from core.features import INTRADAY_FEATURES, MACRO_FEATURES, TECHNICAL_FEATURES
+from core.market_context import MARKET_FEATURES
 from core.news_sentiment import SENTIMENT_FEATURES, UNAVAILABLE, SentimentSnapshot
 from core.regime import TRENDING_BULL
 
 logger = logging.getLogger(__name__)
 
 FEATURE_COLUMNS = TECHNICAL_FEATURES + SENTIMENT_FEATURES
-# Optional inputs a model may be trained with (--mtf; intraday timeframes).
-KNOWN_FEATURES = FEATURE_COLUMNS + MACRO_FEATURES + INTRADAY_FEATURES
+# Optional inputs a model may be trained with (--mtf; intraday timeframes; --market).
+KNOWN_FEATURES = FEATURE_COLUMNS + MACRO_FEATURES + INTRADAY_FEATURES + MARKET_FEATURES
 REGIME_POLICIES = ("off", "suppress", "penalty")
 ARTIFACT_VERSION = 1
 DEFAULT_MODEL_PATH = "models/ml_signal.joblib"
@@ -70,7 +71,8 @@ class MLSignal:
     reasons: List[str] = field(default_factory=list)
     regime: Optional[str] = None          # TRENDING_BULL / TRENDING_BEAR / CHOPPY / UNKNOWN
     macro_aligned: Optional[float] = None  # 1.0 if aligned with the daily trend, 0.0 if not
-    gated_by: Optional[str] = None        # "regime" or "mtf" when a BUY was vetoed
+    gated_by: Optional[str] = None        # "regime", "mtf" or "market" when a BUY was vetoed
+    market_ok: Optional[float] = None     # 1.0 healthy tape, 0.0 weak, None unknown
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -89,6 +91,7 @@ class MLSignal:
             "regime": self.regime,
             "macro_aligned": self.macro_aligned,
             "gated_by": self.gated_by,
+            "market_ok": self.market_ok,
         }
 
 
@@ -168,6 +171,7 @@ class MLStrategy:
         regime_policy: Optional[str] = None,
         regime_bump: Optional[float] = None,
         mtf_confirmation: Optional[bool] = None,
+        market_filter: Optional[bool] = None,
     ) -> None:
         if artifact is None:
             artifact = load_artifact(model_path or os.getenv("ML_MODEL_PATH", DEFAULT_MODEL_PATH))
@@ -198,6 +202,9 @@ class MLStrategy:
         if mtf_confirmation is None:
             mtf_confirmation = os.getenv("MTF_CONFIRMATION", "false").strip().lower() in {"1", "true", "yes", "on"}
         self.mtf_confirmation = mtf_confirmation
+        if market_filter is None:
+            market_filter = os.getenv("MARKET_FILTER", "false").strip().lower() in {"1", "true", "yes", "on"}
+        self.market_filter = market_filter
         self.feature_columns = list((artifact or {}).get("feature_columns") or FEATURE_COLUMNS)
 
     def without_model(self) -> "MLStrategy":
@@ -211,6 +218,11 @@ class MLStrategy:
     def uses_macro(self) -> bool:
         """True when the model or the MTF gate needs daily-timeframe features."""
         return self.mtf_confirmation or any(c in MACRO_FEATURES for c in self.feature_columns)
+
+    @property
+    def uses_market(self) -> bool:
+        """True when the model or the market filter needs index (SPY) bars."""
+        return self.market_filter or any(c in MARKET_FEATURES for c in self.feature_columns)
 
     @property
     def mode(self) -> str:
@@ -276,9 +288,11 @@ class MLStrategy:
         regime = latest.get("regime") if isinstance(latest.get("regime"), str) else None
         macro_aligned = latest.get("macro_trend_aligned")
         macro_aligned = float(macro_aligned) if macro_aligned is not None and pd.notna(macro_aligned) else None
+        market_ok = latest.get("market_ok")
+        market_ok = float(market_ok) if market_ok is not None and pd.notna(market_ok) else None
         gated_by = None
         if signal == "BUY":
-            gated_by = self._entry_gate(probability_up, regime, macro_aligned, reasons)
+            gated_by = self._entry_gate(probability_up, regime, macro_aligned, reasons, market_ok)
             if gated_by:
                 signal, confidence = "HOLD", probability_up
 
@@ -308,6 +322,7 @@ class MLStrategy:
             regime=regime,
             macro_aligned=macro_aligned,
             gated_by=gated_by,
+            market_ok=market_ok,
         )
 
     def _entry_gate(
@@ -316,8 +331,9 @@ class MLStrategy:
         regime: Optional[str],
         macro_aligned: Optional[float],
         reasons: List[str],
+        market_ok: Optional[float] = None,
     ) -> Optional[str]:
-        """Return "regime"/"mtf" if a long entry should be vetoed, else None."""
+        """Return "regime"/"mtf"/"market" if a long entry should be vetoed, else None."""
         if regime is not None and self.regime_policy != "off" and regime != TRENDING_BULL:
             if self.regime_policy == "suppress":
                 reasons.append(f"{regime} regime: long entries suppressed")
@@ -333,6 +349,12 @@ class MLStrategy:
                 if macro_aligned == 0.0 else "daily trend unavailable; no MTF confirmation"
             )
             return "mtf"
+        if self.market_filter and market_ok != 1.0:
+            reasons.append(
+                "weak market tape (index below its EMA50 and session VWAP); longs paused"
+                if market_ok == 0.0 else "market (index) data unavailable; no market confirmation"
+            )
+            return "market"
         return None
 
     @staticmethod

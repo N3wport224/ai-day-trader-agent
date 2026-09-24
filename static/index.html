@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>AI Day Trader</title>
   <link rel="stylesheet" href="/static/css/dashboard.css">
+  <link rel="stylesheet" href="/static/css/control.css">
 </head>
 <body>
 
@@ -14,6 +15,28 @@
       <div class="login-card">
         <h1>AI Day Trader</h1>
         <p class="subtitle">Trading Dashboard</p>
+
+        <div id="setup-card" class="setup-card" hidden>
+          <h2>Welcome! Create your account</h2>
+          <p class="muted">This is the first time the dashboard has run. Create the owner account that will
+            control the bot. It stays on this computer.</p>
+          <form id="setup-form">
+            <div class="form-group">
+              <label class="form-label" for="setup-username">Username</label>
+              <input class="form-input" type="text" id="setup-username" required minlength="3" autocomplete="username">
+            </div>
+            <div class="form-group">
+              <label class="form-label" for="setup-email">Email</label>
+              <input class="form-input" type="email" id="setup-email" required autocomplete="email">
+            </div>
+            <div class="form-group">
+              <label class="form-label" for="setup-password">Password (8+ characters)</label>
+              <input class="form-input" type="password" id="setup-password" required minlength="8" autocomplete="new-password">
+            </div>
+            <button type="submit" class="btn btn-primary btn-block">Create account</button>
+            <div id="setup-error" class="error-msg"></div>
+          </form>
+        </div>
 
         <form id="login-form">
           <div class="form-group">
@@ -86,6 +109,193 @@
       </div>
     </header>
 
+    <div id="app-shell">
+      <nav id="sidebar" aria-label="Main">
+        <button class="nav-item active" data-view="start"><span class="nav-icon">🏠</span><span>Get Started</span><span class="nav-badge" id="badge-start"></span></button>
+        <button class="nav-item" data-view="keys"><span class="nav-icon">🔑</span><span>API Keys</span><span class="nav-badge" id="badge-keys"></span></button>
+        <div class="nav-divider">Trading</div>
+        <button class="nav-item nav-paper" data-view="paper"><span class="nav-icon">🧪</span><span>Paper Trading<small>fake money</small></span><span class="nav-badge" id="badge-paper"></span></button>
+        <button class="nav-item nav-live" data-view="live"><span class="nav-icon">💵</span><span>Live Trading<small>real money</small></span><span class="nav-badge" id="badge-live"></span></button>
+        <div class="nav-divider">Tools</div>
+        <button class="nav-item" data-view="research"><span class="nav-icon">📊</span><span>Research</span></button>
+      </nav>
+
+      <div id="views">
+
+        <!-- ═══ Get Started ═══ -->
+        <section class="view" id="view-start">
+          <div class="view-inner">
+            <h1 class="view-title">Get started</h1>
+            <p class="lead">Four steps from zero to an automated trader. Do them in order: each step unlocks the next.</p>
+
+            <ol class="steps">
+              <li class="step" id="step-keys">
+                <div class="step-status"></div>
+                <div class="step-body">
+                  <h3>1. Connect your Alpaca account</h3>
+                  <p>Alpaca is the free broker the bot trades through. Paste your <b>paper</b> (practice) keys first.</p>
+                  <button class="btn btn-primary btn-sm" data-goto="keys">Add API keys →</button>
+                </div>
+              </li>
+              <li class="step" id="step-validate">
+                <div class="step-status"></div>
+                <div class="step-body">
+                  <h3>2. Validate the strategy</h3>
+                  <p>The bot tests itself on months of real market data it has never seen, including trading
+                    costs. <b>It only places trades if this test shows an edge.</b> This takes a few minutes.</p>
+                  <div class="form-row">
+                    <label class="field grow">
+                      <span>Stocks to trade</span>
+                      <input class="form-input mono" id="val-symbols" value="AAPL,MSFT,NVDA,AMD,META,AMZN,GOOGL,TSLA">
+                    </label>
+                    <label class="field">
+                      <span>Bar size</span>
+                      <select class="form-input" id="val-timeframe">
+                        <option value="5m" selected>5 minutes (day trading)</option>
+                        <option value="15m">15 minutes</option>
+                        <option value="1m">1 minute</option>
+                        <option value="1h">1 hour (swing)</option>
+                      </select>
+                    </label>
+                    <label class="field">
+                      <span>Days of history</span>
+                      <input class="form-input" type="number" id="val-days" value="120" min="20" max="3650">
+                    </label>
+                  </div>
+                  <label class="check"><input type="checkbox" id="val-market" checked> Use market context (compare each stock with SPY)</label>
+                  <div class="btn-row">
+                    <button class="btn btn-primary" id="val-start">▶ Validate strategy</button>
+                    <button class="btn btn-outline" id="val-stop" hidden>Stop</button>
+                  </div>
+                  <div id="val-result"></div>
+                  <details class="log-box" id="val-log-box">
+                    <summary>Progress log</summary>
+                    <pre id="val-log" class="log"></pre>
+                  </details>
+                </div>
+              </li>
+              <li class="step" id="step-paper">
+                <div class="step-status"></div>
+                <div class="step-body">
+                  <h3>3. Paper trade for a few weeks</h3>
+                  <p>Run the bot with fake money and check that it behaves and performs like the test said it would.</p>
+                  <button class="btn btn-success btn-sm" data-goto="paper">Open Paper Trading →</button>
+                </div>
+              </li>
+              <li class="step" id="step-live">
+                <div class="step-status"></div>
+                <div class="step-body">
+                  <h3>4. Go live (optional, real money)</h3>
+                  <p>Only after paper trading looks good. Start small; you can lose money.</p>
+                  <button class="btn btn-danger btn-sm" data-goto="live">Open Live Trading →</button>
+                </div>
+              </li>
+            </ol>
+
+            <details class="faq">
+              <summary>How does the bot work, and how does it protect me?</summary>
+              <ul>
+                <li><b>What it does:</b> every few minutes during market hours it scores each stock with a model trained
+                  on price action, market context and news sentiment, and buys when the odds look good.</li>
+                <li><b>Every trade has a stop-loss and take-profit at the broker</b>, so positions stay protected even if
+                  your computer turns off.</li>
+                <li><b>Day-trading mode closes everything before 4 pm ET</b>: no overnight risk.</li>
+                <li><b>Loss limits:</b> it stops opening trades after a 2% drop in a day, caps total risk across positions,
+                  and pauses itself if live results fall well short of the test.</li>
+                <li><b>Honest warning:</b> most automated day-trading strategies lose money after costs. The validation step
+                  exists so the bot doesn't trade when there's no evidence of an edge. Never trade money you can't afford to lose.</li>
+              </ul>
+            </details>
+          </div>
+        </section>
+
+        <!-- ═══ API Keys ═══ -->
+        <section class="view" id="view-keys" hidden>
+          <div class="view-inner">
+            <h1 class="view-title">API keys</h1>
+            <p class="lead">Your keys are saved in the <code>.env</code> file on this computer only (readable by you
+              alone). They are never shown again or sent anywhere except Alpaca.</p>
+
+            <div class="card instructions">
+              <h3>How to get your Alpaca keys (about 5 minutes)</h3>
+              <ol>
+                <li>Create a free account at <a href="https://alpaca.markets" target="_blank" rel="noopener noreferrer">alpaca.markets</a> and log in.</li>
+                <li><b>Paper keys:</b> in the top-left account switcher choose <b>Paper Trading</b>. On the home page find
+                  <b>API Keys</b> and click <b>Generate New Keys</b>.</li>
+                <li>Copy the <b>Key ID</b> and the <b>Secret Key</b> into the boxes below. The secret is only shown once, so if
+                  you lose it, just generate new keys.</li>
+                <li><b>Live keys (optional):</b> only after your live account is funded and approved, switch to your
+                  <b>Live</b> account and generate keys the same way. Paper keys start with <code>PK</code>, live keys usually with <code>AK</code>.</li>
+              </ol>
+              <p class="muted">Tip: never share these keys or paste them into chats or emails. Anyone with them can trade your account.</p>
+            </div>
+
+            <div class="key-grid">
+              <div class="card key-card key-paper">
+                <div class="card-head">
+                  <h3>🧪 Paper trading keys <span class="tag tag-paper">fake money</span></h3>
+                  <span class="pill" id="paper-key-status">not set</span>
+                </div>
+                <label class="field"><span>API Key ID</span>
+                  <input class="form-input mono" id="paper-key-id" autocomplete="off" spellcheck="false" placeholder="PK…"></label>
+                <label class="field"><span>Secret Key</span>
+                  <span class="secret-wrap"><input class="form-input mono" type="password" id="paper-secret" autocomplete="off" spellcheck="false" placeholder="••••••••">
+                  <button type="button" class="btn btn-outline btn-sm reveal" data-target="paper-secret">Show</button></span></label>
+                <div class="btn-row">
+                  <button class="btn btn-primary" data-save="paper">Save</button>
+                  <button class="btn btn-outline" data-test="paper">Test connection</button>
+                  <button class="btn btn-outline btn-sm push-right" data-remove="paper">Remove</button>
+                </div>
+                <div class="result" id="paper-key-result"></div>
+              </div>
+
+              <div class="card key-card key-live">
+                <div class="card-head">
+                  <h3>💵 Live trading keys <span class="tag tag-live">real money</span></h3>
+                  <span class="pill" id="live-key-status">not set</span>
+                </div>
+                <label class="field"><span>API Key ID</span>
+                  <input class="form-input mono" id="live-key-id" autocomplete="off" spellcheck="false" placeholder="AK…"></label>
+                <label class="field"><span>Secret Key</span>
+                  <span class="secret-wrap"><input class="form-input mono" type="password" id="live-secret" autocomplete="off" spellcheck="false" placeholder="••••••••">
+                  <button type="button" class="btn btn-outline btn-sm reveal" data-target="live-secret">Show</button></span></label>
+                <div class="btn-row">
+                  <button class="btn btn-danger" data-save="live">Save</button>
+                  <button class="btn btn-outline" data-test="live">Test connection</button>
+                  <button class="btn btn-outline btn-sm push-right" data-remove="live">Remove</button>
+                </div>
+                <div class="result" id="live-key-result"></div>
+                <p class="muted small">Saving live keys doesn't start real trading. That also needs the strategy validated and live
+                  trading armed on the Live Trading tab.</p>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card-head">
+                <h3>🔔 Phone alerts (optional)</h3>
+                <span class="pill" id="alerts-status">off</span>
+              </div>
+              <p class="muted">Get a message for every trade, rejection, daily summary and safety stop. In Discord: Server
+                Settings → Integrations → Webhooks → New Webhook → Copy URL. Slack incoming webhooks work too.</p>
+              <div class="form-row">
+                <label class="field grow"><span>Webhook URL</span>
+                  <input class="form-input mono" type="password" id="alert-url" autocomplete="off" placeholder="https://discord.com/api/webhooks/…"></label>
+              </div>
+              <div class="btn-row">
+                <button class="btn btn-primary" id="alerts-save">Save</button>
+                <button class="btn btn-outline btn-sm push-right" data-remove="alerts">Remove</button>
+              </div>
+            </div>
+            <p class="muted small" id="env-file-note"></p>
+          </div>
+        </section>
+
+        <!-- ═══ Paper + Live trading (same layout, filled by control.js) ═══ -->
+        <section class="view mode-view mode-paper" id="view-paper" data-mode="paper" hidden></section>
+        <section class="view mode-view mode-live" id="view-live" data-mode="live" hidden></section>
+
+        <!-- ═══ Research (the original dashboard) ═══ -->
+        <section class="view" id="view-research" hidden>
     <!-- Three-Column Layout -->
     <div id="layout">
 
@@ -245,9 +455,14 @@
 
       </aside>
     </div>
+        </section>
+      </div>
+    </div>
   </div>
 
+  <div id="modal-root"></div>
   <script src="/static/js/api.js"></script>
   <script src="/static/js/app.js"></script>
+  <script src="/static/js/control.js"></script>
 </body>
 </html>

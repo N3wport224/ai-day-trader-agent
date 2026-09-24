@@ -86,7 +86,7 @@ def test_buying_power_rejection_retries_smaller(monkeypatch, executor) -> None:
     monkeypatch.setattr(AlpacaExecutor, "get_position", lambda self, symbol: None)
     attempts = []
 
-    def bracket(self, symbol, qty, stop, target):
+    def bracket(self, symbol, qty, stop, target, **kw):
         attempts.append(qty)
         if len(attempts) == 1:
             self.account = {**self.account, "buying_power": "5000"}  # someone else used the cash
@@ -100,7 +100,10 @@ def test_buying_power_rejection_retries_smaller(monkeypatch, executor) -> None:
     assert attempts == [100, 48]  # 5000 * 0.97 // 100
     assert result.recovered and result.order["id"] == "o-2"
     assert result.rejection.category == "buying_power"
-    assert [e["event"] for e in executor.telemetry.events] == ["order_rejected", "order_retry", "order_recovered"]
+    assert [e["event"] for e in executor.telemetry.events] == [
+        "order_rejected", "order_retry", "order_recovered", "order_submitted",
+    ]
+    assert executor.telemetry.events[-1]["recovered"] is True and executor.telemetry.events[-1]["qty"] == 48
 
 
 def test_wash_trade_on_exit_cancels_legs_and_retries(monkeypatch, executor) -> None:
@@ -126,7 +129,7 @@ def test_wash_trade_on_exit_cancels_legs_and_retries(monkeypatch, executor) -> N
 def test_unrecoverable_rejection_is_reported_with_root_cause(monkeypatch, executor) -> None:
     monkeypatch.setattr(AlpacaExecutor, "get_position", lambda self, s: None)
 
-    def bracket(self, *args):
+    def bracket(self, *args, **kw):
         raise _http_error(403, "trade denied due to pattern day trading protection")
 
     monkeypatch.setattr(AlpacaExecutor, "_place_bracket_order", bracket)
@@ -143,7 +146,7 @@ def test_failed_retry_reports_second_rejection(monkeypatch, executor) -> None:
     monkeypatch.setattr(AlpacaExecutor, "get_position", lambda self, s: None)
     calls = []
 
-    def bracket(self, symbol, qty, stop, target):
+    def bracket(self, symbol, qty, stop, target, **kw):
         calls.append(qty)
         if len(calls) == 1:
             self.account = {**self.account, "buying_power": "5000"}

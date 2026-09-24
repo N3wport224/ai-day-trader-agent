@@ -43,6 +43,8 @@ from core.ml_strategy import MLStrategy, _snapshot_from_row
 from core.news_sentiment import SENTIMENT_FEATURES
 from core.session_clock import SessionClock, SessionConfig, SessionPhase
 from core.risk_manager import (
+    ExitFill,
+    PortfolioRisk,
     RiskManager,
     SizingConfig,
     TrailingConfig,
@@ -69,6 +71,10 @@ class BacktestConfig:
     # Intraday session rules (opening lockout, entry cutoff, EOD flatten); None = off.
     session: Optional[SessionConfig] = None
     spread_bps: float = 0.0   # full bid/ask spread; half is paid on every fill
+    # Marketable-limit entries (live default): the limit is this many bps above
+    # the decision price. A next bar that opens above it fills at the limit only
+    # if it trades back below it; otherwise the entry is missed. None = market.
+    entry_limit_bps: Optional[float] = None
 
     @property
     def intraday_rules(self) -> bool:
@@ -100,6 +106,11 @@ class Trade:
     costs: float = 0.0
     initial_stop: Optional[float] = None
     high_water: Optional[float] = None
+    regime: Optional[str] = None   # market regime when the entry signal fired
+
+    @property
+    def entry_hour_et(self) -> int:
+        return int(self.entry_time.tz_convert(MARKET_TZ).hour)
 
     def __post_init__(self) -> None:
         if self.initial_stop is None:
@@ -146,6 +157,8 @@ class BacktestResult:
                     "exit_price": round(t.exit_price, 4),
                     "exit_reason": t.exit_reason,
                     "initial_stop": t.initial_stop,
+                    "regime": t.regime,
+                    "entry_hour_et": t.entry_hour_et,
                     "pnl": round(t.pnl, 2),
                     "r_multiple": round(t.r_multiple, 3),
                 }
@@ -197,12 +210,16 @@ class Backtester:
         sentiment: Optional[Dict[str, pd.DataFrame]] = None,
         start: Optional[pd.Timestamp] = None,
         macro_bars: Optional[Dict[str, pd.DataFrame]] = None,
+        end: Optional[pd.Timestamp] = None,
+        market_bars: Optional[pd.DataFrame] = None,
     ) -> BacktestResult:
-        """Simulate from ``start`` (default: first bar). Earlier bars only warm up indicators.
+        """Simulate bars in [``start``, ``end``) (default: all). Earlier bars only
+        warm up indicators; positions still open at ``end`` are closed there.
 
         ``macro_bars`` are higher-timeframe bars per symbol (daily for intraday
         runs). If the strategy needs them and none are given, they are
-        resampled from the primary bars.
+        resampled from the primary bars. ``market_bars`` is the index (SPY) on
+        the same timeframe, for market-context features and the market filter.
         """
         cfg = self.config
         slip = (cfg.slippage_bps + cfg.spread_bps / 2) / 10_000
@@ -214,7 +231,7 @@ class Backtester:
             macro = (macro_bars or {}).get(symbol)
             if macro is None and self.strategy.uses_macro:
                 macro = macro_from_primary(frame, cfg.timeframe)
-            feats = build_feature_frame(frame, cfg.timeframe, macro_bars=macro)
+            feats = build_feature_frame(frame, cfg.timeframe, macro_bars=macro, market_bars=market_bars)
             sent = (sentiment or {}).get(symbol)
             if sent is None:
                 sent = pd.DataFrame(np.nan, index=feats.index, columns=SENTIMENT_FEATURES)
@@ -225,6 +242,8 @@ class Backtester:
             feats["p_up"] = self.strategy.probabilities(feats, feats[SENTIMENT_FEATURES])
             if start is not None:
                 feats = feats[feats.index >= start]
+            if end is not None:
+                feats = feats[feats.index < end]
             prepared[symbol] = feats
 
         timeline = sorted(set().union(*(f.index for f in prepared.values())))
@@ -256,6 +275,7 @@ class Backtester:
         positions: Dict[str, Trade] = {}
         pending_entries: Dict[str, dict] = {}
         pending_exits: set = set()
+        last_exits: Dict[str, ExitFill] = {}   # re-entry cooldown (RiskLimits.reentry_cooldown_minutes)
         last_close: Dict[str, float] = {}
         trades: List[Trade] = []
         blocked: Dict[str, int] = {}
@@ -280,6 +300,8 @@ class Backtester:
                 day_trade_days.append(_day_key(ts))  # same-day round trip (PDT)
             fill = price * (1 - slip) if slipped else price
             trade.exit_time, trade.exit_price, trade.exit_reason = ts, fill, reason
+            # Intra-bar fills are known once the bar closes.
+            last_exits[symbol] = ExitFill(ts + cfg.bar_length, "stop" in reason, fill)
             trade.costs += cfg.commission_per_share * trade.quantity
             cash += fill * trade.quantity - cfg.commission_per_share * trade.quantity
             trades.append(trade)
@@ -323,6 +345,16 @@ class Backtester:
                         order = None
                     if order and symbol not in positions:
                         fill = o * (1 + slip)
+                        if cfg.entry_limit_bps is not None:
+                            limit = order["price"] * (1 + cfg.entry_limit_bps / 10_000)
+                            if fill > limit:
+                                if l < limit:
+                                    fill = limit
+                                else:
+                                    session_blocked["entry_limit_missed"] = (
+                                        session_blocked.get("entry_limit_missed", 0) + 1)
+                                    order = None
+                    if order and symbol not in positions:
                         qty = min(order["quantity"], int(cash // fill))
                         if qty > 0:
                             cash -= fill * qty + cfg.commission_per_share * qty
@@ -335,6 +367,7 @@ class Backtester:
                                 target=round(fill + order["target_distance"], 2),
                                 probability_up=order["p_up"],
                                 costs=cfg.commission_per_share * qty,
+                                regime=order.get("regime"),
                             )
 
                     # 2. Bracket legs (the entry bar included).
@@ -424,6 +457,14 @@ class Backtester:
                         stop_loss=signal.stop_loss,
                         take_profit=signal.take_profit,
                         session_date=day,
+                        last_exit=last_exits.get(symbol),
+                        now=ts + cfg.bar_length,
+                        portfolio=PortfolioRisk(
+                            len(positions) + len(pending_entries),
+                            sum(max(0.0, last_close.get(s, p.entry_price) - p.stop) * p.quantity
+                                for s, p in positions.items())
+                            + sum(o["quantity"] * o["stop_distance"] for o in pending_entries.values()),
+                        ),
                     )
                     if decision.approved:
                         pending_entries[symbol] = {
@@ -433,6 +474,7 @@ class Backtester:
                             "p_up": signal.probability_up,
                             "price": c,
                             "day": day,
+                            "regime": signal.regime,
                         }
                         entries_by_day[day] = entries_by_day.get(day, 0) + 1
                     else:
@@ -498,6 +540,37 @@ def compute_metrics(result: BacktestResult) -> Dict[str, float]:
     }
 
 
+def attribution(trades: List[Trade], by: str) -> pd.DataFrame:
+    """Per-group trade stats; ``by`` is "regime" or "entry_hour_et".
+
+    Answers "where does the strategy make or lose money?" — e.g. whether
+    losses cluster in CHOPPY regimes or in the first hour of the session.
+    """
+    columns = [by, "trades", "win_rate_pct", "avg_r", "total_pnl", "worst_trade_pnl", "share_of_pnl_pct"]
+    if not trades:
+        return pd.DataFrame(columns=columns)
+    frame = pd.DataFrame(
+        {
+            by: [getattr(t, by) if getattr(t, by) is not None else "n/a" for t in trades],
+            "pnl": [t.pnl for t in trades],
+            "r": [t.r_multiple for t in trades],
+        }
+    )
+    total = frame["pnl"].sum()
+    grouped = frame.groupby(by, sort=True)
+    table = pd.DataFrame(
+        {
+            "trades": grouped.size(),
+            "win_rate_pct": grouped["pnl"].apply(lambda p: (p > 0).mean() * 100).round(1),
+            "avg_r": grouped["r"].mean().round(3),
+            "total_pnl": grouped["pnl"].sum().round(2),
+            "worst_trade_pnl": grouped["pnl"].min().round(2),
+            "share_of_pnl_pct": (grouped["pnl"].sum() / total * 100).round(1) if total else np.nan,
+        }
+    ).reset_index()
+    return table[columns]
+
+
 def format_report(result: BacktestResult, title: str = "Backtest") -> str:
     m = result.metrics
     lines = [
@@ -540,4 +613,10 @@ def format_report(result: BacktestResult, title: str = "Backtest") -> str:
         exits[t.exit_reason] = exits.get(t.exit_reason, 0) + 1
     if exits:
         lines.append(f"Exit reasons:      {exits}")
+    if result.trades:
+        lines.append("\nBy entry regime:")
+        lines.append(attribution(result.trades, "regime").to_string(index=False))
+        if result.config.bar_length < timedelta(days=1):
+            lines.append("\nBy entry hour (ET):")
+            lines.append(attribution(result.trades, "entry_hour_et").to_string(index=False))
     return "\n".join(lines)

@@ -107,6 +107,7 @@ const API = (() => {
     APIError,
     isLoggedIn,
     clearTokens,
+    request,
 
     /* Auth */
     async login(username, password) {

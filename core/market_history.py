@@ -12,8 +12,10 @@ from __future__ import annotations
 
 import logging
 import os
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Callable, Optional
+from typing import Callable, Dict, Optional
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
@@ -39,6 +41,7 @@ TIMEFRAME_ALIASES = {
     "1h": "1Hour", "60m": "1Hour", "1hour": "1Hour",
     "1d": "1Day", "1day": "1Day", "d": "1Day",
 }
+MARKET_TZ = ZoneInfo("America/New_York")
 INTRADAY_TIMEFRAMES = ("1Min", "5Min", "15Min")
 # History needed per timeframe: EMA200 warm-up plus ~20 sessions for relative volume.
 DEFAULT_LOOKBACK_DAYS = {"1Min": 30, "5Min": 45, "15Min": 60, "1Hour": 60, "1Day": 400}
@@ -92,8 +95,8 @@ def fetch_alpaca_bars(
     *,
     http_get: Callable = requests.get,
 ) -> pd.DataFrame:
-    key = os.getenv("ALPACA_API_KEY") or os.getenv("ALPACA_KEY_ID")
-    secret = os.getenv("ALPACA_SECRET_KEY") or os.getenv("ALPACA_SECRET")
+    key = os.getenv("ALPACA_API_KEY") or os.getenv("ALPACA_KEY_ID") or os.getenv("ALPACA_LIVE_API_KEY")
+    secret = os.getenv("ALPACA_SECRET_KEY") or os.getenv("ALPACA_SECRET") or os.getenv("ALPACA_LIVE_SECRET_KEY")
     if not key or not secret:
         raise ValueError("Alpaca credentials not configured")
 
@@ -141,6 +144,22 @@ def fetch_yahoo_bars(symbol: str, timeframe: str, start: datetime, end: datetime
     return hist.astype(float).sort_index()
 
 
+def fetch_bars(symbol: str, timeframe: str, start: datetime, end: datetime) -> pd.DataFrame:
+    """Raw bars in [start, end] from Alpaca, falling back to Yahoo Finance."""
+    timeframe = normalize_timeframe(timeframe)
+    bars = _empty()
+    try:
+        bars = fetch_alpaca_bars(symbol, timeframe, start, end)
+    except Exception as exc:
+        logger.info(f"Alpaca bars unavailable for {symbol} ({exc}); trying Yahoo Finance")
+    if bars.empty:
+        try:
+            bars = fetch_yahoo_bars(symbol, timeframe, start, end)
+        except Exception as exc:
+            logger.warning(f"Yahoo bars unavailable for {symbol}: {exc}")
+    return bars[~bars.index.duplicated(keep="last")].dropna()
+
+
 def get_history(
     symbol: str,
     timeframe: str = "1Hour",
@@ -152,18 +171,81 @@ def get_history(
     """Oldest-first OHLCV bars, completed candles only unless asked otherwise."""
     timeframe = normalize_timeframe(timeframe)
     end = end or datetime.now(timezone.utc)
-    start = end - timedelta(days=lookback_days)
-
-    bars = _empty()
-    try:
-        bars = fetch_alpaca_bars(symbol, timeframe, start, end)
-    except Exception as exc:
-        logger.info(f"Alpaca bars unavailable for {symbol} ({exc}); trying Yahoo Finance")
-    if bars.empty:
-        try:
-            bars = fetch_yahoo_bars(symbol, timeframe, start, end)
-        except Exception as exc:
-            logger.warning(f"Yahoo bars unavailable for {symbol}: {exc}")
-
-    bars = bars[~bars.index.duplicated(keep="last")].dropna()
+    bars = fetch_bars(symbol, timeframe, end - timedelta(days=lookback_days), end)
     return bars if include_incomplete else drop_incomplete_bar(bars, timeframe, end)
+
+
+@dataclass
+class _CacheEntry:
+    bars: pd.DataFrame
+    full_at: datetime
+
+
+class BarCache:
+    """Per-symbol bar history for the live loop, fetched incrementally.
+
+    The first request per symbol loads the whole lookback window; later ones
+    fetch only from a few bars before the newest cached bar and replace that
+    overlap (so a bar that was still forming, or a late correction, is
+    overwritten). A full reload happens on each new market day and after
+    ``full_refresh_hours``, so split/dividend-adjusted history never mixes
+    old and new adjustments for long. Returned frames hold completed bars only.
+    """
+
+    def __init__(
+        self,
+        timeframe: str,
+        lookback_days: int,
+        *,
+        fetch: Callable[[str, str, datetime, datetime], pd.DataFrame] = None,
+        overlap_bars: int = 3,
+        full_refresh_hours: float = 6.0,
+        now_fn: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+    ) -> None:
+        self.timeframe = normalize_timeframe(timeframe)
+        self.lookback = timedelta(days=lookback_days)
+        self.fetch = fetch or fetch_bars
+        self.overlap = bar_length(self.timeframe) * max(1, overlap_bars)
+        self.full_refresh = timedelta(hours=full_refresh_hours)
+        self.now_fn = now_fn
+        self._entries: Dict[str, _CacheEntry] = {}
+        self.stats = {"full": 0, "incremental": 0, "failed_incremental": 0}
+
+    def _needs_full(self, entry: Optional[_CacheEntry], now: datetime) -> bool:
+        if entry is None or entry.bars.empty:
+            return True
+        if now - entry.full_at >= self.full_refresh:
+            return True
+        return entry.full_at.astimezone(MARKET_TZ).date() != now.astimezone(MARKET_TZ).date()
+
+    def get(self, symbol: str) -> pd.DataFrame:
+        now = self.now_fn()
+        entry = self._entries.get(symbol)
+        if self._needs_full(entry, now):
+            bars = self.fetch(symbol, self.timeframe, now - self.lookback, now)
+            self.stats["full"] += 1
+            if bars is None or bars.empty:
+                if entry is None:
+                    return _empty()
+                bars = entry.bars  # keep serving what we have; retry next call
+            else:
+                entry = self._entries[symbol] = _CacheEntry(bars.sort_index(), now)
+        else:
+            start = entry.bars.index[-1] - self.overlap
+            fresh = self.fetch(symbol, self.timeframe, start.to_pydatetime(), now)
+            if fresh is None or fresh.empty:
+                self.stats["failed_incremental"] += 1
+            else:
+                self.stats["incremental"] += 1
+                fresh = fresh.sort_index()
+                kept = entry.bars[entry.bars.index < fresh.index[0]]
+                combined = pd.concat([kept, fresh])
+                combined = combined[~combined.index.duplicated(keep="last")]
+                entry.bars = combined[combined.index >= now - self.lookback]
+        return drop_incomplete_bar(entry.bars, self.timeframe, now)
+
+    def invalidate(self, symbol: Optional[str] = None) -> None:
+        if symbol is None:
+            self._entries.clear()
+        else:
+            self._entries.pop(symbol, None)

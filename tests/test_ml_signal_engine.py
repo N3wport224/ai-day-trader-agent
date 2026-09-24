@@ -106,7 +106,7 @@ def test_ml_signal_still_goes_through_risk_manager_and_brackets(
     monkeypatch.setattr(AlpacaExecutor, "get_orders_today", lambda self: [])
     placed = {}
 
-    def fake_bracket(self, symbol, qty, stop, target):
+    def fake_bracket(self, symbol, qty, stop, target, **kw):
         placed.update(symbol=symbol, qty=qty, stop=stop, target=target)
         return {"id": "bracket-1", "status": "accepted", "qty": str(qty), "symbol": symbol}
 
