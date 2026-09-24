@@ -61,7 +61,10 @@ class TradingWorkflow:
         record_paper_trade: bool = False,
         submit_alpaca_paper_order: bool = False,
         user_id: Optional[int] = None,
+        entry_block_reason: Optional[str] = None,
     ) -> WorkflowResult:
+        """``entry_block_reason`` (e.g. opening lockout, EOD cutoff, drawdown
+        breaker) vetoes BUYs for this run while still allowing exits."""
         symbol = symbol.upper().strip()
         portfolio = self.portfolio_manager.get_portfolio(portfolio_name, user_id=user_id)
         if not portfolio and (record_paper_trade or submit_alpaca_paper_order):
@@ -95,6 +98,13 @@ class TradingWorkflow:
                 portfolio_name=portfolio_name,
                 analysis=analysis,
                 skipped_reason="No actionable trade recommendation",
+            )
+        if action == "BUY" and entry_block_reason:
+            return WorkflowResult(
+                symbol=symbol,
+                portfolio_name=portfolio_name,
+                analysis=analysis,
+                skipped_reason=f"Entry blocked: {entry_block_reason}",
             )
 
         price = self._extract_price(analysis, quantity)

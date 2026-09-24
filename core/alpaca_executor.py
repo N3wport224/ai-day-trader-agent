@@ -12,7 +12,7 @@ Usage:
 
 import os
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, time
 from typing import Any, Callable, Dict, List, Optional
 from zoneinfo import ZoneInfo
@@ -22,6 +22,7 @@ from dotenv import load_dotenv
 
 from core.execution_telemetry import EventLog, Rejection, classify_rejection
 from core.risk_manager import RiskManager
+from core.session_clock import SessionClock, SessionPhase
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -38,6 +39,18 @@ class ExecutionResult:
     skipped_reason: Optional[str] = None
     rejection: Optional[Rejection] = None   # set when the broker refused the order
     recovered: bool = False                 # True when a retry after a rejection succeeded
+
+
+@dataclass
+class FlattenReport:
+    reason: str
+    cancelled: int = 0
+    closed: List[Dict[str, Any]] = field(default_factory=list)
+    failures: List[Dict[str, Any]] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return not self.failures
 
 
 @dataclass(frozen=True)
@@ -89,8 +102,11 @@ class AlpacaExecutor:
         risk_manager: Optional[RiskManager] = None,
         price_lookup: Optional[Callable[[str], float]] = None,
         telemetry: Optional[EventLog] = None,
+        session_clock: Optional[SessionClock] = None,
     ):
         self.risk_manager = risk_manager or RiskManager()
+        # Optional intraday session rules (opening lockout / EOD cutoff) for entries.
+        self.session_clock = session_clock
         self.telemetry = telemetry or EventLog.from_env()
         self.price_lookup = price_lookup or _default_price_lookup
         self.api_key = os.getenv("ALPACA_API_KEY")
@@ -220,6 +236,11 @@ class AlpacaExecutor:
         if not self.is_market_open():
             logger.warning(f"Market is closed. Skipping {action} {quantity} {symbol}.")
             return ExecutionResult(skipped_reason="Market is closed")
+        if action == "BUY" and self.session_clock is not None:
+            phase = self.session_clock.phase_from_alpaca_clock(self.get_clock())
+            if phase is not SessionPhase.OPEN:
+                logger.info(f"Session phase {phase.value}: skipping entry {quantity} {symbol}")
+                return ExecutionResult(skipped_reason=f"Entries not allowed during {phase.value}")
 
         risk = signal.get("risk_parameters") or {}
         position = self.get_position(symbol)
@@ -454,6 +475,61 @@ class AlpacaExecutor:
     # ------------------------------------------------------------------
     # Cancel helpers
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # End-of-day liquidation
+    # ------------------------------------------------------------------
+
+    def close_position(self, symbol: str, qty: float, current_price: float = 0.0) -> Dict:
+        """Close one position: market order (DELETE /v2/positions/{symbol}) or,
+        with FLATTEN_ORDER_TYPE=limit, a marketable limit priced
+        FLATTEN_LIMIT_OFFSET_BPS through the last price."""
+        if os.getenv("FLATTEN_ORDER_TYPE", "market").lower() == "limit" and current_price > 0:
+            offset = float(os.getenv("FLATTEN_LIMIT_OFFSET_BPS", "20")) / 10_000
+            side = "sell" if qty > 0 else "buy"
+            limit = current_price * (1 - offset) if side == "sell" else current_price * (1 + offset)
+            resp = requests.post(
+                f"{self.base_url}/orders",
+                headers=self.headers,
+                json={"symbol": symbol, "qty": str(abs(int(qty))), "side": side, "type": "limit",
+                      "limit_price": str(round(limit, 2)), "time_in_force": "day"},
+                timeout=10,
+            )
+        else:
+            resp = requests.delete(f"{self.base_url}/positions/{symbol}", headers=self.headers, timeout=10)
+        resp.raise_for_status()
+        return resp.json() if resp.text else {}
+
+    def flatten_all(self, reason: str = "eod") -> "FlattenReport":
+        """Cancel every working order (bracket legs included), then close every
+        position. Failures are classified and logged; the bot retries on the
+        next cycle while the session is still in its FLATTEN phase."""
+        report = FlattenReport(reason=reason)
+        try:
+            report.cancelled = len(self.cancel_all_orders() or [])
+        except requests.exceptions.HTTPError as exc:
+            report.failures.append({"symbol": "*", **self._rejection(exc, action="cancel_all").as_dict()})
+
+        for position in self.get_positions():
+            symbol, qty = position["symbol"], float(position.get("qty") or 0)
+            if qty == 0:
+                continue
+            try:
+                order = self.close_position(symbol, qty, float(position.get("current_price") or 0))
+                report.closed.append({"symbol": symbol, "qty": qty, "order_id": order.get("id")})
+            except requests.exceptions.HTTPError as exc:
+                rejection = self._rejection(exc, symbol=symbol, side="close", qty=qty, attempt=1)
+                report.failures.append({"symbol": symbol, **rejection.as_dict()})
+
+        self.telemetry.record(
+            "flatten",
+            logging.WARNING if report.failures else logging.INFO,
+            reason=reason,
+            cancelled_orders=report.cancelled,
+            closed=report.closed,
+            failures=report.failures,
+        )
+        return report
 
     def cancel_all_orders(self) -> list:
         """Cancel every open order — useful for end-of-day cleanup."""

@@ -29,6 +29,7 @@ the final gatekeepers.
 
 from __future__ import annotations
 
+import copy
 import logging
 import math
 import os
@@ -39,15 +40,15 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import pandas as pd
 
-from core.features import MACRO_FEATURES, TECHNICAL_FEATURES
+from core.features import INTRADAY_FEATURES, MACRO_FEATURES, TECHNICAL_FEATURES
 from core.news_sentiment import SENTIMENT_FEATURES, UNAVAILABLE, SentimentSnapshot
 from core.regime import TRENDING_BULL
 
 logger = logging.getLogger(__name__)
 
 FEATURE_COLUMNS = TECHNICAL_FEATURES + SENTIMENT_FEATURES
-# Optional inputs a model may be trained with (scripts/train_model.py --mtf).
-KNOWN_FEATURES = FEATURE_COLUMNS + MACRO_FEATURES
+# Optional inputs a model may be trained with (--mtf; intraday timeframes).
+KNOWN_FEATURES = FEATURE_COLUMNS + MACRO_FEATURES + INTRADAY_FEATURES
 REGIME_POLICIES = ("off", "suppress", "penalty")
 ARTIFACT_VERSION = 1
 DEFAULT_MODEL_PATH = "models/ml_signal.joblib"
@@ -198,6 +199,13 @@ class MLStrategy:
             mtf_confirmation = os.getenv("MTF_CONFIRMATION", "false").strip().lower() in {"1", "true", "yes", "on"}
         self.mtf_confirmation = mtf_confirmation
         self.feature_columns = list((artifact or {}).get("feature_columns") or FEATURE_COLUMNS)
+
+    def without_model(self) -> "MLStrategy":
+        """Same thresholds and gates, heuristic probabilities."""
+        clone = copy.copy(self)
+        clone.artifact = None
+        clone.feature_columns = list(FEATURE_COLUMNS)
+        return clone
 
     @property
     def uses_macro(self) -> bool:

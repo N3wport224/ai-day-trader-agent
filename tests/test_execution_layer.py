@@ -360,3 +360,31 @@ def test_bot_skips_cycle_when_broker_state_unknown(portfolio_manager) -> None:
 
     assert report.broker_error == "broker down"
     assert workflow.calls == 0
+
+
+def test_bot_logs_clean_reconciliation_and_mtf_state(portfolio_manager, caplog) -> None:
+    import logging
+
+    class MLWorkflow(StubWorkflow):
+        def run(self, symbol, portfolio_name, *, record_paper_trade, submit_alpaca_paper_order):
+            ml = {"mode": "model", "probability_up": 0.7, "regime": "TRENDING_BULL", "macro_aligned": 0.0,
+                  "gated_by": "mtf", "sentiment_available": False}
+            return WorkflowResult(symbol=symbol, portfolio_name=portfolio_name,
+                                  analysis={"recommendation": "HOLD", "all_signals": {"ml": ml}})
+
+    with caplog.at_level(logging.INFO):
+        TradingBot(MLWorkflow(portfolio_manager), ["AAPL"], broker=StubBroker()).run_cycle()
+
+    text = caplog.text
+    assert "Reconciliation clean: 0 positions, 0 open orders" in text
+    assert "regime TRENDING_BULL daily trend not aligned vetoed by mtf" in text
+
+
+def test_trailing_manager_logs_initialisation(tmp_path, caplog) -> None:
+    import logging
+
+    with caplog.at_level(logging.INFO):
+        _manager(tmp_path, FakeBroker())
+
+    assert "Trailing stops enabled: trigger 1.5R" in caplog.text
+    assert "(0 tracked position(s))" in caplog.text

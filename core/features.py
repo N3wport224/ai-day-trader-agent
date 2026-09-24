@@ -202,6 +202,93 @@ def add_macro_features(
     return out
 
 
+# ---------------------------------------------------------------------------
+# Intraday microstructure features (VWAP, relative volume, opening range)
+# ---------------------------------------------------------------------------
+
+INTRADAY_FEATURES = [
+    "vwap_dist",
+    "vwap_z",
+    "rvol",
+    "close_vs_orb_high",
+    "close_vs_orb_low",
+    "orb_range_pct",
+    "minutes_from_open",
+]
+_SESSION_OPEN_MIN = 9 * 60 + 30
+_SESSION_CLOSE_MIN = 16 * 60
+
+
+def add_intraday_features(
+    features: pd.DataFrame,
+    *,
+    bar_length: pd.Timedelta,
+    orb_minutes: int = 15,
+    rvol_sessions: int = 20,
+) -> pd.DataFrame:
+    """Session-anchored VWAP (+1/2 sigma bands), RVOL and opening-range levels.
+
+    All values at a bar use only that session's bars up to and including it
+    (plus earlier sessions for RVOL), so they are known at the bar's close:
+
+    - VWAP resets at 9:30 ET: cumulative sum(typical price x volume) /
+      sum(volume) over regular-session bars; sigma is the volume-weighted
+      standard deviation of typical price around it. Extended-hours bars get
+      NaN (they aren't part of the anchored session).
+    - RVOL: bar volume / mean volume of the same time-of-day bucket over the
+      previous ``rvol_sessions`` sessions (today excluded).
+    - Opening range: high/low of the first ``orb_minutes``; NaN until that
+      window has closed. Not defined when bars are longer than the window.
+    """
+    out = features.copy()
+    local = out.index.tz_convert("America/New_York")
+    minutes = local.hour * 60 + local.minute
+    bar_minutes = bar_length / pd.Timedelta(minutes=1)
+    regular = (minutes >= _SESSION_OPEN_MIN) & (minutes < _SESSION_CLOSE_MIN) & (local.weekday < 5)
+    session = pd.Series(np.where(regular, local.date, None), index=out.index)
+
+    typical = (out["high"] + out["low"] + out["close"]) / 3
+    vol = out["volume"].where(regular)
+    pv = (typical * vol).groupby(session).cumsum()
+    pv2 = (typical ** 2 * vol).groupby(session).cumsum()
+    cum_vol = vol.groupby(session).cumsum().replace(0.0, np.nan)
+    vwap = pv / cum_vol
+    sigma = np.sqrt((pv2 / cum_vol - vwap ** 2).clip(lower=0.0))
+    out["vwap"] = vwap.where(regular)
+    out["vwap_sigma"] = sigma.where(regular)
+    for k in (1, 2):
+        out[f"vwap_upper_{k}"] = out["vwap"] + k * out["vwap_sigma"]
+        out[f"vwap_lower_{k}"] = out["vwap"] - k * out["vwap_sigma"]
+    out["vwap_dist"] = (out["close"] - out["vwap"]) / out["vwap"]
+    out["vwap_z"] = ((out["close"] - out["vwap"]) / out["vwap_sigma"].replace(0.0, np.nan)).where(regular)
+
+    # Relative volume vs the same time-of-day bucket on previous sessions.
+    bucket = pd.Series(np.where(regular, minutes, -1), index=out.index)
+    prior_mean = (
+        out["volume"].where(regular)
+        .groupby(bucket)
+        .transform(lambda s: s.shift(1).rolling(rvol_sessions, min_periods=max(3, rvol_sessions // 4)).mean())
+    )
+    out["rvol"] = (out["volume"] / prior_mean.replace(0.0, np.nan)).where(regular)
+
+    # Opening range: only once the window has fully closed.
+    out["orb_high"] = np.nan
+    out["orb_low"] = np.nan
+    if 0 < bar_minutes <= orb_minutes:
+        in_window = regular & (minutes + bar_minutes <= _SESSION_OPEN_MIN + orb_minutes)
+        after_window = regular & (minutes >= _SESSION_OPEN_MIN + orb_minutes)
+        window_high = out["high"].where(in_window).groupby(session).transform("max")
+        window_low = out["low"].where(in_window).groupby(session).transform("min")
+        out["orb_high"] = window_high.where(after_window)
+        out["orb_low"] = window_low.where(after_window)
+    out["close_vs_orb_high"] = out["close"] / out["orb_high"] - 1
+    out["close_vs_orb_low"] = out["close"] / out["orb_low"] - 1
+    out["orb_range_pct"] = (out["orb_high"] - out["orb_low"]) / out["orb_low"]
+
+    out["minutes_from_open"] = pd.Series(minutes - _SESSION_OPEN_MIN, index=out.index, dtype=float).where(regular)
+    return out.replace([np.inf, -np.inf], np.nan)
+
+
 def bars_from_candles(candles: list[dict]) -> pd.DataFrame:
     """Build an oldest-first OHLCV frame from the fetcher's candle dicts."""
     frame = pd.DataFrame(candles)

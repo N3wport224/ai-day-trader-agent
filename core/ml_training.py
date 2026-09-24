@@ -22,7 +22,8 @@ import numpy as np
 import pandas as pd
 
 from core.feature_pipeline import build_feature_frame, macro_from_primary
-from core.features import MACRO_FEATURES
+from core.features import INTRADAY_FEATURES, MACRO_FEATURES
+from core.market_history import is_intraday, timeframe_from_length
 from core.ml_strategy import ARTIFACT_VERSION, FEATURE_COLUMNS
 from core.news_sentiment import SENTIMENT_FEATURES, ScoredArticle, rolling_sentiment
 
@@ -36,8 +37,17 @@ class LabelParams:
     target_atr_mult: float = 3.0
 
 
-def triple_barrier_labels(features: pd.DataFrame, params: LabelParams) -> pd.Series:
-    """1.0 if target hit before stop within the horizon, 0.0 otherwise, NaN if unknowable."""
+def triple_barrier_labels(
+    features: pd.DataFrame,
+    params: LabelParams,
+    session_ids: Optional[Sequence] = None,
+) -> pd.Series:
+    """1.0 if target hit before stop within the horizon, 0.0 otherwise, NaN if unknowable.
+
+    With ``session_ids`` (day-trading mode) the look-ahead stops at the end of
+    the bar's session: a position flattened at the close before reaching the
+    target counts as 0, and bars outside a session (None) get no label.
+    """
     close = features["close"].to_numpy()
     high = features["high"].to_numpy()
     low = features["low"].to_numpy()
@@ -45,13 +55,18 @@ def triple_barrier_labels(features: pd.DataFrame, params: LabelParams) -> pd.Ser
     n = len(features)
     labels = np.full(n, np.nan)
 
+    sessions = list(session_ids) if session_ids is not None else None
     for t in range(n - params.horizon):
         if not np.isfinite(atr[t]) or atr[t] <= 0:
+            continue
+        if sessions is not None and sessions[t] is None:
             continue
         stop = close[t] - params.stop_atr_mult * atr[t]
         target = close[t] + params.target_atr_mult * atr[t]
         outcome = 0.0
         for j in range(t + 1, t + params.horizon + 1):
+            if sessions is not None and sessions[j] != sessions[t]:
+                break  # flattened at the close: target not reached
             if low[j] <= stop:
                 break
             if high[j] >= target:
@@ -70,6 +85,7 @@ def build_dataset(
     *,
     macro_bars: Optional[pd.DataFrame] = None,
     use_macro: bool = False,
+    no_overnight: Optional[bool] = None,
 ) -> pd.DataFrame:
     """Features + regime + optional macro + sentiment (as of each bar's close) + label for one symbol.
 
@@ -88,16 +104,23 @@ def build_dataset(
         sentiment = rolling_sentiment(close_times, scored_news, half_life=half_life)
         sentiment.index = features.index
     data = features.join(sentiment)
-    data["label"] = triple_barrier_labels(features, params)
+    if no_overnight is None:
+        no_overnight = is_intraday(timeframe)
+    sessions = regular_session_ids(features.index) if no_overnight else None
+    data["label"] = triple_barrier_labels(features, params, sessions)
     return data.dropna(subset=["label"])
 
 
+def regular_session_ids(index: pd.DatetimeIndex) -> List[Optional[object]]:
+    """ET trading date for regular-session bars (9:30-16:00), None otherwise."""
+    local = index.tz_convert("America/New_York")
+    minutes = local.hour * 60 + local.minute
+    regular = (minutes >= 570) & (minutes < 960) & (local.weekday < 5)
+    return [d if ok else None for d, ok in zip(local.date, regular)]
+
+
 def timeframe_name(bar_length: timedelta) -> str:
-    names = {timedelta(minutes=15): "15Min", timedelta(hours=1): "1Hour", timedelta(days=1): "1Day"}
-    try:
-        return names[bar_length]
-    except KeyError as exc:
-        raise ValueError(f"Unsupported bar length {bar_length}") from exc
+    return timeframe_from_length(bar_length)
 
 
 def purged_time_split(
@@ -171,12 +194,19 @@ def train(
     test_fraction: float = 0.2,
     timeframe: str = "1Hour",
     use_macro: bool = False,
+    use_intraday: Optional[bool] = None,
 ) -> Dict:
     """Train on all symbols' rows and return a ready-to-save artifact dict.
 
     ``use_macro`` adds MACRO_FEATURES (build the datasets with use_macro=True).
     """
-    feature_columns = list(FEATURE_COLUMNS) + (list(MACRO_FEATURES) if use_macro else [])
+    if use_intraday is None:
+        use_intraday = is_intraday(timeframe)
+    feature_columns = (
+        list(FEATURE_COLUMNS)
+        + (list(MACRO_FEATURES) if use_macro else [])
+        + (list(INTRADAY_FEATURES) if use_intraday else [])
+    )
     data = pd.concat(datasets.values()).sort_index()
     if len(data) < 200:
         raise ValueError(f"Only {len(data)} labeled rows; fetch more history")
@@ -265,3 +295,35 @@ def calibration_table(proba: Sequence[float], labels: Sequence[float], bins: int
         bars=("label", "size"), mean_p=("p", "mean"), hit_rate=("label", "mean")
     )
     return table.reset_index().round(4)
+
+
+def synthetic_intraday_bars(
+    days: int = 30,
+    freq: str = "5min",
+    seed: int = 7,
+    start: str = "2025-03-03",
+) -> pd.DataFrame:
+    """Regular-session-only (9:30-16:00 ET, weekdays) random-walk bars with a
+    U-shaped intraday volume profile, overnight gaps and trend regimes."""
+    rng = np.random.default_rng(seed)
+    step = pd.Timedelta(freq)
+    per_day = int(pd.Timedelta(hours=6, minutes=30) / step)
+    sessions = pd.bdate_range(start, periods=days)
+    frames, price = [], 100.0
+    for i, day in enumerate(sessions):
+        open_ts = pd.Timestamp(f"{day.date()} 09:30", tz="America/New_York")
+        idx = pd.date_range(open_ts, periods=per_day, freq=step).tz_convert("UTC")
+        price *= np.exp(rng.normal(0, 0.006))  # overnight gap
+        drift = rng.normal(0, 0.0004) if i % 3 else 0.0
+        close = price * np.exp(np.cumsum(drift + rng.normal(0, 0.0015, per_day)))
+        open_ = np.concatenate([[price], close[:-1]])
+        spread = np.abs(rng.normal(0, 0.001, per_day)) * close
+        u_shape = 1.5 + np.cos(np.linspace(0, 2 * np.pi, per_day))
+        volume = (rng.integers(5_000, 20_000, per_day) * u_shape).round()
+        frames.append(pd.DataFrame(
+            {"open": open_, "high": np.maximum(open_, close) + spread, "low": np.minimum(open_, close) - spread,
+             "close": close, "volume": volume},
+            index=idx,
+        ))
+        price = close[-1]
+    return pd.concat(frames)

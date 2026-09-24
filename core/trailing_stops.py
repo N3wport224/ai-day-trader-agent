@@ -61,6 +61,12 @@ class TrailingStopManager:
         self.state_path = Path(state_path or os.getenv("TRAILING_STATE_PATH", "data/trailing_state.json"))
         self.telemetry = telemetry or EventLog.from_env()
         self.state: Dict[str, Dict[str, float]] = self._load()
+        cfg = self.config
+        logger.info(
+            f"Trailing stops {'enabled' if cfg.enabled else 'disabled'}: trigger {cfg.trigger_r}R, "
+            f"lock {cfg.lock_r}R, trail {cfg.distance_r}R; state {self.state_path} "
+            f"({len(self.state)} tracked position(s))"
+        )
 
     def _load(self) -> Dict[str, Dict[str, float]]:
         try:
