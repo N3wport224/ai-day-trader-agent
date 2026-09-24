@@ -1016,10 +1016,15 @@ class PortfolioManager:
                 return dict(row)
 
         except sqlite3.IntegrityError as e:
-            if "username" in str(e).lower():
+            message = str(e)
+            if "UNIQUE constraint failed: users.username" in message:
                 raise ValueError(f"Username '{username}' already exists")
-            elif "email" in str(e).lower():
+            elif "UNIQUE constraint failed: users.email" in message:
                 raise ValueError(f"Email '{email}' already registered")
+            elif "username_length" in message:
+                raise ValueError("Username must be 3-50 characters")
+            elif "email_format" in message:
+                raise ValueError(f"Invalid email address: '{email}'")
             else:
                 raise ValueError(f"User creation failed: {e}")
 

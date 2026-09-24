@@ -81,3 +81,63 @@ async def test_refresh_token_accepts_json_body_contract(
     assert response["token_type"] == "bearer"
     payload = jwt.decode(response["access_token"], auth.JWT_SECRET_KEY, algorithms=[auth.JWT_ALGORITHM])
     assert payload["sub"] == "alice"
+
+
+def test_jwt_secret_is_not_the_published_development_key() -> None:
+    assert auth.JWT_SECRET_KEY != "dev_secret_key_for_testing_only_change_in_production"
+    assert len(auth.JWT_SECRET_KEY) >= 32
+
+
+def _request(path: str) -> Request:
+    return Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": path,
+            "headers": [],
+            "client": ("127.0.0.1", 12345),
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_registration_is_disabled_by_default(
+    monkeypatch,
+    portfolio_manager: PortfolioManager,
+) -> None:
+    monkeypatch.delenv("ALLOW_REGISTRATION", raising=False)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await auth.register.__wrapped__(
+            request=_request("/api/auth/register"),
+            user_data=auth.UserCreate(
+                username="mallory",
+                email="mallory@example.com",
+                password="long-enough-password",
+            ),
+            db=portfolio_manager,
+        )
+
+    assert exc_info.value.status_code == 403
+    assert portfolio_manager.get_user_by_username("mallory") is None
+
+
+@pytest.mark.asyncio
+async def test_registration_can_be_enabled_explicitly(
+    monkeypatch,
+    portfolio_manager: PortfolioManager,
+) -> None:
+    monkeypatch.setenv("ALLOW_REGISTRATION", "true")
+
+    user = await auth.register.__wrapped__(
+        request=_request("/api/auth/register"),
+        user_data=auth.UserCreate(
+            username="bob",
+            email="bob@example.com",
+            password="long-enough-password",
+        ),
+        db=portfolio_manager,
+    )
+
+    assert user.username == "bob"
+    assert user.is_admin is False

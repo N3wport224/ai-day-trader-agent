@@ -14,7 +14,9 @@ import os
 from collections import deque
 from threading import Lock
 
-from config import settings
+from dotenv import load_dotenv
+
+load_dotenv()
 
 logger = logging.getLogger(__name__)
 
@@ -144,12 +146,17 @@ class CandlestickDataFetcher:
     """
     
     def __init__(self):
-        self.alpaca_api_key = settings.ALPACA_API_KEY
-        self.alpaca_secret_key = settings.ALPACA_SECRET_KEY
-        self.alpaca_data_base_url = settings.ALPACA_DATA_BASE_URL.rstrip("/")
-        self.alpaca_data_feed = settings.ALPACA_DATA_FEED
-        self.twelve_data_key = settings.TWELVE_DATA_API_KEY
-        self.alpha_vantage_key = settings.ALPHA_VANTAGE_API_KEY
+        # Read the environment at construction time (not the values
+        # config.settings captured at import) so this matches the cache key
+        # in core.candle_fetcher_provider and picks up config changes.
+        self.alpaca_api_key = os.getenv("ALPACA_API_KEY") or os.getenv("ALPACA_KEY_ID")
+        self.alpaca_secret_key = os.getenv("ALPACA_SECRET_KEY") or os.getenv("ALPACA_SECRET")
+        self.alpaca_data_base_url = os.getenv(
+            "ALPACA_DATA_BASE_URL", "https://data.alpaca.markets"
+        ).rstrip("/")
+        self.alpaca_data_feed = os.getenv("ALPACA_DATA_FEED", "iex")
+        self.twelve_data_key = os.getenv("TWELVE_DATA_API_KEY")
+        self.alpha_vantage_key = os.getenv("ALPHA_VANTAGE_API_KEY")
         self.source_priority = self._load_source_priority()
         self._rate_limit_cache = {}
         

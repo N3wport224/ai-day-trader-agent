@@ -5,6 +5,8 @@ technical and sentiment analysis. This creates a multi-strategy approach where
 dividend events can override or complement other trading signals.
 """
 
+import copy
+
 import pandas as pd
 import numpy as np
 from datetime import datetime
@@ -60,9 +62,10 @@ class EnhancedTradingPipeline:
         self.symbol = symbol
         self.portfolio_name = portfolio_name
         self.user_id = user_id
-        # Import trading config
+        # Per-pipeline copy: portfolio cash and API overrides are written to
+        # self.config below and must not leak into other users' analyses.
         from config.settings import trading_config
-        self.config = trading_config
+        self.config = copy.copy(trading_config)
         self.dividend_strategy = DividendCaptureStrategy(symbol, 100)  # Keep for compatibility
         self.position_tracker = PositionTracker(symbol)
         self.signal_history = []

@@ -19,7 +19,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(
 
 from core.portfolio_manager import PortfolioManager
 from config.api.auth import get_current_active_user, User
-from config.api.dependencies import get_portfolio_manager
+from config.api.dependencies import claim_legacy_portfolios, get_portfolio_manager
 
 # Logging
 logger = logging.getLogger(__name__)
@@ -138,7 +138,7 @@ async def get_user_portfolio(
     db: PortfolioManager = Depends(get_portfolio_manager),
 ) -> dict:
     """Get portfolio for authenticated user"""
-    await run_in_threadpool(db.claim_unowned_portfolios, current_user.id)
+    await claim_legacy_portfolios(db, current_user)
     portfolio = await run_in_threadpool(
         db.get_portfolio,
         portfolio_name,
@@ -162,7 +162,7 @@ async def list_portfolios(
     List all portfolios for the authenticated user.
     """
     try:
-        await run_in_threadpool(db.claim_unowned_portfolios, current_user.id)
+        await claim_legacy_portfolios(db, current_user)
         portfolios = await run_in_threadpool(db.list_portfolios, current_user.id)
         
         # Enrich with current values

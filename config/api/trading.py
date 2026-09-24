@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field, field_validator
 
-from config.api.auth import User, get_current_active_user
+from config.api.auth import User, get_admin_user, get_current_active_user
 from config.api.dependencies import get_portfolio_manager
 from core.alpaca_executor import AlpacaExecutor
 from core.alpaca_executor_provider import get_alpaca_executor
@@ -131,7 +131,7 @@ async def get_provider_status(
 
 @router.get("/alpaca/account", response_model=AlpacaAccountStatusResponse)
 async def get_alpaca_account_status(
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(get_admin_user),
     executor: AlpacaExecutor = Depends(get_alpaca_executor),
 ):
     """Return Alpaca paper account status."""
@@ -161,7 +161,7 @@ async def get_alpaca_account_status(
 @router.post("/paper-order", response_model=PaperOrderResponse)
 async def submit_paper_order(
     request: PaperOrderRequest,
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(get_admin_user),
     executor: AlpacaExecutor = Depends(get_alpaca_executor),
 ):
     """Submit a direct BUY/SELL order to Alpaca paper trading."""
@@ -177,7 +177,7 @@ async def submit_paper_order(
         return {
             "submitted": False,
             "order": None,
-            "skipped_reason": "Order was not submitted",
+            "skipped_reason": "Order was not submitted (market closed or no position to sell)",
         }
 
     return {
@@ -194,6 +194,14 @@ async def analyze_and_paper_trade(
     db: PortfolioManager = Depends(get_portfolio_manager),
 ):
     """Run analysis and optionally submit an actionable result to Alpaca paper trading."""
+    # The Alpaca account is shared by the whole server, so only admins may
+    # submit orders to it. Everyone can still analyze and record locally.
+    if request.submit_paper_order and not current_user.is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only administrators can submit orders to the Alpaca account",
+        )
+
     workflow = TradingWorkflow(db)
     try:
         result = await run_in_threadpool(

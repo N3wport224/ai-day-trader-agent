@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any
 import os
 import logging
+import secrets
 
 from fastapi import APIRouter, Depends, HTTPException, status, Request
 from fastapi.concurrency import run_in_threadpool
@@ -31,11 +32,15 @@ from config.api.dependencies import get_portfolio_manager
 # Configuration
 JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY")
 if not JWT_SECRET_KEY:
-    # For development/testing only - use a consistent test key
-    # In production, this will raise an error
+    # Never fall back to a key that is published in source control. In
+    # development, generate a random per-process key instead; tokens stop
+    # working when the server restarts and are not shared across workers.
     if os.getenv("ENVIRONMENT", "development") == "development":
-        JWT_SECRET_KEY = "dev_secret_key_for_testing_only_change_in_production"
-        logger.warning("⚠️  Using development JWT secret. Set JWT_SECRET_KEY env var for production!")
+        JWT_SECRET_KEY = secrets.token_hex(32)
+        logger.warning(
+            "⚠️  JWT_SECRET_KEY not set; using a random key for this process. "
+            "Logins will reset on restart. Set JWT_SECRET_KEY in .env."
+        )
     else:
         raise RuntimeError(
             "JWT_SECRET_KEY environment variable must be set in production. "
@@ -45,6 +50,12 @@ if not JWT_SECRET_KEY:
 JWT_ALGORITHM = "HS256"
 JWT_ACCESS_TOKEN_EXPIRE_MINUTES = 30
 JWT_REFRESH_TOKEN_EXPIRE_DAYS = 7
+
+# Self-service registration is off by default: every account can trade on the
+# single Alpaca account configured for this server. Create accounts with
+# scripts/create_admin.py, or set ALLOW_REGISTRATION=true to open signups.
+def registration_enabled() -> bool:
+    return os.getenv("ALLOW_REGISTRATION", "false").strip().lower() in {"1", "true", "yes", "on"}
 
 # Security
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -336,6 +347,12 @@ async def register(
     - Email: Valid email format
     - Password: Minimum 8 characters
     """
+    if not registration_enabled():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Registration is disabled. Ask the server administrator for an account.",
+        )
+
     try:
         # Hash the password
         hashed_password = await run_in_threadpool(get_password_hash, user_data.password)

@@ -3,8 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from fastapi import HTTPException
 
-from config.api.auth import User
+from config.api.auth import User, get_admin_user
 from config.api.trading import (
     AnalyzeAndPaperTradeRequest,
     PaperOrderRequest,
@@ -13,6 +14,7 @@ from config.api.trading import (
     get_provider_status,
     submit_paper_order,
     analyze_and_paper_trade,
+    router,
 )
 from core.alpaca_executor_provider import clear_alpaca_executor_cache
 from core.portfolio_manager import PortfolioManager
@@ -26,6 +28,18 @@ def current_user() -> User:
         email="api-user@example.com",
         is_active=True,
         is_admin=False,
+        created_at="2026-01-01T00:00:00",
+    )
+
+
+@pytest.fixture
+def admin_user() -> User:
+    return User(
+        id=1,
+        username="api-user",
+        email="api-user@example.com",
+        is_active=True,
+        is_admin=True,
         created_at="2026-01-01T00:00:00",
     )
 
@@ -111,7 +125,7 @@ async def test_submit_paper_order_uses_executor(current_user):
 async def test_analyze_and_paper_trade_returns_workflow_result(
     monkeypatch,
     portfolio_manager: PortfolioManager,
-    current_user,
+    admin_user,
 ):
     class FakeWorkflowResult:
         symbol = "AAPL"
@@ -150,13 +164,47 @@ async def test_analyze_and_paper_trade_returns_workflow_result(
             submit_paper_order=True,
             record_local_trade=True,
         ),
-        current_user=current_user,
+        current_user=admin_user,
         db=portfolio_manager,
     )
 
     assert result["symbol"] == "AAPL"
     assert result["alpaca_order"]["id"] == "order-1"
     assert result["recorded_trade_id"] == 10
+
+
+@pytest.mark.asyncio
+async def test_non_admin_cannot_submit_alpaca_order_via_analysis(
+    monkeypatch,
+    portfolio_manager: PortfolioManager,
+    current_user,
+):
+    def fail_if_constructed(db):
+        raise AssertionError("workflow must not run for a forbidden request")
+
+    monkeypatch.setattr("config.api.trading.TradingWorkflow", fail_if_constructed)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await analyze_and_paper_trade(
+            request=AnalyzeAndPaperTradeRequest(symbol="AAPL", submit_paper_order=True),
+            current_user=current_user,
+            db=portfolio_manager,
+        )
+
+    assert exc_info.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_alpaca_order_endpoints_require_admin(current_user):
+    with pytest.raises(HTTPException) as exc_info:
+        await get_admin_user(current_user)
+
+    assert exc_info.value.status_code == 403
+
+    for path in ("/alpaca/account", "/paper-order"):
+        route = next(r for r in router.routes if r.path == path)
+        dependency_calls = {dep.call for dep in route.dependant.dependencies}
+        assert get_admin_user in dependency_calls
 
 
 def test_dashboard_uses_canonical_analyze_and_paper_trade_endpoint():

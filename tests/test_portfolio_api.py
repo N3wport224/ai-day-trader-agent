@@ -317,3 +317,20 @@ async def test_different_users_can_use_same_portfolio_name(
 
     assert owner_fetched["id"] == owner_portfolio["id"]
     assert other_fetched["id"] == other_portfolio["id"]
+
+
+@pytest.mark.asyncio
+async def test_unowned_portfolios_are_only_claimed_by_admins(
+    portfolio_manager: PortfolioManager,
+    current_user: User,
+):
+    portfolio_manager.create_portfolio("cli-portfolio", 5000.0)
+
+    assert await list_portfolios(current_user=current_user, db=portfolio_manager) == []
+    assert portfolio_manager.get_portfolio("cli-portfolio")["user_id"] is None
+
+    admin = current_user.model_copy(update={"is_admin": True})
+    portfolios = await list_portfolios(current_user=admin, db=portfolio_manager)
+
+    assert [p["name"] for p in portfolios] == ["cli-portfolio"]
+    assert portfolio_manager.get_portfolio("cli-portfolio")["user_id"] == admin.id

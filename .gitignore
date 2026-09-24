@@ -36,7 +36,6 @@ MANIFEST
 
 # json files
 *.json
-!.mcp.json
 
 # Virtual environments
 venv/

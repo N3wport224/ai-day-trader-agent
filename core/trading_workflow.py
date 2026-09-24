@@ -121,7 +121,10 @@ class TradingWorkflow:
                     symbol=symbol,
                     portfolio_name=portfolio_name,
                     analysis=analysis,
-                    skipped_reason="Alpaca paper order was not submitted",
+                    skipped_reason=(
+                        "Alpaca paper order was not submitted "
+                        "(market closed or no position to sell)"
+                    ),
                 )
 
         notes = "Recorded by TradingWorkflow local paper mode"
