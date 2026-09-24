@@ -43,6 +43,7 @@ from core.ml_strategy import MLStrategy, _snapshot_from_row
 from core.news_sentiment import SENTIMENT_FEATURES
 from core.session_clock import SessionClock, SessionConfig, SessionPhase
 from core.risk_manager import (
+    ExitFill,
     RiskManager,
     SizingConfig,
     TrailingConfig,
@@ -267,6 +268,7 @@ class Backtester:
         positions: Dict[str, Trade] = {}
         pending_entries: Dict[str, dict] = {}
         pending_exits: set = set()
+        last_exits: Dict[str, ExitFill] = {}   # re-entry cooldown (RiskLimits.reentry_cooldown_minutes)
         last_close: Dict[str, float] = {}
         trades: List[Trade] = []
         blocked: Dict[str, int] = {}
@@ -291,6 +293,8 @@ class Backtester:
                 day_trade_days.append(_day_key(ts))  # same-day round trip (PDT)
             fill = price * (1 - slip) if slipped else price
             trade.exit_time, trade.exit_price, trade.exit_reason = ts, fill, reason
+            # Intra-bar fills are known once the bar closes.
+            last_exits[symbol] = ExitFill(ts + cfg.bar_length, "stop" in reason, fill)
             trade.costs += cfg.commission_per_share * trade.quantity
             cash += fill * trade.quantity - cfg.commission_per_share * trade.quantity
             trades.append(trade)
@@ -436,6 +440,8 @@ class Backtester:
                         stop_loss=signal.stop_loss,
                         take_profit=signal.take_profit,
                         session_date=day,
+                        last_exit=last_exits.get(symbol),
+                        now=ts + cfg.bar_length,
                     )
                     if decision.approved:
                         pending_entries[symbol] = {

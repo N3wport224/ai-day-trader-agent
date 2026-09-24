@@ -186,6 +186,8 @@ def _run_variant(args, variant, bars, macro, sentiment, scored, bar_len):
     traded bar is out-of-sample. Returns ([(fold_label, result), ...], audit)."""
     kwargs = dict(confidence_threshold=args.threshold, **variant["strategy"])
     limits = replace(RiskLimits.from_env(), day_trading=bool(args.session and args.session.no_overnight))
+    if args.reentry_cooldown_minutes is not None:
+        limits = replace(limits, reentry_cooldown_minutes=args.reentry_cooldown_minutes)
     config = _config(args, variant, bar_len)
 
     def backtest(strategy, start=None, end=None):
@@ -443,6 +445,9 @@ def main(argv: list[str] | None = None) -> int:
                           default=int(os.getenv("ENTRY_CUTOFF_MINUTES_BEFORE_CLOSE", "15")))
     intraday.add_argument("--flatten-minutes", type=int,
                           default=int(os.getenv("FLATTEN_MINUTES_BEFORE_CLOSE", "10")))
+    intraday.add_argument("--reentry-cooldown-minutes", type=float, default=None,
+                          help="No re-entry into a symbol this soon after a stop-out (default: "
+                               "REENTRY_COOLDOWN_MINUTES or 30; 0 disables)")
     intraday.add_argument("--spread-bps", type=float, default=None,
                           help="Full bid/ask spread cost in bps, half paid per fill (default 2 intraday, 0 otherwise)")
     parser.add_argument("--compare", action="store_true",

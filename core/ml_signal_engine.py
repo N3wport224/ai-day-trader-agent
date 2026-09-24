@@ -16,13 +16,21 @@ from __future__ import annotations
 
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Optional
 
 import pandas as pd
 
 from core.feature_pipeline import build_feature_frame, macro_from_primary, macro_timeframe
-from core.market_history import DEFAULT_LOOKBACK_DAYS, get_history, normalize_timeframe
+from core.market_history import (
+    DEFAULT_LOOKBACK_DAYS,
+    MARKET_TZ,
+    BarCache,
+    bar_length,
+    get_history,
+    is_intraday,
+    normalize_timeframe,
+)
 from core.ml_strategy import MLSignal, MLStrategy
 from core.news_sentiment import SentimentSnapshot, live_sentiment
 from core.portfolio_manager import PortfolioManager
@@ -55,6 +63,7 @@ class MLSignalEngine:
         risk_per_trade_pct: Optional[float] = None,
         sizing: Optional[SizingConfig] = None,
         macro_loader: Optional[Callable[[str], pd.DataFrame]] = None,
+        now_fn: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     ) -> None:
         self.portfolio_manager = portfolio_manager
         self.strategy = strategy or MLStrategy()
@@ -69,8 +78,14 @@ class MLSignalEngine:
             self.strategy = self.strategy.without_model()
         env_lookback = os.getenv("ML_LOOKBACK_DAYS")
         self.lookback_days = lookback_days or (int(env_lookback) if env_lookback else DEFAULT_LOOKBACK_DAYS[self.timeframe])
+        # The live loop re-reads history every cycle; the cache fetches only
+        # the newest bars after the first load (BAR_CACHE=false disables it).
+        self.use_cache = os.getenv("BAR_CACHE", "true").strip().lower() not in {"0", "false", "no", "off"}
+        self._bar_cache = BarCache(self.timeframe, self.lookback_days) if self.use_cache else None
+        self._macro_cache: Optional[BarCache] = None
         self.history_loader = history_loader or (
-            lambda symbol: get_history(symbol, self.timeframe, self.lookback_days)
+            self._bar_cache.get if self._bar_cache is not None
+            else (lambda symbol: get_history(symbol, self.timeframe, self.lookback_days))
         )
         self.sentiment_loader = sentiment_loader or live_sentiment
         sizing = sizing or SizingConfig.from_env()
@@ -78,6 +93,10 @@ class MLSignalEngine:
             sizing = SizingConfig(**{**sizing.__dict__, "base_risk_pct": risk_per_trade_pct})
         self.sizing = sizing
         self.macro_loader = macro_loader or self._default_macro_loader
+        self.now_fn = now_fn
+        # Intraday only: refuse to signal on bars this many bar-lengths old
+        # while the regular session is running (feed outage, delayed fallback).
+        self.max_bar_age_bars = _env_float("MAX_BAR_AGE_BARS", 3.0)
         logger.info(
             f"ML signal engine ready: mode={self.strategy.mode}, timeframe={self.timeframe}, "
             f"regime filter={self.strategy.regime_policy}, MTF gate={self.strategy.mtf_confirmation}, "
@@ -85,10 +104,16 @@ class MLSignalEngine:
         )
 
     def _default_macro_loader(self, symbol: str) -> pd.DataFrame:
-        if macro_timeframe(self.timeframe) == "1Week":
-            return macro_from_primary(get_history(symbol, "1Day", 500), "1Day")
+        weekly = macro_timeframe(self.timeframe) == "1Week"
         # 50 daily EMA bars need ~75 trading days; fetch extra for warm-up.
-        return get_history(symbol, "1Day", int(os.getenv("ML_MACRO_LOOKBACK_DAYS", "200")))
+        days = 500 if weekly else int(os.getenv("ML_MACRO_LOOKBACK_DAYS", "200"))
+        if self.use_cache:
+            if self._macro_cache is None:
+                self._macro_cache = BarCache("1Day", days)
+            daily = self._macro_cache.get(symbol)
+        else:
+            daily = get_history(symbol, "1Day", days)
+        return macro_from_primary(daily, "1Day") if weekly else daily
 
     def __call__(
         self,
@@ -100,6 +125,10 @@ class MLSignalEngine:
         bars = self.history_loader(symbol)
         if bars is None or len(bars) < MIN_BARS:
             return self._error(symbol, "no_data", f"Need at least {MIN_BARS} completed bars for {symbol}")
+        stale = self._stale_reason(bars)
+        if stale:
+            logger.warning(f"{symbol}: {stale}")
+            return self._error(symbol, "stale_data", stale)
 
         macro = None
         if self.strategy.uses_macro:
@@ -114,6 +143,23 @@ class MLSignalEngine:
         return self._analysis(symbol, ml, quantity, features, portfolio_name, risk_pct)
 
     # ------------------------------------------------------------------
+
+    def _stale_reason(self, bars: pd.DataFrame) -> Optional[str]:
+        if not is_intraday(self.timeframe) or self.max_bar_age_bars <= 0:
+            return None
+        now = pd.Timestamp(self.now_fn())
+        length = bar_length(self.timeframe)
+        max_age = length * self.max_bar_age_bars
+        local = now.tz_convert(MARKET_TZ)
+        session_open = local.normalize() + pd.Timedelta(hours=9, minutes=30)
+        session_close = local.normalize() + pd.Timedelta(hours=16)
+        if local.weekday() >= 5 or not (session_open + length + max_age <= local <= session_close):
+            return None  # outside regular hours the last bar is legitimately old
+        age = now - (bars.index[-1] + length)
+        if age > max_age:
+            return (f"latest completed {self.timeframe} bar closed {age.total_seconds() / 60:.0f} min ago "
+                    f"(limit {max_age.total_seconds() / 60:.0f} min); no signal on stale data")
+        return None
 
     def _size(
         self, ml: MLSignal, symbol: str, portfolio_name: str, user_id: Optional[int], latest: pd.Series

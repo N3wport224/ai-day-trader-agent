@@ -136,7 +136,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     session_clock = SessionClock(session)
-    market_clock = broker = trailing = None
+    market_clock = broker = trailing = fills = None
     if args.execute or os.getenv("ALPACA_API_KEY"):
         from core.alpaca_executor_provider import get_alpaca_executor
         from core.trailing_stops import TrailingStopManager
@@ -149,6 +149,10 @@ def main(argv: list[str] | None = None) -> int:
         broker.risk_manager.limits = replace(broker.risk_manager.limits, day_trading=no_overnight)
         # Reconcile every cycle (report-only in dry run); trail stops only when executing.
         trailing = TrailingStopManager(broker) if args.execute else None
+        if args.execute:
+            from core.fill_quality import FillTracker
+
+            fills = FillTracker(broker.expected_prices)
 
     log.info(
         f"Timeframe {timeframe}, scan every {interval} min; "
@@ -168,6 +172,7 @@ def main(argv: list[str] | None = None) -> int:
             trailing_manager=trailing,
             session_clock=session_clock,
             timeframe=timeframe,
+            fill_tracker=fills,
         )
     except ValueError as exc:
         print(str(exc), file=sys.stderr)

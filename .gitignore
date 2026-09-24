@@ -161,3 +161,4 @@ models/
 # Runtime telemetry and bot state
 logs/
 data/trailing_state.json
+data/fill_state.json

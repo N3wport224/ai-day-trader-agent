@@ -300,7 +300,21 @@ python bot.py --timeframe 1h --overnight                                        
   recovers. It is checked every cycle, not only when a buy is attempted.
 - **Data**: 1Min and 5Min bars from Alpaca (paginated) with Yahoo fallback
   (Yahoo keeps ~7 days of 1m and ~60 days of 5m history). Default lookback is
-  30 days for 1m and 45 for 5m so EMA200 and RVOL are warmed up.
+  30 days for 1m and 45 for 5m so EMA200 and RVOL are warmed up. The live bot
+  caches history per symbol and fetches only the newest bars each cycle
+  (re-fetching the last 3 so revised bars are replaced), with a full reload
+  each market day and every 6 hours (`BAR_CACHE=false` turns it off).
+- **Stale-data guard**: during regular hours, if the newest completed bar is
+  more than `MAX_BAR_AGE_BARS` (3) bars old, e.g. during a feed outage or
+  when falling back to delayed data, the symbol gets no signal that cycle.
+  Open positions stay protected by their broker-side brackets and the EOD
+  flatten.
+- **Re-entry cooldown**: after a stop-out, the risk manager rejects a new
+  entry in that symbol for `REENTRY_COOLDOWN_MINUTES` (30), so a stop doesn't
+  turn straight into a revenge trade. Live, it reads the stop leg's fill time
+  from Alpaca's orders (restart-safe); the backtester applies the same rule
+  (`--reentry-cooldown-minutes`). `REENTRY_COOLDOWN_STOPS_ONLY=false` applies
+  it after every exit.
 
 Backtest the intraday rules (opening lockout, cutoff, 15:50 forced close,
 2 bps spread on top of slippage, simulated PDT day-trade count):
@@ -325,6 +339,14 @@ python scripts/backtest.py --timeframe 5m --days 60 --no-overnight --opening-loc
 - **Heartbeat**: `logs/heartbeat.json` is rewritten atomically every cycle
   (phase, positions, errors, entry blocks, seconds to the next cycle). Point
   your monitoring at its modification time; if it goes stale, the bot is down.
+- **Fill quality** (`core/fill_quality.py`, execute mode): every fill is
+  compared with the price the bot expected (the live quote for market
+  entries/exits, the stop price for stop legs, the limit for take-profits)
+  and logged as `order_filled` with signed slippage in bps (positive = worse
+  for you). Fills worse than `SLIPPAGE_ALERT_BPS` (25) alert, and the session
+  report includes mean, notional-weighted and worst slippage plus its dollar
+  cost. Compare it with the backtest's `--slippage-bps`/`--spread-bps`: if
+  live is consistently worse, the backtest is flattering the strategy.
 - **Shutdown**: SIGTERM or Ctrl-C finishes the current cycle and exits
   cleanly (it interrupts the wait between cycles, never an order in flight);
   a second signal forces the exit. A cycle that throws is logged and alerted

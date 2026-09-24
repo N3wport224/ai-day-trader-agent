@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import Any, Dict, Iterable, Optional
 from zoneinfo import ZoneInfo
 
@@ -57,6 +57,10 @@ class RiskLimits:
     pdt_max_day_trades: int = 3
     pdt_buffer: int = 0
     max_intraday_drawdown_pct: float = 2.0   # 0 disables the breaker
+    # No re-entry into a symbol this soon after its last exit (0 disables);
+    # with reentry_cooldown_stops_only only stop-outs start the cooldown.
+    reentry_cooldown_minutes: float = 30.0
+    reentry_cooldown_stops_only: bool = True
 
     @classmethod
     def from_env(cls) -> "RiskLimits":
@@ -74,6 +78,8 @@ class RiskLimits:
             pdt_max_day_trades=_env_int("PDT_MAX_DAY_TRADES", cls.pdt_max_day_trades),
             pdt_buffer=_env_int("PDT_DAYTRADE_BUFFER", cls.pdt_buffer),
             max_intraday_drawdown_pct=_env_float("MAX_INTRADAY_DRAWDOWN_PCT", cls.max_intraday_drawdown_pct),
+            reentry_cooldown_minutes=_env_float("REENTRY_COOLDOWN_MINUTES", cls.reentry_cooldown_minutes),
+            reentry_cooldown_stops_only=_env_bool("REENTRY_COOLDOWN_STOPS_ONLY", cls.reentry_cooldown_stops_only),
         )
 
 
@@ -96,6 +102,49 @@ def _to_float(value: Any) -> float:
 def round_price(price: float) -> float:
     """Round to a price increment Alpaca accepts (sub-penny only under $1)."""
     return round(price, 4 if price < 1 else 2)
+
+
+@dataclass(frozen=True)
+class ExitFill:
+    """The most recent filled sell for a symbol."""
+
+    filled_at: datetime
+    stopped_out: bool
+    price: float = 0.0
+
+
+_STOP_TYPES = {"stop", "stop_limit", "trailing_stop"}
+
+
+def _parse_ts(value: Any) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        ts = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+
+
+def last_exit_fill(orders: Iterable[Dict[str, Any]], symbol: str) -> Optional[ExitFill]:
+    """Latest filled sell of ``symbol`` in an Alpaca order list, bracket legs
+    included (a stop leg that fired is how most stop-outs appear)."""
+    latest: Optional[ExitFill] = None
+    stack = list(orders or [])
+    while stack:
+        order = stack.pop()
+        stack.extend(order.get("legs") or [])
+        if order.get("symbol") != symbol or str(order.get("side", "")).lower() != "sell":
+            continue
+        if str(order.get("status", "")).lower() != "filled":
+            continue
+        filled_at = _parse_ts(order.get("filled_at"))
+        if filled_at is None:
+            continue
+        if latest is None or filled_at > latest.filled_at:
+            kind = str(order.get("type", order.get("order_type", ""))).lower()
+            latest = ExitFill(filled_at, kind in _STOP_TYPES, _to_float(order.get("filled_avg_price")))
+    return latest
 
 
 class RiskManager:
@@ -166,6 +215,8 @@ class RiskManager:
         stop_loss: Optional[float] = None,
         take_profit: Optional[float] = None,
         session_date: Optional[date] = None,
+        last_exit: Optional["ExitFill"] = None,
+        now: Optional[datetime] = None,
     ) -> RiskDecision:
         limits = self.limits
         side = side.lower()
@@ -220,6 +271,10 @@ class RiskManager:
         if pdt:
             return RiskDecision(False, reason=pdt)
 
+        cooldown = self._cooldown_block(symbol, last_exit, now)
+        if cooldown:
+            return RiskDecision(False, reason=cooldown)
+
         entries_today = sum(
             1 for order in orders_today if str(order.get("side", "")).lower() == "buy"
         )
@@ -259,6 +314,20 @@ class RiskManager:
             stop_loss=stop_loss,
             take_profit=take_profit,
         )
+
+    def _cooldown_block(self, symbol: str, last_exit: Optional["ExitFill"], now: Optional[datetime]) -> Optional[str]:
+        minutes = self.limits.reentry_cooldown_minutes
+        if minutes <= 0 or last_exit is None:
+            return None
+        if self.limits.reentry_cooldown_stops_only and not last_exit.stopped_out:
+            return None
+        now = now or datetime.now(timezone.utc)
+        elapsed = (now - last_exit.filled_at).total_seconds() / 60
+        if 0 <= elapsed < minutes:
+            kind = "stop-out" if last_exit.stopped_out else "exit"
+            return (f"Re-entry cooldown for {symbol}: {kind} {elapsed:.0f} min ago "
+                    f"(REENTRY_COOLDOWN_MINUTES={minutes:g})")
+        return None
 
     def bracket_prices(self, price: float) -> tuple[Optional[float], Optional[float]]:
         """Stop/target from the configured percentages around ``price``."""

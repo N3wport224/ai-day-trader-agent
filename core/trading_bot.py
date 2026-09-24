@@ -63,6 +63,13 @@ class CycleReport:
         return [r for r in self.results if r.alpaca_order]
 
 
+def _walk_orders(orders):
+    """Orders with their nested bracket legs."""
+    for order in orders or []:
+        yield order
+        yield from _walk_orders(order.get("legs") or [])
+
+
 class TradingBot:
     def __init__(
         self,
@@ -82,12 +89,14 @@ class TradingBot:
         telemetry: Optional[EventLog] = None,
         heartbeat_path: Optional[str] = None,
         timeframe: Optional[str] = None,
+        fill_tracker: Optional[Any] = None,
     ) -> None:
         """``broker`` (an AlpacaExecutor) enables the start-of-cycle broker
         snapshot and reconciliation; ``trailing_manager`` raises stops on
         winners (execute mode only). ``session_clock`` applies the intraday
         session rules (opening lockout, entry cutoff, EOD flatten) using the
-        broker's market clock."""
+        broker's market clock. ``fill_tracker`` (core.fill_quality.FillTracker)
+        measures live slippage from the broker's filled orders each cycle."""
         cleaned = [s.strip().upper() for s in symbols if s and s.strip()]
         if not cleaned:
             raise ValueError("Watchlist is empty; pass --symbols or set WATCHLIST")
@@ -110,6 +119,7 @@ class TradingBot:
         self._breaker_alerted: Optional[date] = None
         self.broker = broker
         self.trailing_manager = trailing_manager
+        self.fill_tracker = fill_tracker
         if reconcile_fn is None and broker is not None:
             from core.reconciliation import reconcile as reconcile_fn
         self.reconcile_fn = reconcile_fn
@@ -249,12 +259,26 @@ class TradingBot:
                 f"Reconciliation clean: {recon.positions} positions, {recon.open_orders} open orders match local book"
             )
 
+        self._track_fills(self._market_date())
+
         if self.execute and self.trailing_manager is not None:
             report.stop_adjustments = self.trailing_manager.update(snapshot)
             for adj in report.stop_adjustments:
                 status = "raised" if adj.ok else "FAILED to raise"
                 logger.info(f"{adj.symbol}: stop {status} {adj.old_stop} -> {adj.new_stop} ({adj.detail})")
         return True
+
+    def _track_fills(self, session_date: date, orders: Optional[List[Dict[str, Any]]] = None) -> None:
+        if self.fill_tracker is None or not hasattr(self.broker, "get_orders_today"):
+            return
+        try:
+            orders = self.broker.get_orders_today() if orders is None else orders
+            for fill in self.fill_tracker.update(orders, session_date):
+                if fill.slippage_bps is not None:
+                    logger.info(f"Fill {fill.side} {fill.qty:g} {fill.symbol} @ {fill.fill_price} vs "
+                                f"{fill.reference} {fill.reference_price}: {fill.slippage_bps:+.1f} bps")
+        except Exception as exc:  # measurement only; never blocks trading
+            logger.warning(f"Fill tracking failed: {exc}")
 
     def _flatten(self, report: CycleReport) -> None:
         """EOD: cancel working orders and close every position (no overnight risk)."""
@@ -300,7 +324,9 @@ class TradingBot:
             return
         equity = float(account.get("equity") or 0)
         start = float(account.get("last_equity") or 0)
-        fills = [o for o in orders if o.get("status") == "filled" or float(o.get("filled_qty") or 0) > 0]
+        all_orders = list(_walk_orders(orders))
+        fills = [o for o in all_orders if o.get("status") == "filled" or float(o.get("filled_qty") or 0) > 0]
+        self._track_fills(session_date, orders)
         no_overnight = bool(self.session_clock and self.session_clock.config.no_overnight)
         report.session_report = {
             "date": str(session_date),
@@ -312,6 +338,8 @@ class TradingBot:
             "open_symbols": [p.get("symbol") for p in positions],
             "no_overnight": no_overnight,
         }
+        if self.fill_tracker is not None:
+            report.session_report["fill_quality"] = self.fill_tracker.summary()
         level = logging.WARNING if (no_overnight and positions) else logging.INFO
         self.telemetry.record("session_report", level, **report.session_report)
 

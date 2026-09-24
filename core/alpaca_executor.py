@@ -21,7 +21,7 @@ import requests
 from dotenv import load_dotenv
 
 from core.execution_telemetry import EventLog, Rejection, classify_rejection
-from core.risk_manager import RiskManager
+from core.risk_manager import RiskManager, last_exit_fill
 from core.session_clock import SessionClock, SessionPhase
 
 load_dotenv()
@@ -108,6 +108,9 @@ class AlpacaExecutor:
         # Optional intraday session rules (opening lockout / EOD cutoff) for entries.
         self.session_clock = session_clock
         self.telemetry = telemetry or EventLog.from_env()
+        # order id -> price we expected to fill at (for slippage measurement,
+        # see core/fill_quality.py). Bracket legs carry their own stop/limit.
+        self.expected_prices: Dict[str, float] = {}
         self.price_lookup = price_lookup or _default_price_lookup
         self.api_key = os.getenv("ALPACA_API_KEY")
         self.secret_key = os.getenv("ALPACA_SECRET_KEY")
@@ -185,6 +188,7 @@ class AlpacaExecutor:
             headers=self.headers,
             params={
                 "status": "all",
+                "nested": "true",  # bracket legs under their parent (stop-out detection)
                 "after": start.isoformat(),
                 "limit": 500,
                 "direction": "desc",
@@ -262,6 +266,7 @@ class AlpacaExecutor:
             # ATR-based distances re-centred on the live entry price.
             stop_loss, take_profit = price - stop_distance, price + target_distance
 
+        orders_today = self.get_orders_today() if action == "BUY" else []
         decision = self.risk_manager.check_order(
             side=action,
             symbol=symbol,
@@ -269,9 +274,10 @@ class AlpacaExecutor:
             price=price,
             account=self.get_account(),
             position=position,
-            orders_today=self.get_orders_today() if action == "BUY" else (),
+            orders_today=orders_today,
             stop_loss=stop_loss,
             take_profit=take_profit,
+            last_exit=last_exit_fill(orders_today, symbol),
         )
         if not decision.approved:
             logger.warning(f"Risk check blocked {action} {quantity} {symbol}: {decision.reason}")
@@ -282,24 +288,27 @@ class AlpacaExecutor:
                 # Bracket stop/target legs reserve the shares; release them first.
                 self.cancel_open_orders(symbol)
                 order = self._place_order(symbol, decision.quantity, "sell")
-                self._record_submitted(order, symbol, "sell", decision.quantity)
+                self._record_submitted(order, symbol, "sell", decision.quantity, expected_price=price)
                 return ExecutionResult(order=order)
 
             order = self._place_bracket_order(
                 symbol, decision.quantity, decision.stop_loss, decision.take_profit
             )
-            self._record_submitted(order, symbol, "buy", decision.quantity, decision.stop_loss, decision.take_profit)
+            self._record_submitted(order, symbol, "buy", decision.quantity, decision.stop_loss,
+                                   decision.take_profit, expected_price=price)
             return ExecutionResult(order=order)
         except requests.exceptions.HTTPError as exc:
             return self._recover_from_rejection(exc, action, symbol, decision.quantity, price)
 
     def _record_submitted(self, order: Dict, symbol: str, side: str, qty: int,
                           stop_loss: Optional[float] = None, take_profit: Optional[float] = None,
-                          recovered: bool = False) -> None:
+                          recovered: bool = False, expected_price: Optional[float] = None) -> None:
+        if order.get("id") and expected_price:
+            self.expected_prices[order["id"]] = float(expected_price)
         self.telemetry.record(
             "order_submitted", symbol=symbol, side=side, qty=int(float(order.get("qty") or qty)),
             order_id=order.get("id"), status=order.get("status"), stop_loss=stop_loss,
-            take_profit=take_profit, recovered=recovered,
+            take_profit=take_profit, recovered=recovered, expected_price=expected_price,
         )
 
     # ------------------------------------------------------------------
@@ -373,7 +382,7 @@ class AlpacaExecutor:
             )
         self.telemetry.record("order_recovered", symbol=symbol, side=action, category=rejection.category,
                               order_id=order.get("id"), plan=plan)
-        self._record_submitted(order, symbol, action.lower(), quantity, recovered=True)
+        self._record_submitted(order, symbol, action.lower(), quantity, recovered=True, expected_price=price)
         return ExecutionResult(order=order, rejection=rejection, recovered=True)
 
     def _place_order(
@@ -528,7 +537,10 @@ class AlpacaExecutor:
             if qty == 0:
                 continue
             try:
-                order = self.close_position(symbol, qty, float(position.get("current_price") or 0))
+                last_price = float(position.get("current_price") or 0)
+                order = self.close_position(symbol, qty, last_price)
+                if order.get("id") and last_price > 0:
+                    self.expected_prices[order["id"]] = last_price
                 report.closed.append({"symbol": symbol, "qty": qty, "order_id": order.get("id")})
             except requests.exceptions.HTTPError as exc:
                 rejection = self._rejection(exc, symbol=symbol, side="close", qty=qty, attempt=1)

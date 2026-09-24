@@ -33,6 +33,7 @@ DEFAULT_EVENTS = (
     "order_submitted",
     "order_rejected",
     "order_recovered",
+    "order_filled",
     "flatten",
     "breaker_tripped",
     "reconciliation",
@@ -57,6 +58,11 @@ def format_alert(event: Dict[str, Any]) -> Optional[str]:
         return f"🔴 {sym} {event.get('side', '')} rejected [{event.get('category')}]: {event.get('message')}"
     if name == "order_recovered":
         return f"🟡 {sym} recovered after {event.get('category')}: {event.get('plan')}"
+    if name == "order_filled":
+        if not event.get("adverse"):
+            return None  # only fills worse than SLIPPAGE_ALERT_BPS
+        return (f"🐌 {event.get('side', '').upper()} {sym} filled {event.get('fill_price')} vs "
+                f"{event.get('reference')} {event.get('reference_price')}: {event.get('slippage_bps'):+.1f} bps slippage")
     if name == "flatten":
         closed = ", ".join(c["symbol"] for c in event.get("closed") or []) or "nothing to close"
         failures = event.get("failures") or []
@@ -79,6 +85,8 @@ def format_alert(event: Dict[str, Any]) -> Optional[str]:
             f"📊 Session {event.get('date')}: P&L {event.get('pnl', 0):+,.2f} ({event.get('pnl_pct', 0):+.2f}%), "
             f"equity {event.get('equity', 0):,.2f}, {event.get('fills', 0)} fills, "
             f"{event.get('open_positions', 0)} open positions"
+            + (f", slippage {q['mean_bps']:+.1f} bps avg" if (q := event.get("fill_quality") or {}).get("measured")
+               else "")
             + (" ⚠️ NOT FLAT" if event.get("open_positions") and event.get("no_overnight") else "")
         )
     if name == "bot_started":
