@@ -41,6 +41,9 @@ class CycleReport:
     market_open: bool
     results: List[WorkflowResult] = field(default_factory=list)
     errors: Dict[str, str] = field(default_factory=dict)
+    reconciliation: Optional[Any] = None           # core.reconciliation.ReconciliationReport
+    stop_adjustments: List[Any] = field(default_factory=list)
+    broker_error: Optional[str] = None
 
     @property
     def orders(self) -> List[WorkflowResult]:
@@ -58,7 +61,13 @@ class TradingBot:
         interval_seconds: int = 900,
         market_clock: Optional[Callable[[], Dict[str, Any]]] = None,
         sleep: Callable[[float], None] = time.sleep,
+        broker: Optional[Any] = None,
+        trailing_manager: Optional[Any] = None,
+        reconcile_fn: Optional[Callable[..., Any]] = None,
     ) -> None:
+        """``broker`` (an AlpacaExecutor) enables the start-of-cycle broker
+        snapshot and reconciliation; ``trailing_manager`` raises stops on
+        winners (execute mode only)."""
         cleaned = [s.strip().upper() for s in symbols if s and s.strip()]
         if not cleaned:
             raise ValueError("Watchlist is empty; pass --symbols or set WATCHLIST")
@@ -69,6 +78,11 @@ class TradingBot:
         self.interval_seconds = max(60, interval_seconds)
         self.market_clock = market_clock
         self.sleep = sleep
+        self.broker = broker
+        self.trailing_manager = trailing_manager
+        if reconcile_fn is None and broker is not None:
+            from core.reconciliation import reconcile as reconcile_fn
+        self.reconcile_fn = reconcile_fn
 
     def _market_open(self) -> bool:
         if self.market_clock is None:
@@ -83,6 +97,9 @@ class TradingBot:
         report = CycleReport(started_at=datetime.now(timezone.utc), market_open=self._market_open())
         if not report.market_open:
             logger.info("Market closed; skipping cycle")
+            return report
+
+        if self.broker is not None and not self._sync_with_broker(report):
             return report
 
         for symbol in self.symbols:
@@ -111,13 +128,40 @@ class TradingBot:
                     if ml.get("sentiment_available") else "n/a"
                 )
                 summary += (
-                    f" [{ml['mode']} P(up)={ml['probability_up']:.2f} sentiment {sentiment}]"
+                    f" [{ml['mode']} P(up)={ml['probability_up']:.2f} regime {ml.get('regime') or 'n/a'}"
+                    f" sentiment {sentiment}]"
                 )
             if result.alpaca_order:
                 logger.info(f"{summary} -> ORDER {result.alpaca_order.get('id')}")
             else:
                 logger.info(f"{summary} -> {result.skipped_reason or 'no order'}")
         return report
+
+    def _sync_with_broker(self, report: CycleReport) -> bool:
+        """Snapshot broker state, reconcile the local book, trail stops.
+        Returns False (skip the cycle) if broker state can't be read."""
+        try:
+            snapshot = self.broker.get_snapshot()
+        except Exception as exc:
+            report.broker_error = str(exc)
+            logger.error(f"Could not read broker positions/orders ({exc}); skipping cycle rather than trading blind")
+            return False
+
+        report.reconciliation = self.reconcile_fn(
+            snapshot,
+            self.workflow.portfolio_manager,
+            self.portfolio_name,
+            mode=None if self.execute else "report",
+        )
+        if report.reconciliation.discrepancies:
+            logger.warning(f"Reconciliation: {report.reconciliation.kinds()} (synced: {report.reconciliation.synced})")
+
+        if self.execute and self.trailing_manager is not None:
+            report.stop_adjustments = self.trailing_manager.update(snapshot)
+            for adj in report.stop_adjustments:
+                status = "raised" if adj.ok else "FAILED to raise"
+                logger.info(f"{adj.symbol}: stop {status} {adj.old_stop} -> {adj.new_stop} ({adj.detail})")
+        return True
 
     def run(self, max_cycles: Optional[int] = None) -> List[CycleReport]:
         mode = "EXECUTE (paper orders)" if self.execute else "DRY RUN (no orders)"

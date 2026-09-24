@@ -76,14 +76,19 @@ def macd(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
     return line, signal_line, line - signal_line
 
 
-def atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
-    """Wilder's Average True Range."""
+def true_range(high: pd.Series, low: pd.Series, close: pd.Series) -> pd.Series:
     prev_close = close.shift(1)
-    true_range = pd.concat(
+    tr = pd.concat(
         [high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1
     ).max(axis=1, skipna=False)
-    true_range.iloc[0] = high.iloc[0] - low.iloc[0] if len(true_range) else np.nan
-    return true_range.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
+    if len(tr):
+        tr.iloc[0] = high.iloc[0] - low.iloc[0]
+    return tr
+
+
+def atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
+    """Wilder's Average True Range."""
+    return true_range(high, low, close).ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
 
 
 def compute_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -128,6 +133,73 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
     out["volume_z20"] = ((v - vol_mean) / vol_std.replace(0.0, np.nan)).fillna(0.0).where(vol_mean.notna())
 
     return out.replace([np.inf, -np.inf], np.nan)
+
+
+# ---------------------------------------------------------------------------
+# Multi-timeframe (macro anchor) features
+# ---------------------------------------------------------------------------
+
+MACRO_FEATURES = ["macro_close_vs_ema50", "macro_ema20_vs_ema50", "macro_trend_aligned"]
+
+
+def resample_bars(bars: pd.DataFrame, rule: str = "1D") -> pd.DataFrame:
+    """Aggregate OHLCV bars into a higher timeframe (labels = period start)."""
+    agg = bars.resample(rule, label="left", closed="left").agg(
+        {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
+    )
+    return agg.dropna(subset=["close"])
+
+
+def add_macro_features(
+    features: pd.DataFrame,
+    macro_bars: pd.DataFrame,
+    *,
+    primary_bar_length: pd.Timedelta,
+    macro_bar_length: pd.Timedelta = pd.Timedelta(days=1),
+) -> pd.DataFrame:
+    """Attach higher-timeframe trend context to each primary bar without lookahead.
+
+    A macro (e.g. daily) candle is only usable once it has closed, i.e. at
+    ``macro_index + macro_bar_length``. Each primary bar is matched, as of its
+    own close time (``index + primary_bar_length``), to the latest macro candle
+    that had closed by then (``merge_asof`` backward). An hourly bar during
+    day D therefore sees day D-1's EMA values, never day D's unfinished close.
+    """
+    out = features.copy()
+    macro = _validate(macro_bars).sort_index()
+    ema20, ema50 = ema(macro["close"], 20), ema(macro["close"], 50)
+    def utc_ns(index) -> pd.DatetimeIndex:
+        index = pd.DatetimeIndex(index)
+        index = index.tz_localize("UTC") if index.tz is None else index.tz_convert("UTC")
+        return index.as_unit("ns")
+
+    anchor = pd.DataFrame(
+        {
+            "macro_available_at": utc_ns(macro.index + macro_bar_length),
+            "macro_ema20": ema20.to_numpy(),
+            "macro_ema50": ema50.to_numpy(),
+        }
+    )
+    primary = pd.DataFrame(
+        {"primary_close_at": utc_ns(out.index + primary_bar_length), "_row": np.arange(len(out))}
+    )
+    merged = pd.merge_asof(
+        primary.sort_values("primary_close_at"),
+        anchor.sort_values("macro_available_at"),
+        left_on="primary_close_at",
+        right_on="macro_available_at",
+        direction="backward",
+    ).sort_values("_row")
+
+    macro_ema20 = merged["macro_ema20"].to_numpy()
+    macro_ema50 = merged["macro_ema50"].to_numpy()
+    close = out["close"].to_numpy()
+    out["macro_ema50"] = macro_ema50
+    out["macro_close_vs_ema50"] = close / macro_ema50 - 1
+    out["macro_ema20_vs_ema50"] = macro_ema20 / macro_ema50 - 1
+    aligned = (close > macro_ema50) & (macro_ema20 > macro_ema50)
+    out["macro_trend_aligned"] = np.where(np.isnan(macro_ema50) | np.isnan(macro_ema20), np.nan, aligned.astype(float))
+    return out
 
 
 def bars_from_candles(candles: list[dict]) -> pd.DataFrame:

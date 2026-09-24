@@ -164,3 +164,56 @@ def test_bot_dry_run_with_ml_engine_never_orders(portfolio_manager: PortfolioMan
     assert report.results[0].analysis["recommendation"] == "BUY"
     assert report.results[0].skipped_reason == "Paper trading disabled"
     assert report.orders == []
+
+
+def test_engine_reports_regime_applies_mtf_gate_and_dynamic_sizing(portfolio_manager: PortfolioManager) -> None:
+    from core.features import resample_bars
+    from core.risk_manager import SizingConfig
+
+    portfolio_manager.create_portfolio("paper", 10_000)
+    hourly = synthetic_bars(24 * 90, seed=6, start="2025-01-01 00:00")
+    macro_calls = []
+
+    def daily_loader(symbol):
+        macro_calls.append(symbol)
+        return resample_bars(hourly, "1D")
+
+    strategy = MLStrategy(
+        {"pipeline": FixedModel(0.9), "label_params": {"stop_atr_mult": 1.5, "target_atr_mult": 3.0}},
+        confidence_threshold=0.6, regime_policy="off", mtf_confirmation=True,
+    )
+    engine = MLSignalEngine(
+        portfolio_manager, strategy=strategy, history_loader=lambda s: hourly,
+        sentiment_loader=lambda s: UNAVAILABLE, macro_loader=daily_loader,
+        sizing=SizingConfig(method="volatility", base_risk_pct=1.0),
+    )
+
+    analysis = engine("AAPL", {}, "paper")
+    ml = analysis["all_signals"]["ml"]
+
+    assert macro_calls == ["AAPL"]
+    assert ml["regime"] in {"TRENDING_BULL", "TRENDING_BEAR", "CHOPPY"}
+    assert ml["macro_aligned"] in {0.0, 1.0}
+    if ml["macro_aligned"] == 1.0:
+        assert analysis["recommendation"] == "BUY"
+        assert analysis["risk_parameters"]["sizing_method"] == "volatility"
+        assert 0.5 <= analysis["risk_parameters"]["risk_pct"] <= 1.5
+    else:
+        assert analysis["recommendation"] == "HOLD" and ml["gated_by"] == "mtf"
+
+
+def test_engine_blocks_mtf_entries_when_daily_bars_unavailable(portfolio_manager: PortfolioManager) -> None:
+    def broken(symbol):
+        raise ConnectionError("daily feed down")
+
+    strategy = MLStrategy(
+        {"pipeline": FixedModel(0.9), "label_params": {}}, confidence_threshold=0.6,
+        regime_policy="off", mtf_confirmation=True,
+    )
+    engine = MLSignalEngine(portfolio_manager, strategy=strategy, history_loader=lambda s: synthetic_bars(300, seed=4),
+                            sentiment_loader=lambda s: UNAVAILABLE, macro_loader=broken)
+
+    analysis = engine("AAPL", {}, "paper")
+
+    assert analysis["recommendation"] == "HOLD"
+    assert analysis["all_signals"]["ml"]["gated_by"] == "mtf"

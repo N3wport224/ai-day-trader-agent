@@ -60,6 +60,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--target-atr", type=float, default=float(os.getenv("ATR_TARGET_MULT", "3.0")))
     parser.add_argument("--threshold", type=float, default=float(os.getenv("ML_CONFIDENCE_THRESHOLD", "0.6")))
     parser.add_argument("--no-news", action="store_true", help="Train on technical features only")
+    parser.add_argument(
+        "--mtf",
+        action="store_true",
+        help="Add higher-timeframe trend features (daily anchor for intraday, weekly for daily)",
+    )
     parser.add_argument("--synthetic", action="store_true", help="Use generated bars (offline demo)")
     parser.add_argument("--output", default=os.getenv("ML_MODEL_PATH", DEFAULT_MODEL_PATH))
     args = parser.parse_args(argv)
@@ -98,7 +103,12 @@ def main(argv: list[str] | None = None) -> int:
             except Exception as exc:
                 logger.warning(f"{symbol}: news unavailable ({exc}); sentiment features left missing")
 
-        data = build_dataset(bars, params, bar_len, scored, half_life=half_life_from_env())
+        macro = None
+        if args.mtf and not args.synthetic and args.timeframe != "1Day":
+            macro = get_history(symbol, "1Day", args.days + 120, end=end)
+        data = build_dataset(
+            bars, params, bar_len, scored, half_life=half_life_from_env(), macro_bars=macro, use_macro=args.mtf
+        )
         datasets[symbol] = data
         logger.info(f"{symbol}: {len(bars)} bars -> {len(data)} labeled rows, base rate {data['label'].mean():.2%}")
 
@@ -107,7 +117,9 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     try:
-        artifact = train(datasets, params, bar_len, threshold=args.threshold, timeframe=args.timeframe)
+        artifact = train(
+            datasets, params, bar_len, threshold=args.threshold, timeframe=args.timeframe, use_macro=args.mtf
+        )
     except ValueError as exc:
         logger.error(str(exc))
         return 1
@@ -118,7 +130,8 @@ def main(argv: list[str] | None = None) -> int:
 
     joblib.dump(artifact, output)
     print(f"\nSaved model to {output}")
-    print(json.dumps({k: artifact[k] for k in ("symbols", "timeframe", "label_params", "uses_sentiment", "metrics")},
+    print(json.dumps({k: artifact[k] for k in ("symbols", "timeframe", "label_params", "uses_sentiment",
+                                               "feature_columns", "metrics")},
                      indent=2, default=str))
     metrics = artifact["metrics"]
     if not metrics["auc"] > 0.52 or not metrics["approx_expectancy_r"] > 0:

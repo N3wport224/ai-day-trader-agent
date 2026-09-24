@@ -157,3 +157,7 @@ $RECYCLE.BIN/
 
 # Trained ML model artifacts
 models/
+
+# Runtime telemetry and bot state
+logs/
+data/trailing_state.json

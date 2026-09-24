@@ -96,3 +96,73 @@ def test_bars_from_candles_sorts_fetcher_output() -> None:
 
     assert frame["close"].tolist() == [1.5, 2.5]
     assert frame.index.is_monotonic_increasing
+
+
+# ---------------------------------------------------------------------------
+# Multi-timeframe (daily anchor) alignment
+# ---------------------------------------------------------------------------
+
+from core.features import MACRO_FEATURES, add_macro_features, resample_bars  # noqa: E402
+
+
+def _hourly(n=24 * 90, seed=4):
+    return synthetic_bars(n=n, seed=seed, start="2025-01-01 00:00")
+
+
+def test_macro_features_only_use_completed_daily_candles() -> None:
+    hourly = _hourly()
+    daily = resample_bars(hourly, "1D")
+    feats = add_macro_features(
+        compute_features(hourly), daily, primary_bar_length=pd.Timedelta(hours=1)
+    )
+    daily_ema50 = daily["close"].ewm(span=50, adjust=False, min_periods=50).mean()
+
+    # An hourly bar on day D (closing before midnight) must see day D-1's EMA.
+    ts = pd.Timestamp("2025-03-10 15:00", tz="UTC")
+    assert feats.loc[ts, "macro_ema50"] == pytest.approx(daily_ema50.loc[pd.Timestamp("2025-03-09", tz="UTC")])
+    # The 23:00 bar closes exactly at midnight, when day D's candle has closed.
+    ts_last = pd.Timestamp("2025-03-10 23:00", tz="UTC")
+    assert feats.loc[ts_last, "macro_ema50"] == pytest.approx(daily_ema50.loc[pd.Timestamp("2025-03-10", tz="UTC")])
+
+
+def test_macro_features_have_no_lookahead() -> None:
+    hourly = _hourly()
+    cutoff = pd.Timestamp("2025-03-01 12:00", tz="UTC")
+    shocked = hourly.copy()
+    shocked.loc[shocked.index > cutoff, ["open", "high", "low", "close"]] *= 2
+
+    def build(bars):
+        return add_macro_features(
+            compute_features(bars), resample_bars(bars, "1D"), primary_bar_length=pd.Timedelta(hours=1)
+        )
+
+    base, alt = build(hourly), build(shocked)
+    cols = MACRO_FEATURES + ["macro_ema50"]
+    pd.testing.assert_frame_equal(base.loc[:cutoff, cols], alt.loc[:cutoff, cols])
+
+
+def test_macro_alignment_flag_and_warmup() -> None:
+    hourly = _hourly()
+    feats = add_macro_features(
+        compute_features(hourly), resample_bars(hourly, "1D"), primary_bar_length=pd.Timedelta(hours=1)
+    )
+    early = feats.loc[: "2025-02-15"]
+    late = feats.loc["2025-03-15":].dropna(subset=["macro_ema50"])
+
+    assert early["macro_trend_aligned"].isna().all()  # < 50 daily candles
+    assert set(late["macro_trend_aligned"].unique()) <= {0.0, 1.0}
+    expected = ((late["close"] > late["macro_ema50"]) & (late["macro_ema20_vs_ema50"] > 0)).astype(float)
+    pd.testing.assert_series_equal(late["macro_trend_aligned"], expected, check_names=False)
+
+
+def test_resample_bars_aggregates_ohlcv() -> None:
+    idx = pd.date_range("2025-01-01", periods=48, freq="h", tz="UTC")
+    bars = pd.DataFrame({"open": range(48), "high": range(1, 49), "low": range(48),
+                         "close": range(48), "volume": [1.0] * 48}, index=idx, dtype=float)
+
+    daily = resample_bars(bars, "1D")
+
+    assert daily["open"].tolist() == [0.0, 24.0]
+    assert daily["high"].tolist() == [24.0, 48.0]
+    assert daily["close"].tolist() == [23.0, 47.0]
+    assert daily["volume"].tolist() == [24.0, 24.0]

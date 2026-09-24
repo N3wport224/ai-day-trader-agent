@@ -230,6 +230,81 @@ expectancy is negative, the model has no edge: keep the bot in dry-run.**
 Retrain after changing `ATR_*_MULT`, the timeframe, or the feature code.
 Use `--strategy classic` to run the original rule-based pipeline.
 
+#### Regime filter, multi-timeframe confirmation, sizing and trailing stops
+
+- **Regime filter** (`core/regime.py`): each bar is `TRENDING_BULL`,
+  `TRENDING_BEAR`, `CHOPPY` or `UNKNOWN` from ADX/+DI/-DI plus the ATR%
+  percentile (ADX >= `ADX_TREND_THRESHOLD`, or 5 below it when volatility is
+  expanding). `REGIME_FILTER=suppress` allows longs only in `TRENDING_BULL`;
+  `penalty` (default) requires `ML_CONFIDENCE_THRESHOLD + REGIME_THRESHOLD_BUMP`
+  elsewhere. Exits are never blocked.
+- **Multi-timeframe** (`features.add_macro_features`): each intraday bar gets
+  the daily EMA20/EMA50 trend from the last *completed* daily candle (matched
+  as of the bar's close), so no daily close leaks into earlier hours.
+  `MTF_CONFIRMATION=true` only enters longs aligned with the daily trend;
+  `scripts/train_model.py --mtf` also trains the model on these features.
+- **Sizing** (`POSITION_SIZING_METHOD`): `fixed` risk per trade;
+  `volatility` scales it by median/current ATR% (0.5x-1.5x); `kelly` uses
+  fractional Kelly on the model's probability (capped at the fixed risk, zero
+  when the model sees no edge), then volatility-scales it.
+- **Trailing stops**: once a position is `TRAILING_STOP_TRIGGER_R` in profit
+  the bracket stop moves to breakeven, then trails `TRAILING_STOP_DISTANCE_R`
+  below the high. The backtester and the live `TrailingStopManager` use the
+  same rule; live stops are replaced at Alpaca each cycle (`--execute` only).
+- **Reconciliation and recovery**: each cycle starts by reading Alpaca
+  positions and open orders. Mismatches with the local book, positions with
+  no working stop, and shorts are logged (and holdings synced with
+  `RECONCILE_MODE=sync`). If broker state can't be read, the cycle is
+  skipped. Order rejections are classified (buying power, margin/PDT, wash
+  trade, shares held by bracket legs, invalid prices, ...) with a root cause
+  and remediation, written to `logs/execution_events.jsonl`, and retried once
+  when there is a safe fix (smaller size, fresh-quote levels, cancel legs
+  before an exit).
+
+#### Backtesting
+
+`scripts/backtest.py` replays the whole path on history using the live code:
+the same features, `MLStrategy` decisions, risk-per-trade sizing and
+`RiskManager` checks (with a simulated account), with realistic execution:
+
+- Decide at a bar's close; fill at the **next** bar's open plus slippage.
+- Brackets at the signal's ATR distances around the fill price; a gap through
+  a level fills at the open, and a bar touching both counts as the stop.
+- Intraday: decisions only while the market is open; brackets only trigger in
+  bars overlapping the regular session. Queued orders reserve buying power.
+
+```bash
+# Walk-forward (default): train on the first 60%, trade only the unseen 40%
+python scripts/backtest.py --symbols AAPL,MSFT,NVDA,AMD,SPY --days 730
+
+# Add news sentiment, write trades.csv / equity.csv / summary.json
+python scripts/backtest.py --news --out reports/bt
+
+# A saved model (warns if the test period overlaps its training data)
+python scripts/backtest.py --mode model
+
+# The no-model heuristic, or an offline demo
+python scripts/backtest.py --mode heuristic --timeframe 1Day --days 1500
+python scripts/backtest.py --synthetic
+```
+
+Benchmark the new layers against the old behaviour on identical data with
+`--compare` (baseline = regime off, no MTF, fixed sizing, no trailing):
+
+```bash
+python scripts/backtest.py --regime suppress --mtf --mtf-gate --sizing kelly --trailing --compare --out reports/cmp
+```
+
+The report shows return vs. equal-weight buy-and-hold, max drawdown, daily
+Sharpe, trade count, win rate, average R, profit factor, exit reasons, how
+often each risk limit blocked an entry, and how many BUY-level signals fell
+outside market hours. Walk-forward runs also print a **threshold audit** for
+the unseen period (hit rate and approximate expectancy at each
+`ML_CONFIDENCE_THRESHOLD`, plus a calibration table), saved as
+`threshold_sweep.csv` / `calibration.csv` with `--out`. Treat fewer than ~30 trades as
+inconclusive, and only use `--execute` if the walk-forward result beats
+buy-and-hold with positive average R after slippage.
+
 Every order, whether from the bot, the CLI (`--paper-trade`), the API or
 the dashboard, goes through the same safeguards:
 

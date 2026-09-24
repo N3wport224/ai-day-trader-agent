@@ -21,11 +21,12 @@ from typing import Any, Callable, Dict, Optional
 
 import pandas as pd
 
-from core.features import compute_features
+from core.feature_pipeline import build_feature_frame, macro_from_primary, macro_timeframe
 from core.market_history import get_history
 from core.ml_strategy import MLSignal, MLStrategy
 from core.news_sentiment import SentimentSnapshot, live_sentiment
 from core.portfolio_manager import PortfolioManager
+from core.risk_manager import SizingConfig, position_size, risk_pct_for_trade
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +53,8 @@ class MLSignalEngine:
         timeframe: Optional[str] = None,
         lookback_days: Optional[int] = None,
         risk_per_trade_pct: Optional[float] = None,
+        sizing: Optional[SizingConfig] = None,
+        macro_loader: Optional[Callable[[str], pd.DataFrame]] = None,
     ) -> None:
         self.portfolio_manager = portfolio_manager
         self.strategy = strategy or MLStrategy()
@@ -61,8 +64,22 @@ class MLSignalEngine:
             lambda symbol: get_history(symbol, self.timeframe, self.lookback_days)
         )
         self.sentiment_loader = sentiment_loader or live_sentiment
-        self.risk_per_trade_pct = risk_per_trade_pct or _env_float("RISK_PER_TRADE_PCT", 1.0)
-        logger.info(f"ML signal engine ready: mode={self.strategy.mode}, timeframe={self.timeframe}")
+        sizing = sizing or SizingConfig.from_env()
+        if risk_per_trade_pct:
+            sizing = SizingConfig(**{**sizing.__dict__, "base_risk_pct": risk_per_trade_pct})
+        self.sizing = sizing
+        self.macro_loader = macro_loader or self._default_macro_loader
+        logger.info(
+            f"ML signal engine ready: mode={self.strategy.mode}, timeframe={self.timeframe}, "
+            f"regime filter={self.strategy.regime_policy}, MTF gate={self.strategy.mtf_confirmation}, "
+            f"sizing={self.sizing.method}"
+        )
+
+    def _default_macro_loader(self, symbol: str) -> pd.DataFrame:
+        if macro_timeframe(self.timeframe) == "1Week":
+            return macro_from_primary(get_history(symbol, "1Day", 500), "1Day")
+        # 50 daily EMA bars need ~75 trading days; fetch extra for warm-up.
+        return get_history(symbol, "1Day", int(os.getenv("ML_MACRO_LOOKBACK_DAYS", "200")))
 
     def __call__(
         self,
@@ -75,26 +92,39 @@ class MLSignalEngine:
         if bars is None or len(bars) < MIN_BARS:
             return self._error(symbol, "no_data", f"Need at least {MIN_BARS} completed bars for {symbol}")
 
-        features = compute_features(bars)
+        macro = None
+        if self.strategy.uses_macro:
+            try:
+                macro = self.macro_loader(symbol)
+            except Exception as exc:  # missing macro data blocks MTF-gated entries, never crashes
+                logger.warning(f"Macro ({macro_timeframe(self.timeframe)}) bars unavailable for {symbol}: {exc}")
+        features = build_feature_frame(bars, self.timeframe, macro_bars=macro)
         sentiment = self.sentiment_loader(symbol)
         ml = self.strategy.predict(features, sentiment)
-        quantity = self._size(ml, symbol, portfolio_name, user_id)
-        return self._analysis(symbol, ml, quantity, features, portfolio_name)
+        quantity, risk_pct = self._size(ml, symbol, portfolio_name, user_id, features.iloc[-1])
+        return self._analysis(symbol, ml, quantity, features, portfolio_name, risk_pct)
 
     # ------------------------------------------------------------------
 
-    def _size(self, ml: MLSignal, symbol: str, portfolio_name: str, user_id: Optional[int]) -> int:
+    def _size(
+        self, ml: MLSignal, symbol: str, portfolio_name: str, user_id: Optional[int], latest: pd.Series
+    ) -> tuple[int, Optional[float]]:
         if ml.signal == "BUY":
-            if not ml.stop_distance or ml.stop_distance <= 0:
-                return 0
+            risk_pct = risk_pct_for_trade(
+                self.sizing,
+                probability=ml.probability_up,
+                reward_risk=(ml.target_distance / ml.stop_distance) if ml.stop_distance else None,
+                atr_pct=latest.get("atr_pct"),
+                atr_pct_median=latest.get("atr_pct_median"),
+                calibrated=self.strategy.mode == "model",
+            )
             capital = self._capital(portfolio_name, user_id)
-            # Risk a fixed % of capital between entry and stop.
-            return max(0, int(capital * self.risk_per_trade_pct / 100 // ml.stop_distance))
+            return position_size(capital, risk_pct, ml.stop_distance), risk_pct
         if ml.signal == "SELL":
             holdings = self.portfolio_manager.get_holdings(portfolio_name, user_id=user_id) \
                 if self.portfolio_manager.get_portfolio(portfolio_name, user_id=user_id) else []
-            return next((int(h["quantity"]) for h in holdings if h["symbol"] == symbol), 0)
-        return 0
+            return next((int(h["quantity"]) for h in holdings if h["symbol"] == symbol), 0), None
+        return 0, None
 
     def _capital(self, portfolio_name: str, user_id: Optional[int]) -> float:
         if self.portfolio_manager.get_portfolio(portfolio_name, user_id=user_id):
@@ -103,7 +133,13 @@ class MLSignalEngine:
         return _env_float("TRADING_CAPITAL", 5000.0)
 
     def _analysis(
-        self, symbol: str, ml: MLSignal, quantity: int, features: pd.DataFrame, portfolio_name: str
+        self,
+        symbol: str,
+        ml: MLSignal,
+        quantity: int,
+        features: pd.DataFrame,
+        portfolio_name: str,
+        risk_pct: Optional[float] = None,
     ) -> Dict[str, Any]:
         action = ml.signal if quantity > 0 else "HOLD"
         reasons = list(ml.reasons)
@@ -122,6 +158,8 @@ class MLSignalEngine:
             "stop_distance": ml.stop_distance,
             "target_distance": ml.target_distance,
             "position_value": round(quantity * ml.price, 2),
+            "sizing_method": self.sizing.method,
+            "risk_pct": round(risk_pct, 4) if risk_pct is not None else None,
         }
         if ml.stop_distance and ml.target_distance:
             risk_parameters["risk_reward_ratio"] = round(ml.target_distance / ml.stop_distance, 2)
