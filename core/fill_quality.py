@@ -47,6 +47,7 @@ class FillRecord:
     reference: str                 # quote | stop | limit | none
     slippage_bps: Optional[float]  # positive = adverse
     filled_at: str
+    stop_price: Optional[float] = None  # entries: the bracket's initial stop (for R-multiples)
 
 
 def _num(value: Any) -> float:
@@ -143,7 +144,11 @@ class FillTracker:
         new: List[FillRecord] = []
         for order in _walk(orders):
             order_id = order.get("id")
-            if not order_id or order_id in self._seen or str(order.get("status", "")).lower() != "filled":
+            status = str(order.get("status", "")).lower()
+            # Terminal orders with shares filled count too (a partial fill later
+            # cancelled, e.g. by the EOD flatten, still opened a position).
+            done_partial = status in {"canceled", "expired", "done_for_day"} and _num(order.get("filled_qty")) > 0
+            if not order_id or order_id in self._seen or not (status == "filled" or done_partial):
                 continue
             fill = _num(order.get("filled_avg_price"))
             if fill <= 0:
@@ -160,7 +165,13 @@ class FillTracker:
                 reference_price=reference,
                 reference=source,
                 slippage_bps=slippage_bps(side, fill, reference) if reference else None,
-                filled_at=str(order.get("filled_at") or ""),
+                filled_at=str(order.get("filled_at") or order.get("updated_at") or ""),
+                stop_price=next(
+                    (_num(leg.get("stop_price")) for leg in order.get("legs") or []
+                     if str(leg.get("type", leg.get("order_type", ""))).lower() in {"stop", "stop_limit"}
+                     and _num(leg.get("stop_price")) > 0),
+                    None,
+                ) if side == "buy" else None,
             )
             self._seen.add(order_id)
             self.records.append(record)

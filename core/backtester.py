@@ -44,6 +44,7 @@ from core.news_sentiment import SENTIMENT_FEATURES
 from core.session_clock import SessionClock, SessionConfig, SessionPhase
 from core.risk_manager import (
     ExitFill,
+    PortfolioRisk,
     RiskManager,
     SizingConfig,
     TrailingConfig,
@@ -70,6 +71,10 @@ class BacktestConfig:
     # Intraday session rules (opening lockout, entry cutoff, EOD flatten); None = off.
     session: Optional[SessionConfig] = None
     spread_bps: float = 0.0   # full bid/ask spread; half is paid on every fill
+    # Marketable-limit entries (live default): the limit is this many bps above
+    # the decision price. A next bar that opens above it fills at the limit only
+    # if it trades back below it; otherwise the entry is missed. None = market.
+    entry_limit_bps: Optional[float] = None
 
     @property
     def intraday_rules(self) -> bool:
@@ -206,13 +211,15 @@ class Backtester:
         start: Optional[pd.Timestamp] = None,
         macro_bars: Optional[Dict[str, pd.DataFrame]] = None,
         end: Optional[pd.Timestamp] = None,
+        market_bars: Optional[pd.DataFrame] = None,
     ) -> BacktestResult:
         """Simulate bars in [``start``, ``end``) (default: all). Earlier bars only
         warm up indicators; positions still open at ``end`` are closed there.
 
         ``macro_bars`` are higher-timeframe bars per symbol (daily for intraday
         runs). If the strategy needs them and none are given, they are
-        resampled from the primary bars.
+        resampled from the primary bars. ``market_bars`` is the index (SPY) on
+        the same timeframe, for market-context features and the market filter.
         """
         cfg = self.config
         slip = (cfg.slippage_bps + cfg.spread_bps / 2) / 10_000
@@ -224,7 +231,7 @@ class Backtester:
             macro = (macro_bars or {}).get(symbol)
             if macro is None and self.strategy.uses_macro:
                 macro = macro_from_primary(frame, cfg.timeframe)
-            feats = build_feature_frame(frame, cfg.timeframe, macro_bars=macro)
+            feats = build_feature_frame(frame, cfg.timeframe, macro_bars=macro, market_bars=market_bars)
             sent = (sentiment or {}).get(symbol)
             if sent is None:
                 sent = pd.DataFrame(np.nan, index=feats.index, columns=SENTIMENT_FEATURES)
@@ -338,6 +345,16 @@ class Backtester:
                         order = None
                     if order and symbol not in positions:
                         fill = o * (1 + slip)
+                        if cfg.entry_limit_bps is not None:
+                            limit = order["price"] * (1 + cfg.entry_limit_bps / 10_000)
+                            if fill > limit:
+                                if l < limit:
+                                    fill = limit
+                                else:
+                                    session_blocked["entry_limit_missed"] = (
+                                        session_blocked.get("entry_limit_missed", 0) + 1)
+                                    order = None
+                    if order and symbol not in positions:
                         qty = min(order["quantity"], int(cash // fill))
                         if qty > 0:
                             cash -= fill * qty + cfg.commission_per_share * qty
@@ -442,6 +459,12 @@ class Backtester:
                         session_date=day,
                         last_exit=last_exits.get(symbol),
                         now=ts + cfg.bar_length,
+                        portfolio=PortfolioRisk(
+                            len(positions) + len(pending_entries),
+                            sum(max(0.0, last_close.get(s, p.entry_price) - p.stop) * p.quantity
+                                for s, p in positions.items())
+                            + sum(o["quantity"] * o["stop_distance"] for o in pending_entries.values()),
+                        ),
                     )
                     if decision.approved:
                         pending_entries[symbol] = {

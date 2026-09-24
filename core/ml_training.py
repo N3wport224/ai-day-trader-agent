@@ -24,6 +24,7 @@ import pandas as pd
 from core.feature_pipeline import build_feature_frame, macro_from_primary
 from core.features import INTRADAY_FEATURES, MACRO_FEATURES
 from core.market_history import is_intraday, timeframe_from_length
+from core.market_context import MARKET_FEATURES
 from core.ml_strategy import ARTIFACT_VERSION, FEATURE_COLUMNS
 from core.news_sentiment import SENTIMENT_FEATURES, ScoredArticle, rolling_sentiment
 
@@ -86,6 +87,7 @@ def build_dataset(
     macro_bars: Optional[pd.DataFrame] = None,
     use_macro: bool = False,
     no_overnight: Optional[bool] = None,
+    market_bars: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     """Features + regime + optional macro + sentiment (as of each bar's close) + label for one symbol.
 
@@ -95,7 +97,9 @@ def build_dataset(
     timeframe = timeframe_name(bar_length)
     if use_macro and macro_bars is None:
         macro_bars = macro_from_primary(bars, timeframe)
-    features = build_feature_frame(bars, timeframe, macro_bars=macro_bars if use_macro else None)
+    features = build_feature_frame(
+        bars, timeframe, macro_bars=macro_bars if use_macro else None, market_bars=market_bars
+    )
     if scored_news is None:
         sentiment = pd.DataFrame(np.nan, index=features.index, columns=SENTIMENT_FEATURES)
         sentiment["sentiment_available"] = 0.0
@@ -195,6 +199,7 @@ def train(
     timeframe: str = "1Hour",
     use_macro: bool = False,
     use_intraday: Optional[bool] = None,
+    use_market: bool = False,
 ) -> Dict:
     """Train on all symbols' rows and return a ready-to-save artifact dict.
 
@@ -206,6 +211,7 @@ def train(
         list(FEATURE_COLUMNS)
         + (list(MACRO_FEATURES) if use_macro else [])
         + (list(INTRADAY_FEATURES) if use_intraday else [])
+        + (list(MARKET_FEATURES) if use_market else [])
     )
     data = pd.concat(datasets.values()).sort_index()
     if len(data) < 200:

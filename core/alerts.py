@@ -39,6 +39,8 @@ DEFAULT_EVENTS = (
     "reconciliation",
     "trailing_stop_failed",
     "session_report",
+    "edge_gate",
+    "edge_decay",
     "bot_started",
     "bot_stopped",
     "bot_error",
@@ -89,6 +91,10 @@ def format_alert(event: Dict[str, Any]) -> Optional[str]:
                else "")
             + (" ⚠️ NOT FLAT" if event.get("open_positions") and event.get("no_overnight") else "")
         )
+    if name == "edge_gate":
+        return None if event.get("passed") else f"🚧 Edge gate: live entries blocked: {event.get('reason')}"
+    if name == "edge_decay":
+        return f"📉 Live edge decayed, entries paused: {event.get('reason')}"
     if name == "bot_started":
         return f"▶️ Bot started: {event.get('mode')}, {event.get('timeframe')}, {event.get('symbols')}"
     if name == "bot_stopped":

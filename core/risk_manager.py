@@ -61,6 +61,10 @@ class RiskLimits:
     # with reentry_cooldown_stops_only only stop-outs start the cooldown.
     reentry_cooldown_minutes: float = 30.0
     reentry_cooldown_stops_only: bool = True
+    # Portfolio heat: total $ at risk to the stops across open positions plus
+    # the new entry, as % of equity; and a cap on concurrent positions (0 = off).
+    max_portfolio_heat_pct: float = 4.0
+    max_open_positions: int = 5
 
     @classmethod
     def from_env(cls) -> "RiskLimits":
@@ -80,6 +84,8 @@ class RiskLimits:
             max_intraday_drawdown_pct=_env_float("MAX_INTRADAY_DRAWDOWN_PCT", cls.max_intraday_drawdown_pct),
             reentry_cooldown_minutes=_env_float("REENTRY_COOLDOWN_MINUTES", cls.reentry_cooldown_minutes),
             reentry_cooldown_stops_only=_env_bool("REENTRY_COOLDOWN_STOPS_ONLY", cls.reentry_cooldown_stops_only),
+            max_portfolio_heat_pct=_env_float("MAX_PORTFOLIO_HEAT_PCT", cls.max_portfolio_heat_pct),
+            max_open_positions=_env_int("MAX_OPEN_POSITIONS", cls.max_open_positions),
         )
 
 
@@ -145,6 +151,44 @@ def last_exit_fill(orders: Iterable[Dict[str, Any]], symbol: str) -> Optional[Ex
             kind = str(order.get("type", order.get("order_type", ""))).lower()
             latest = ExitFill(filled_at, kind in _STOP_TYPES, _to_float(order.get("filled_avg_price")))
     return latest
+
+
+@dataclass(frozen=True)
+class PortfolioRisk:
+    """Open exposure across the account, for the heat / position-count caps."""
+
+    open_positions: int = 0
+    open_risk: float = 0.0   # $ lost if every open position hit its stop
+
+
+def portfolio_risk(
+    positions: Iterable[Dict[str, Any]],
+    open_orders: Iterable[Dict[str, Any]],
+    default_stop_pct: float = 3.0,
+) -> PortfolioRisk:
+    """Sum of (price - stop) x qty over long positions, using each position's
+    highest working stop; a position with no stop counts ``default_stop_pct``
+    of its value (it is unprotected, so this is optimistic). A stop above the
+    price (locked-in profit) counts as zero risk."""
+    stops: Dict[str, float] = {}
+    for order in open_orders or []:
+        kind = str(order.get("type", order.get("order_type", ""))).lower()
+        if str(order.get("side", "")).lower() == "sell" and kind in _STOP_TYPES and order.get("stop_price"):
+            symbol = order.get("symbol")
+            stops[symbol] = max(stops.get(symbol, 0.0), _to_float(order.get("stop_price")))
+    count, risk = 0, 0.0
+    for position in positions or []:
+        qty = _to_float(position.get("qty"))
+        if qty <= 0:
+            continue
+        count += 1
+        price = _to_float(position.get("current_price")) or _to_float(position.get("avg_entry_price"))
+        stop = stops.get(position.get("symbol"))
+        if stop:
+            risk += max(0.0, price - stop) * qty
+        else:
+            risk += price * qty * default_stop_pct / 100
+    return PortfolioRisk(count, round(risk, 2))
 
 
 class RiskManager:
@@ -217,6 +261,7 @@ class RiskManager:
         session_date: Optional[date] = None,
         last_exit: Optional["ExitFill"] = None,
         now: Optional[datetime] = None,
+        portfolio: Optional["PortfolioRisk"] = None,
     ) -> RiskDecision:
         limits = self.limits
         side = side.lower()
@@ -307,6 +352,28 @@ class RiskManager:
         reason = "Entry approved"
         if approved_qty < quantity:
             reason = f"Entry approved, reduced from {quantity} to {approved_qty} shares by position/buying-power limits"
+
+        if portfolio is not None:
+            adding = held_value <= 0  # a new symbol, not adding to a holding
+            if adding and limits.max_open_positions > 0 and portfolio.open_positions >= limits.max_open_positions:
+                return RiskDecision(
+                    False, reason=f"Max open positions reached ({portfolio.open_positions}/{limits.max_open_positions})"
+                )
+            if limits.max_portfolio_heat_pct > 0:
+                budget = equity * limits.max_portfolio_heat_pct / 100 - portfolio.open_risk
+                per_share = price - stop_loss
+                heat_qty = int(budget // per_share) if per_share > 0 and budget > 0 else 0
+                if heat_qty <= 0:
+                    return RiskDecision(
+                        False,
+                        reason=(
+                            f"Portfolio heat limit: ${portfolio.open_risk:,.2f} already at risk "
+                            f"(cap {limits.max_portfolio_heat_pct:g}% = ${equity * limits.max_portfolio_heat_pct / 100:,.2f})"
+                        ),
+                    )
+                if heat_qty < approved_qty:
+                    approved_qty = heat_qty
+                    reason = f"Entry approved, reduced from {quantity} to {approved_qty} shares by the portfolio heat cap"
         return RiskDecision(
             True,
             quantity=approved_qty,

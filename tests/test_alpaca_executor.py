@@ -58,7 +58,8 @@ def test_alpaca_executor_uses_paper_v2_endpoint(monkeypatch):
         "symbol": "AAPL",
         "qty": "2",
         "side": "buy",
-        "type": "market",
+        "type": "limit",                 # marketable limit, 10 bps through the price
+        "limit_price": "100.1",
         "time_in_force": "gtc",
         "order_class": "bracket",
         "take_profit": {"limit_price": "110.0"},
@@ -167,7 +168,7 @@ def test_alpaca_executor_prefers_live_quote_and_reports_broker_rejection(monkeyp
     class Rejected:
         text = '{"message":"stop_price must be less than base_price"}'
 
-    def reject(self, symbol, qty, stop, target):
+    def reject(self, symbol, qty, stop, target, **kw):
         placed.update(qty=qty, stop=stop, target=target)
         raise requests.exceptions.HTTPError(response=Rejected())
 

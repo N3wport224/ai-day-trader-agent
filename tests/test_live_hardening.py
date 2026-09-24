@@ -104,7 +104,7 @@ def executor(monkeypatch):
     )
     ex.placed = []
     monkeypatch.setattr(AlpacaExecutor, "_place_bracket_order",
-                        lambda self, symbol, qty, stop, target: self.placed.append(qty) or
+                        lambda self, symbol, qty, stop, target, **kw: self.placed.append(qty) or
                         {"id": f"o{len(self.placed)}", "qty": str(qty), "symbol": symbol})
     return ex
 

@@ -90,6 +90,8 @@ class TradingBot:
         heartbeat_path: Optional[str] = None,
         timeframe: Optional[str] = None,
         fill_tracker: Optional[Any] = None,
+        standing_entry_block: Optional[str] = None,
+        edge_monitor: Optional[Any] = None,
     ) -> None:
         """``broker`` (an AlpacaExecutor) enables the start-of-cycle broker
         snapshot and reconciliation; ``trailing_manager`` raises stops on
@@ -120,6 +122,11 @@ class TradingBot:
         self.broker = broker
         self.trailing_manager = trailing_manager
         self.fill_tracker = fill_tracker
+        # Blocks every new entry for the whole run (e.g. the edge gate failed);
+        # exits, brackets, trailing stops and the EOD flatten still run.
+        self.standing_entry_block = standing_entry_block
+        # core.edge_monitor.EdgeMonitor: pauses entries if live results decay.
+        self.edge_monitor = edge_monitor
         if reconcile_fn is None and broker is not None:
             from core.reconciliation import reconcile as reconcile_fn
         self.reconcile_fn = reconcile_fn
@@ -173,6 +180,10 @@ class TradingBot:
         if phase is SessionPhase.FLATTEN:
             self._flatten(report)
             return report
+        if self.standing_entry_block:
+            report.entry_block = report.entry_block or self.standing_entry_block
+        if self.edge_monitor is not None and self.edge_monitor.paused:
+            report.entry_block = report.entry_block or f"edge decay: {self.edge_monitor.paused}"
         if phase is SessionPhase.OPENING_LOCKOUT:
             report.entry_block = report.entry_block or "opening lockout (opening range still forming)"
         elif phase is SessionPhase.ENTRY_CUTOFF:
@@ -261,6 +272,14 @@ class TradingBot:
 
         self._track_fills(self._market_date())
 
+        if self.execute and hasattr(self.broker, "cancel_stale_entries"):
+            try:
+                expired = self.broker.cancel_stale_entries(snapshot.open_orders)
+                if expired:
+                    logger.info(f"Cancelled {len(expired)} unfilled entry order(s) past their TTL")
+            except Exception as exc:
+                logger.warning(f"Could not cancel stale entry orders: {exc}")
+
         if self.execute and self.trailing_manager is not None:
             report.stop_adjustments = self.trailing_manager.update(snapshot)
             for adj in report.stop_adjustments:
@@ -273,7 +292,10 @@ class TradingBot:
             return
         try:
             orders = self.broker.get_orders_today() if orders is None else orders
-            for fill in self.fill_tracker.update(orders, session_date):
+            fills = self.fill_tracker.update(orders, session_date)
+            if self.edge_monitor is not None and fills:
+                self.edge_monitor.update(fills)
+            for fill in fills:
                 if fill.slippage_bps is not None:
                     logger.info(f"Fill {fill.side} {fill.qty:g} {fill.symbol} @ {fill.fill_price} vs "
                                 f"{fill.reference} {fill.reference_price}: {fill.slippage_bps:+.1f} bps")
@@ -340,6 +362,8 @@ class TradingBot:
         }
         if self.fill_tracker is not None:
             report.session_report["fill_quality"] = self.fill_tracker.summary()
+        if self.edge_monitor is not None:
+            report.session_report["live_edge"] = {**self.edge_monitor.stats(), "paused": self.edge_monitor.paused}
         level = logging.WARNING if (no_overnight and positions) else logging.INFO
         self.telemetry.record("session_report", level, **report.session_report)
 

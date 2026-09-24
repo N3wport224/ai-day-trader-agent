@@ -37,6 +37,7 @@ from dotenv import load_dotenv  # noqa: E402
 
 load_dotenv()
 
+from core.market_context import market_symbol  # noqa: E402
 from core.market_history import bar_length, get_history, is_intraday, normalize_timeframe  # noqa: E402
 from core.ml_strategy import DEFAULT_MODEL_PATH  # noqa: E402
 from core.ml_training import (  # noqa: E402
@@ -73,6 +74,13 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Add higher-timeframe trend features (daily anchor for intraday, weekly for daily)",
     )
+    parser.add_argument(
+        "--market",
+        action="store_true",
+        default=os.getenv("ML_MARKET_FEATURES", "false").strip().lower() in {"1", "true", "yes", "on"},
+        help="Add market-context features: relative strength vs the index (MARKET_SYMBOL, default SPY), "
+             "index trend and VWAP distance",
+    )
     parser.add_argument("--synthetic", action="store_true", help="Use generated bars (offline demo)")
     parser.add_argument("--output", default=os.getenv("ML_MODEL_PATH", DEFAULT_MODEL_PATH))
     args = parser.parse_args(argv)
@@ -92,6 +100,17 @@ def main(argv: list[str] | None = None) -> int:
         logger.info(f"Scoring news with the {scorer.name} sentiment model")
 
     end = datetime.now(timezone.utc)
+    market = None
+    if args.market:
+        if args.synthetic:
+            market = (synthetic_intraday_bars(days=max(args.days // 5, 30), freq=str(bar_len), seed=0)
+                      if is_intraday(args.timeframe) else synthetic_bars(n=max(args.days * 7, 800), seed=0))
+        else:
+            market = get_history(market_symbol(), args.timeframe, args.days, end=end)
+        if market is None or len(market) < 250:
+            logger.error(f"--market needs {market_symbol()} history on {args.timeframe}; got "
+                         f"{0 if market is None else len(market)} bars")
+            return 1
     datasets = {}
     for i, symbol in enumerate(symbols):
         if args.synthetic and is_intraday(args.timeframe):
@@ -118,7 +137,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.mtf and not args.synthetic and args.timeframe != "1Day":
             macro = get_history(symbol, "1Day", args.days + 120, end=end)
         data = build_dataset(
-            bars, params, bar_len, scored, half_life=half_life_from_env(), macro_bars=macro, use_macro=args.mtf
+            bars, params, bar_len, scored, half_life=half_life_from_env(), macro_bars=macro, use_macro=args.mtf,
+            market_bars=market,
         )
         datasets[symbol] = data
         logger.info(f"{symbol}: {len(bars)} bars -> {len(data)} labeled rows, base rate {data['label'].mean():.2%}")
@@ -129,7 +149,8 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         artifact = train(
-            datasets, params, bar_len, threshold=args.threshold, timeframe=args.timeframe, use_macro=args.mtf
+            datasets, params, bar_len, threshold=args.threshold, timeframe=args.timeframe, use_macro=args.mtf,
+            use_market=args.market,
         )
     except ValueError as exc:
         logger.error(str(exc))

@@ -31,6 +31,7 @@ from core.market_history import (
     is_intraday,
     normalize_timeframe,
 )
+from core.market_context import market_symbol
 from core.ml_strategy import MLSignal, MLStrategy
 from core.news_sentiment import SentimentSnapshot, live_sentiment
 from core.portfolio_manager import PortfolioManager
@@ -64,6 +65,7 @@ class MLSignalEngine:
         sizing: Optional[SizingConfig] = None,
         macro_loader: Optional[Callable[[str], pd.DataFrame]] = None,
         now_fn: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+        market_loader: Optional[Callable[[], Optional[pd.DataFrame]]] = None,
     ) -> None:
         self.portfolio_manager = portfolio_manager
         self.strategy = strategy or MLStrategy()
@@ -94,12 +96,14 @@ class MLSignalEngine:
         self.sizing = sizing
         self.macro_loader = macro_loader or self._default_macro_loader
         self.now_fn = now_fn
+        self.market_loader = market_loader or (lambda: self.history_loader(market_symbol()))
         # Intraday only: refuse to signal on bars this many bar-lengths old
         # while the regular session is running (feed outage, delayed fallback).
         self.max_bar_age_bars = _env_float("MAX_BAR_AGE_BARS", 3.0)
         logger.info(
             f"ML signal engine ready: mode={self.strategy.mode}, timeframe={self.timeframe}, "
             f"regime filter={self.strategy.regime_policy}, MTF gate={self.strategy.mtf_confirmation}, "
+            f"market filter={self.strategy.market_filter}, "
             f"sizing={self.sizing.method}"
         )
 
@@ -136,7 +140,13 @@ class MLSignalEngine:
                 macro = self.macro_loader(symbol)
             except Exception as exc:  # missing macro data blocks MTF-gated entries, never crashes
                 logger.warning(f"Macro ({macro_timeframe(self.timeframe)}) bars unavailable for {symbol}: {exc}")
-        features = build_feature_frame(bars, self.timeframe, macro_bars=macro)
+        market = None
+        if self.strategy.uses_market:
+            try:
+                market = self.market_loader()
+            except Exception as exc:  # missing index data blocks market-filtered entries, never crashes
+                logger.warning(f"Market ({market_symbol()}) bars unavailable: {exc}")
+        features = build_feature_frame(bars, self.timeframe, macro_bars=macro, market_bars=market)
         sentiment = self.sentiment_loader(symbol)
         ml = self.strategy.predict(features, sentiment)
         quantity, risk_pct = self._size(ml, symbol, portfolio_name, user_id, features.iloc[-1])

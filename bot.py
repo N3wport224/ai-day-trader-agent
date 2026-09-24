@@ -50,6 +50,20 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _edge_gate(bot, strategy_name: str, timeframe: str, log) -> tuple:
+    """(block reason or None, warnings) for opening live positions."""
+    if os.getenv("EDGE_GATE", "true").strip().lower() not in {"1", "true", "yes", "on"}:
+        log.warning("EDGE_GATE=false: trading WITHOUT a validated out-of-sample edge")
+        return None, []
+    from core.edge_gate import check_live_setup, strategy_fingerprint
+
+    engine = getattr(bot.workflow, "analysis_runner", None)
+    strategy = getattr(engine, "strategy", None)
+    if strategy_name != "ml" or strategy is None:
+        return "the classic strategy has no walk-forward validation; use --strategy ml", []
+    return check_live_setup(strategy_fingerprint(strategy, engine.timeframe), bot.symbols)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="AI Day Trader scheduled bot")
     parser.add_argument(
@@ -89,6 +103,8 @@ def main(argv: list[str] | None = None) -> int:
         help="Submit risk-checked bracket orders to Alpaca paper trading",
     )
     parser.add_argument("--once", action="store_true", help="Run one cycle and exit")
+    parser.add_argument("--reset-edge-monitor", action="store_true",
+                        help="Clear an edge-decay pause (after you've reviewed it) and start a fresh live window")
     parser.add_argument(
         "--strategy",
         choices=STRATEGIES,
@@ -136,7 +152,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     session_clock = SessionClock(session)
-    market_clock = broker = trailing = fills = None
+    market_clock = broker = trailing = fills = edge_monitor = None
     if args.execute or os.getenv("ALPACA_API_KEY"):
         from core.alpaca_executor_provider import get_alpaca_executor
         from core.trailing_stops import TrailingStopManager
@@ -152,7 +168,16 @@ def main(argv: list[str] | None = None) -> int:
         if args.execute:
             from core.fill_quality import FillTracker
 
+            from core.edge_monitor import EdgeMonitor
+
             fills = FillTracker(broker.expected_prices)
+            edge_monitor = EdgeMonitor.from_edge_report()
+            if args.reset_edge_monitor:
+                edge_monitor.reset()
+                log.warning("Edge monitor reset: live performance window cleared")
+            elif edge_monitor.paused:
+                log.error(f"Edge monitor is PAUSED from a previous run: {edge_monitor.paused}. New entries stay "
+                          "blocked; review, then restart with --reset-edge-monitor.")
 
     log.info(
         f"Timeframe {timeframe}, scan every {interval} min; "
@@ -173,10 +198,23 @@ def main(argv: list[str] | None = None) -> int:
             session_clock=session_clock,
             timeframe=timeframe,
             fill_tracker=fills,
+            edge_monitor=edge_monitor,
         )
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 1
+
+    if args.execute:
+        block, warnings = _edge_gate(bot, args.strategy, timeframe, log)
+        for warning in warnings:
+            log.warning(f"Edge gate: {warning}")
+        if block:
+            bot.standing_entry_block = f"edge gate: {block}"
+            log.error(f"EDGE GATE: new entries are BLOCKED for this run: {block}. Exits, stops and the EOD "
+                      "flatten still run. See core/edge_gate.py (EDGE_GATE=false overrides at your own risk).")
+            bot.telemetry.record("edge_gate", logging.WARNING, passed=False, reason=block)
+        elif os.getenv("EDGE_GATE", "true").strip().lower() in {"1", "true", "yes", "on"}:
+            log.info("Edge gate: passed (validated walk-forward report matches this setup)")
 
     def request_stop(signum, frame):
         if bot.stopped:  # second signal: stop waiting

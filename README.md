@@ -363,6 +363,72 @@ KillSignal=SIGTERM
 TimeoutStopSec=120
 ```
 
+#### Tactics for a better chance of profit (and fewer ways to lose)
+
+No setting makes a trading bot profitable, and most automated intraday
+strategies lose money after costs. These tactics are about only trading
+when there's evidence of an edge, cutting costs, and limiting the damage
+when there isn't one.
+
+1. **Edge gate: prove it before trading it** (`core/edge_gate.py`). With
+   `--execute`, the bot opens **no new positions** unless a walk-forward
+   backtest of exactly this setup passed on real data within the last 30
+   days. "Exactly this setup" means the same timeframe, ATR stop/target,
+   feature set, threshold and entry gates. The minimums: ≥100 trades, ≥3
+   folds, profit factor ≥1.2, avg R ≥0.05, ≥60% of folds positive and
+   drawdown ≤15%. They're configurable with `EDGE_*`. Exits, stops and the
+   EOD flatten always run. `EDGE_GATE=false` overrides it, at your own risk.
+   ```bash
+   python scripts/backtest.py --timeframe 5m --days 120 --folds 4 --market --promote
+   python scripts/train_model.py --timeframe 5m --days 120 --market   # same flags as the promoted run
+   python bot.py --timeframe 5m --execute
+   ```
+   Don't try dozens of settings until one passes. The winner of many tries is
+   usually luck, so keep the variants you test few.
+2. **Edge-decay monitor** (`core/edge_monitor.py`). Live fills are paired
+   into round trips and measured in R. Over the last 30 trades (evaluated
+   from 20 on), entries pause if the live profit factor falls below 0.8, or
+   if the live mean R is statistically below the backtest's (t < −2). The
+   pause persists across restarts until you review it and run
+   `bot.py --reset-edge-monitor`.
+3. **Market context** (`core/market_context.py`).
+   - `--market` trains with relative strength vs SPY over 12 and 48 bars,
+     plus SPY's trend and VWAP distance.
+   - `--market-filter` (`MARKET_FILTER=true`) pauses longs while SPY is below
+     both its EMA50 and its session VWAP. Longs in a falling tape start with
+     a headwind.
+   - Test both with `--compare` before relying on them.
+4. **Lower execution costs**.
+   - Entries are marketable limits 10 bps through the ask
+     (`ENTRY_ORDER_TYPE`, `ENTRY_LIMIT_OFFSET_BPS`). They cap what a gap or a
+     thin book can cost, and the backtester simulates the missed fills.
+   - Entries are skipped when the bid/ask spread is wider than 20 bps
+     (`MAX_SPREAD_BPS`).
+   - Unfilled entries are cancelled after 120 s (`ENTRY_ORDER_TTL_SECONDS`).
+   - Slippage is measured on every fill, so you can check the backtest's
+     cost assumptions (see Running unattended).
+   - With the free IEX feed, quotes are IEX-only and often wider than the
+     national best bid/offer; `ALPACA_DATA_FEED=sip` is better if your plan
+     includes it.
+5. **Portfolio heat and position caps**. Total risk to the stops across all
+   open positions is capped at 4% of equity (`MAX_PORTFOLIO_HEAT_PCT`), and
+   at most 5 positions can be open at once (`MAX_OPEN_POSITIONS`). This
+   matters because correlated positions all stop out together on a market
+   drop. Both apply live and in backtests (`--max-heat-pct`,
+   `--max-open-positions`).
+6. **Already in place**: regime filter, daily-trend confirmation,
+   volatility/Kelly sizing, trailing stops, the re-entry cooldown after
+   stop-outs, the intraday drawdown breaker, the PDT gate and no overnight
+   risk in day-trading mode.
+
+A reasonable path to live trading:
+1. Run a walk-forward with `--compare` on 6–12 months of data for 5–10
+   liquid symbols.
+2. Promote only a setup that passes.
+3. Paper trade it for several weeks.
+4. Compare live R and slippage with the backtest.
+5. Only then consider real money, starting small.
+
 #### Backtesting
 
 `scripts/backtest.py` replays the whole path on history using the live code:
