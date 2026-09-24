@@ -261,6 +261,54 @@ Use `--strategy classic` to run the original rule-based pipeline.
   when there is a safe fix (smaller size, fresh-quote levels, cancel legs
   before an exit).
 
+#### Intraday day-trading mode (1m / 5m bars)
+
+`python bot.py` now defaults to 5-minute bars in day-trading mode:
+
+```bash
+python bot.py --timeframe 5m --no-overnight --opening-lockout-minutes 15            # dry run
+python bot.py --timeframe 5m --execute                                              # paper orders
+python bot.py --timeframe 1h --overnight                                            # swing mode
+```
+
+- **Session clock** (`core/session_clock.py`, US/Eastern): opening lockout
+  9:30-9:45 (no entries while the opening range forms), entries allowed until
+  the cutoff 15 min before the close, then from 10 min before the close the
+  bot cancels every working order (bracket legs included) and closes every
+  position (`FLATTEN_ORDER_TYPE=market` or a marketable limit). Cutoff and
+  flatten are relative to the actual close from Alpaca's clock, so 13:00
+  half-days work. The bot wakes up exactly at flatten time; if a close fails
+  it retries every cycle until the market closes. The executor enforces the
+  same entry windows, so manual orders can't bypass them.
+- **Intraday features** (`features.add_intraday_features`): session VWAP
+  anchored at 9:30 with 1/2-sigma bands, VWAP distance and z-score, relative
+  volume vs the same time-of-day bucket over prior sessions, 15-minute
+  opening-range high/low (hidden until the range has formed) and minutes
+  since the open. All causal and tested for lookahead on 1m and 5m bars.
+  Models trained with `--timeframe 5m` use them automatically, and their
+  labels end at the session close (a day trader is flat overnight).
+  A model trained on a different bar size is ignored with an error.
+- **PDT gate**: in day-trading mode, with equity under $25,000, entries are
+  rejected when the account is flagged as a pattern day trader or already
+  has 3 day trades in the last 5 business days (`PDT_DAYTRADE_BUFFER` stops
+  earlier). Exits are never blocked by it (Alpaca's own PDT protection may
+  still reject a same-day close for a flagged account; the flatten failure
+  is logged and retried).
+- **Intraday drawdown breaker**: once equity is down
+  `MAX_INTRADAY_DRAWDOWN_PCT` (2%) from the start of the day (realized +
+  unrealized), new entries stop for the rest of the session even if equity
+  recovers. It is checked every cycle, not only when a buy is attempted.
+- **Data**: 1Min and 5Min bars from Alpaca (paginated) with Yahoo fallback
+  (Yahoo keeps ~7 days of 1m and ~60 days of 5m history). Default lookback is
+  30 days for 1m and 45 for 5m so EMA200 and RVOL are warmed up.
+
+Backtest the intraday rules (opening lockout, cutoff, 15:50 forced close,
+2 bps spread on top of slippage, simulated PDT day-trade count):
+
+```bash
+python scripts/backtest.py --timeframe 5m --days 60 --no-overnight --opening-lockout-minutes 15 --compare
+```
+
 #### Backtesting
 
 `scripts/backtest.py` replays the whole path on history using the live code:

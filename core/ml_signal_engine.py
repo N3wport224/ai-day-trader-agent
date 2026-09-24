@@ -22,7 +22,7 @@ from typing import Any, Callable, Dict, Optional
 import pandas as pd
 
 from core.feature_pipeline import build_feature_frame, macro_from_primary, macro_timeframe
-from core.market_history import get_history
+from core.market_history import DEFAULT_LOOKBACK_DAYS, get_history, normalize_timeframe
 from core.ml_strategy import MLSignal, MLStrategy
 from core.news_sentiment import SentimentSnapshot, live_sentiment
 from core.portfolio_manager import PortfolioManager
@@ -58,8 +58,17 @@ class MLSignalEngine:
     ) -> None:
         self.portfolio_manager = portfolio_manager
         self.strategy = strategy or MLStrategy()
-        self.timeframe = timeframe or (self.strategy.artifact or {}).get("timeframe") or os.getenv("ML_TIMEFRAME", "1Hour")
-        self.lookback_days = lookback_days or int(os.getenv("ML_LOOKBACK_DAYS", "60"))
+        model_timeframe = (self.strategy.artifact or {}).get("timeframe")
+        self.timeframe = normalize_timeframe(timeframe or model_timeframe or os.getenv("ML_TIMEFRAME", "1Hour"))
+        if model_timeframe and normalize_timeframe(model_timeframe) != self.timeframe:
+            # A model trained on hourly bars says nothing about 5-minute bars.
+            logger.error(
+                f"Model was trained on {model_timeframe} bars but the bot runs on {self.timeframe}; "
+                f"ignoring the model (heuristic mode). Retrain with --timeframe {self.timeframe}."
+            )
+            self.strategy = self.strategy.without_model()
+        env_lookback = os.getenv("ML_LOOKBACK_DAYS")
+        self.lookback_days = lookback_days or (int(env_lookback) if env_lookback else DEFAULT_LOOKBACK_DAYS[self.timeframe])
         self.history_loader = history_loader or (
             lambda symbol: get_history(symbol, self.timeframe, self.lookback_days)
         )

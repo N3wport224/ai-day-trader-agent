@@ -21,6 +21,10 @@ Examples:
   # Before/after benchmark of the regime filter, daily-trend confirmation,
   # volatility-scaled Kelly sizing and trailing stops on identical data:
   python scripts/backtest.py --regime suppress --mtf --mtf-gate --sizing kelly --trailing --compare
+
+  # Intraday day trading on 5-minute bars: 15-min opening lockout, no entries
+  # after 15:45 ET, forced flatten at 15:50 ET, 2 bps spread + 5 bps slippage
+  python scripts/backtest.py --timeframe 5m --days 60 --no-overnight --opening-lockout-minutes 15
 """
 
 from __future__ import annotations
@@ -45,11 +49,16 @@ import pandas as pd  # noqa: E402
 from core.backtester import Backtester, BacktestConfig, format_report  # noqa: E402
 from core.market_history import bar_length, get_history  # noqa: E402
 from core.ml_strategy import DEFAULT_MODEL_PATH, REGIME_POLICIES, MLStrategy, load_artifact  # noqa: E402
+from dataclasses import replace  # noqa: E402
+
+from core.market_history import is_intraday, normalize_timeframe  # noqa: E402
+from core.session_clock import SessionConfig  # noqa: E402
 from core.ml_training import (  # noqa: E402
     LabelParams,
     build_dataset,
     calibration_table,
     synthetic_bars,
+    synthetic_intraday_bars,
     threshold_table,
     train,
 )
@@ -68,11 +77,12 @@ logger = logging.getLogger("backtest")
 def _load_bars(args, symbols, end):
     bars = {}
     for i, symbol in enumerate(symbols):
-        frame = (
-            synthetic_bars(n=max(args.days * 7, 1000), seed=i + 1)
-            if args.synthetic
-            else get_history(symbol, args.timeframe, args.days, end=end)
-        )
+        if args.synthetic and is_intraday(args.timeframe):
+            frame = synthetic_intraday_bars(days=args.days, freq=str(bar_length(args.timeframe)), seed=i + 1)
+        elif args.synthetic:
+            frame = synthetic_bars(n=max(args.days * 7, 1000), seed=i + 1)
+        else:
+            frame = get_history(symbol, args.timeframe, args.days, end=end)
         if len(frame) < 300:
             logger.warning(f"{symbol}: only {len(frame)} bars, skipping")
             continue
@@ -197,8 +207,11 @@ def _run_variant(args, variant, bars, macro, sentiment, scored, bar_len):
         sizing_method=variant["sizing"],
         kelly_fraction=args.kelly_fraction,
         trailing=variant["trailing"],
+        session=args.session,
+        spread_bps=args.spread_bps,
     )
-    result = Backtester(strategy, RiskManager(RiskLimits.from_env()), config).run(
+    limits = replace(RiskLimits.from_env(), day_trading=bool(args.session and args.session.no_overnight))
+    result = Backtester(strategy, RiskManager(limits), config).run(
         bars, sentiment, start=start, macro_bars=macro
     )
     return result, audit
@@ -270,7 +283,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--symbols", default=os.getenv("WATCHLIST", "AAPL,MSFT,NVDA,AMD,SPY"))
     parser.add_argument("--mode", choices=["walkforward", "model", "heuristic"], default="walkforward")
     parser.add_argument("--model", default=os.getenv("ML_MODEL_PATH", DEFAULT_MODEL_PATH))
-    parser.add_argument("--timeframe", default=os.getenv("ML_TIMEFRAME", "1Hour"), choices=["15Min", "1Hour", "1Day"])
+    parser.add_argument("--timeframe", default=os.getenv("ML_TIMEFRAME", "1Hour"),
+                        help="1m, 5m, 15m, 1h (default) or 1d")
     parser.add_argument("--days", type=int, default=730)
     parser.add_argument("--train-fraction", type=float, default=0.6, help="walkforward: share of history used to train")
     parser.add_argument("--horizon", type=int, default=12, help="walkforward: label horizon in bars")
@@ -303,12 +317,38 @@ def main(argv: list[str] | None = None) -> int:
     sizing.add_argument("--trail-trigger-r", type=float, default=float(os.getenv("TRAILING_STOP_TRIGGER_R", "1.5")))
     sizing.add_argument("--trail-lock-r", type=float, default=float(os.getenv("TRAILING_STOP_LOCK_R", "0")))
     sizing.add_argument("--trail-distance-r", type=float, default=float(os.getenv("TRAILING_STOP_DISTANCE_R", "1.5")))
+    intraday = parser.add_argument_group("intraday session rules (1m/5m/15m)")
+    intraday.add_argument("--overnight", action=argparse.BooleanOptionalAction, default=None,
+                          help="--no-overnight (default for intraday) flattens every position before the close")
+    intraday.add_argument("--opening-lockout-minutes", type=int,
+                          default=int(os.getenv("OPENING_LOCKOUT_MINUTES", "15")))
+    intraday.add_argument("--entry-cutoff-minutes", type=int,
+                          default=int(os.getenv("ENTRY_CUTOFF_MINUTES_BEFORE_CLOSE", "15")))
+    intraday.add_argument("--flatten-minutes", type=int,
+                          default=int(os.getenv("FLATTEN_MINUTES_BEFORE_CLOSE", "10")))
+    intraday.add_argument("--spread-bps", type=float, default=None,
+                          help="Full bid/ask spread cost in bps, half paid per fill (default 2 intraday, 0 otherwise)")
     parser.add_argument("--compare", action="store_true",
                         help="Also run a baseline (all new layers off) on the same data and print both")
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
     os.environ["ADX_TREND_THRESHOLD"] = str(args.adx_threshold)
+    try:
+        args.timeframe = normalize_timeframe(args.timeframe)
+    except ValueError as exc:
+        logger.error(str(exc))
+        return 1
+    intraday_run = is_intraday(args.timeframe)
+    no_overnight = (not args.overnight) if args.overnight is not None else intraday_run
+    args.session = SessionConfig(
+        opening_lockout_minutes=args.opening_lockout_minutes,
+        entry_cutoff_minutes=args.entry_cutoff_minutes,
+        flatten_minutes=args.flatten_minutes,
+        no_overnight=no_overnight,
+    ) if intraday_run else None
+    if args.spread_bps is None:
+        args.spread_bps = 2.0 if intraday_run else 0.0
     symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
     bar_len = bar_length(args.timeframe)
     end = datetime.now(timezone.utc)

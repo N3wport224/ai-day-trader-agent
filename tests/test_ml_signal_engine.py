@@ -217,3 +217,20 @@ def test_engine_blocks_mtf_entries_when_daily_bars_unavailable(portfolio_manager
 
     assert analysis["recommendation"] == "HOLD"
     assert analysis["all_signals"]["ml"]["gated_by"] == "mtf"
+
+
+def test_engine_ignores_model_trained_on_a_different_timeframe(portfolio_manager: PortfolioManager, caplog) -> None:
+    strategy = MLStrategy(
+        {"pipeline": FixedModel(0.9), "label_params": {}, "timeframe": "1Hour"},
+        confidence_threshold=0.6, regime_policy="off",
+    )
+
+    engine = MLSignalEngine(portfolio_manager, strategy=strategy, timeframe="5m",
+                            history_loader=lambda s: synthetic_bars(300, seed=4),
+                            sentiment_loader=lambda s: UNAVAILABLE)
+
+    assert engine.timeframe == "5Min"
+    assert engine.strategy.mode == "heuristic"
+    assert strategy.mode == "model"  # the caller's strategy object is untouched
+    assert "trained on 1Hour bars" in caplog.text
+    assert engine.lookback_days == 45  # 5-minute default history

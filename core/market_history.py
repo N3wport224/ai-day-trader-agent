@@ -26,17 +26,49 @@ logger = logging.getLogger(__name__)
 
 TIMEFRAMES = {
     # name: (bar length, Yahoo interval, Yahoo max history in days)
+    "1Min": (timedelta(minutes=1), "1m", 7),
+    "5Min": (timedelta(minutes=5), "5m", 59),
     "15Min": (timedelta(minutes=15), "15m", 59),
     "1Hour": (timedelta(hours=1), "1h", 729),
     "1Day": (timedelta(days=1), "1d", 3650),
 }
+TIMEFRAME_ALIASES = {
+    "1m": "1Min", "1min": "1Min",
+    "5m": "5Min", "5min": "5Min",
+    "15m": "15Min", "15min": "15Min",
+    "1h": "1Hour", "60m": "1Hour", "1hour": "1Hour",
+    "1d": "1Day", "1day": "1Day", "d": "1Day",
+}
+INTRADAY_TIMEFRAMES = ("1Min", "5Min", "15Min")
+# History needed per timeframe: EMA200 warm-up plus ~20 sessions for relative volume.
+DEFAULT_LOOKBACK_DAYS = {"1Min": 30, "5Min": 45, "15Min": 60, "1Hour": 60, "1Day": 400}
+
+
+def normalize_timeframe(timeframe: str) -> str:
+    """Accept "5m", "5Min", "1h", "1Hour", ... and return the canonical name."""
+    if timeframe in TIMEFRAMES:
+        return timeframe
+    canonical = TIMEFRAME_ALIASES.get(str(timeframe).strip().lower())
+    if canonical is None:
+        raise ValueError(
+            f"Unsupported timeframe {timeframe!r}; use one of {list(TIMEFRAMES)} or {list(TIMEFRAME_ALIASES)}"
+        )
+    return canonical
+
+
+def is_intraday(timeframe: str) -> bool:
+    return normalize_timeframe(timeframe) in INTRADAY_TIMEFRAMES
 
 
 def bar_length(timeframe: str) -> timedelta:
-    try:
-        return TIMEFRAMES[timeframe][0]
-    except KeyError as exc:
-        raise ValueError(f"Unsupported timeframe {timeframe!r}; use one of {list(TIMEFRAMES)}") from exc
+    return TIMEFRAMES[normalize_timeframe(timeframe)][0]
+
+
+def timeframe_from_length(length: timedelta) -> str:
+    for name, (bar_len, _, _) in TIMEFRAMES.items():
+        if bar_len == length:
+            return name
+    raise ValueError(f"Unsupported bar length {length}")
 
 
 def drop_incomplete_bar(bars: pd.DataFrame, timeframe: str, now: Optional[datetime] = None) -> pd.DataFrame:
@@ -99,7 +131,7 @@ def fetch_alpaca_bars(
 def fetch_yahoo_bars(symbol: str, timeframe: str, start: datetime, end: datetime) -> pd.DataFrame:
     import yfinance as yf
 
-    _, interval, max_days = TIMEFRAMES[timeframe]
+    _, interval, max_days = TIMEFRAMES[normalize_timeframe(timeframe)]
     start = max(start, end - timedelta(days=max_days))
     hist = yf.Ticker(symbol).history(start=start, end=end, interval=interval, auto_adjust=True)
     if hist.empty:
@@ -118,7 +150,7 @@ def get_history(
     include_incomplete: bool = False,
 ) -> pd.DataFrame:
     """Oldest-first OHLCV bars, completed candles only unless asked otherwise."""
-    bar_length(timeframe)  # validate early
+    timeframe = normalize_timeframe(timeframe)
     end = end or datetime.now(timezone.utc)
     start = end - timedelta(days=lookback_days)
 

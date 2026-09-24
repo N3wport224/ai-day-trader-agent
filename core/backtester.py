@@ -38,8 +38,10 @@ import numpy as np
 import pandas as pd
 
 from core.feature_pipeline import build_feature_frame, macro_from_primary
+from core.market_history import timeframe_from_length
 from core.ml_strategy import MLStrategy, _snapshot_from_row
 from core.news_sentiment import SENTIMENT_FEATURES
+from core.session_clock import SessionClock, SessionConfig, SessionPhase
 from core.risk_manager import (
     RiskManager,
     SizingConfig,
@@ -64,6 +66,13 @@ class BacktestConfig:
     sizing_method: str = "fixed"
     kelly_fraction: float = 0.25
     trailing: TrailingConfig = field(default_factory=lambda: TrailingConfig(enabled=False))
+    # Intraday session rules (opening lockout, entry cutoff, EOD flatten); None = off.
+    session: Optional[SessionConfig] = None
+    spread_bps: float = 0.0   # full bid/ask spread; half is paid on every fill
+
+    @property
+    def intraday_rules(self) -> bool:
+        return self.session is not None and self.bar_length < timedelta(days=1)
 
     @property
     def sizing(self) -> SizingConfig:
@@ -73,11 +82,7 @@ class BacktestConfig:
 
     @property
     def timeframe(self) -> str:
-        names = {timedelta(minutes=15): "15Min", timedelta(hours=1): "1Hour", timedelta(days=1): "1Day"}
-        try:
-            return names[self.bar_length]
-        except KeyError as exc:
-            raise ValueError(f"Unsupported bar length {self.bar_length}") from exc
+        return timeframe_from_length(self.bar_length)
 
 
 @dataclass
@@ -124,6 +129,7 @@ class BacktestResult:
     metrics: Dict[str, float] = field(default_factory=dict)
     gated: Dict[str, int] = field(default_factory=dict)
     regime_mix: Dict[str, int] = field(default_factory=dict)
+    session_blocked: Dict[str, int] = field(default_factory=dict)
 
     def trades_frame(self) -> pd.DataFrame:
         return pd.DataFrame(
@@ -199,7 +205,7 @@ class Backtester:
         resampled from the primary bars.
         """
         cfg = self.config
-        slip = cfg.slippage_bps / 10_000
+        slip = (cfg.slippage_bps + cfg.spread_bps / 2) / 10_000
         sizing = cfg.sizing
         calibrated = self.strategy.mode == "model"
 
@@ -222,6 +228,30 @@ class Backtester:
             prepared[symbol] = feats
 
         timeline = sorted(set().union(*(f.index for f in prepared.values())))
+
+        # Intraday session rules. Each day's actual close is taken from its last
+        # regular bar, so early-close (13:00) days flatten on time too.
+        clock = SessionClock(cfg.session) if cfg.intraday_rules else None
+        no_overnight = bool(clock and cfg.session.no_overnight)
+        closes_by_day: Dict[object, pd.Timestamp] = {}
+        last_bar_of_day: Dict[str, set] = {}
+        if clock is not None:
+            for symbol, feats in prepared.items():
+                regular_idx = [t for t in feats.index if _is_regular_bar(t, cfg)]
+                by_day: Dict[object, pd.Timestamp] = {}
+                for t in regular_idx:
+                    by_day[_day_key(t)] = t
+                last_bar_of_day[symbol] = set(by_day.values())
+                for d, t in by_day.items():
+                    end = min(t + cfg.bar_length, pd.Timestamp(f"{d} 16:00", tz="America/New_York"))
+                    closes_by_day[d] = max(closes_by_day.get(d, end), end)
+
+        def phase_at(t: pd.Timestamp) -> SessionPhase:
+            return clock.phase(t, closes_by_day.get(_day_key(t)))
+
+        session_blocked: Dict[str, int] = {}
+        day_trade_days: List[object] = []
+        session_days: List[object] = []
         cash = cfg.initial_capital
         positions: Dict[str, Trade] = {}
         pending_entries: Dict[str, dict] = {}
@@ -246,6 +276,8 @@ class Backtester:
         def close_position(symbol: str, ts, price: float, reason: str, slipped: bool) -> None:
             nonlocal cash
             trade = positions.pop(symbol)
+            if _day_key(trade.entry_time) == _day_key(ts):
+                day_trade_days.append(_day_key(ts))  # same-day round trip (PDT)
             fill = price * (1 - slip) if slipped else price
             trade.exit_time, trade.exit_price, trade.exit_reason = ts, fill, reason
             trade.costs += cfg.commission_per_share * trade.quantity
@@ -258,6 +290,11 @@ class Backtester:
                 if current_day is not None:
                     prev_day_equity = day_equity
                 current_day = day
+                session_days.append(day)
+            # Drawdown breaker sees every bar, not just entry attempts.
+            self.risk_manager.update_breaker(
+                {"equity": equity(), "last_equity": prev_day_equity or cfg.initial_capital}, day
+            )
 
             for symbol, feats in prepared.items():
                 if ts not in feats.index:
@@ -267,12 +304,23 @@ class Backtester:
                 regular = _is_regular_bar(ts, cfg)
 
                 if regular:
+                    flatten_now = no_overnight and phase_at(ts) is SessionPhase.FLATTEN
+                    # 0. EOD flatten: the first bar opening in the FLATTEN window
+                    #    closes every position at its open.
+                    if flatten_now and symbol in positions:
+                        close_position(symbol, ts, o, "eod_flatten", slipped=True)
+
                     # 1. Fills queued at the previous decision.
                     if symbol in pending_exits and symbol in positions:
                         close_position(symbol, ts, o, "signal_exit", slipped=True)
                     pending_exits.discard(symbol)
 
                     order = pending_entries.pop(symbol, None)
+                    if order and clock is not None and (order["day"] != day or phase_at(ts) is not SessionPhase.OPEN
+                                                        and phase_at(ts) is not SessionPhase.ENTRY_CUTOFF):
+                        # Live orders fill within the session they were sent in.
+                        session_blocked["expired_entry"] = session_blocked.get("expired_entry", 0) + 1
+                        order = None
                     if order and symbol not in positions:
                         fill = o * (1 + slip)
                         qty = min(order["quantity"], int(cash // fill))
@@ -314,6 +362,11 @@ class Backtester:
                             config=cfg.trailing,
                         )
 
+                    # 3b. No bar opens inside the FLATTEN window today (coarse bars
+                    #     or an early close): flatten at the last regular bar's close.
+                    if no_overnight and symbol in positions and ts in last_bar_of_day.get(symbol, ()):
+                        close_position(symbol, ts, c, "eod_flatten", slipped=True)
+
                 last_close[symbol] = c
 
                 # 4. Decide at this bar's close.
@@ -325,6 +378,11 @@ class Backtester:
                         skipped_outside_session += 1
                     continue
                 signal = self.strategy.decide(float(row["p_up"]), row, _snapshot_from_row(row))
+                if clock is not None and signal.signal == "BUY":
+                    phase = phase_at(ts + cfg.bar_length)
+                    if phase is not SessionPhase.OPEN:
+                        session_blocked[phase.value] = session_blocked.get(phase.value, 0) + 1
+                        continue
                 signals[signal.signal] += 1
                 regime_mix[signal.regime or "n/a"] = regime_mix.get(signal.regime or "n/a", 0) + 1
                 if signal.gated_by:
@@ -358,11 +416,14 @@ class Backtester:
                             "equity": eq,
                             "last_equity": prev_day_equity or cfg.initial_capital,
                             "buying_power": max(0.0, cash - reserved),
+                            "pattern_day_trader": False,
+                            "daytrade_count": sum(1 for d in day_trade_days if d in set(session_days[-5:])),
                         },
                         position=None,
                         orders_today=[{"side": "buy"}] * entries_by_day.get(day, 0),
                         stop_loss=signal.stop_loss,
                         take_profit=signal.take_profit,
+                        session_date=day,
                     )
                     if decision.approved:
                         pending_entries[symbol] = {
@@ -371,6 +432,7 @@ class Backtester:
                             "target_distance": signal.target_distance,
                             "p_up": signal.probability_up,
                             "price": c,
+                            "day": day,
                         }
                         entries_by_day[day] = entries_by_day.get(day, 0) + 1
                     else:
@@ -400,6 +462,7 @@ class Backtester:
         )
         result.gated = gated
         result.regime_mix = regime_mix
+        result.session_blocked = session_blocked
         result.metrics = compute_metrics(result)
         result.metrics["exposure_pct"] = round(bars_in_market / len(timeline) * 100, 1) if timeline else 0.0
         return result
@@ -462,6 +525,16 @@ def format_report(result: BacktestResult, title: str = "Backtest") -> str:
         if cfg.trailing.enabled else "off"
     )
     lines.append(f"Sizing: {cfg.sizing_method} ({cfg.risk_per_trade_pct}% base risk); trailing stops: {trailing}")
+    if cfg.intraday_rules:
+        sess = cfg.session
+        lines.append(
+            f"Session: lockout {sess.opening_lockout_minutes} min, entry cutoff {sess.entry_cutoff_minutes} min "
+            f"and flatten {sess.flatten_minutes} min before close, "
+            f"{'no overnight' if sess.no_overnight else 'overnight allowed'}; "
+            f"costs {cfg.slippage_bps} bps slippage + {cfg.spread_bps} bps spread"
+        )
+        if result.session_blocked:
+            lines.append(f"Entries blocked by session rules: {result.session_blocked}")
     exits: Dict[str, int] = {}
     for t in result.trades:
         exits[t.exit_reason] = exits.get(t.exit_reason, 0) + 1

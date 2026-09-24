@@ -37,9 +37,15 @@ from dotenv import load_dotenv  # noqa: E402
 
 load_dotenv()
 
-from core.market_history import bar_length, get_history  # noqa: E402
+from core.market_history import bar_length, get_history, is_intraday, normalize_timeframe  # noqa: E402
 from core.ml_strategy import DEFAULT_MODEL_PATH  # noqa: E402
-from core.ml_training import LabelParams, build_dataset, synthetic_bars, train  # noqa: E402
+from core.ml_training import (  # noqa: E402
+    LabelParams,
+    build_dataset,
+    synthetic_bars,
+    synthetic_intraday_bars,
+    train,
+)
 from core.news_sentiment import (  # noqa: E402
     AlpacaNewsClient,
     get_scorer,
@@ -53,7 +59,9 @@ logger = logging.getLogger("train_model")
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--symbols", default=os.getenv("WATCHLIST", "AAPL,MSFT,NVDA,AMD,SPY"))
-    parser.add_argument("--timeframe", default=os.getenv("ML_TIMEFRAME", "1Hour"), choices=["15Min", "1Hour", "1Day"])
+    parser.add_argument("--timeframe", default=os.getenv("ML_TIMEFRAME", "1Hour"),
+                        help="1m, 5m, 15m, 1h (default) or 1d; intraday timeframes add VWAP/RVOL/ORB "
+                             "features and end labels at the session close")
     parser.add_argument("--days", type=int, default=365, help="Days of history per symbol")
     parser.add_argument("--horizon", type=int, default=12, help="Bars to wait for target/stop")
     parser.add_argument("--stop-atr", type=float, default=float(os.getenv("ATR_STOP_MULT", "1.5")))
@@ -70,6 +78,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    args.timeframe = normalize_timeframe(args.timeframe)
     params = LabelParams(horizon=args.horizon, stop_atr_mult=args.stop_atr, target_atr_mult=args.target_atr)
     bar_len = bar_length(args.timeframe)
     symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
@@ -85,7 +94,9 @@ def main(argv: list[str] | None = None) -> int:
     end = datetime.now(timezone.utc)
     datasets = {}
     for i, symbol in enumerate(symbols):
-        if args.synthetic:
+        if args.synthetic and is_intraday(args.timeframe):
+            bars = synthetic_intraday_bars(days=max(args.days // 5, 30), freq=str(bar_length(args.timeframe)), seed=i + 1)
+        elif args.synthetic:
             bars = synthetic_bars(n=max(args.days * 7, 800), seed=i + 1)
         else:
             bars = get_history(symbol, args.timeframe, args.days, end=end)

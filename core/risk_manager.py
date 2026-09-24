@@ -12,7 +12,11 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from datetime import date, datetime
 from typing import Any, Dict, Iterable, Optional
+from zoneinfo import ZoneInfo
+
+MARKET_TZ = ZoneInfo("America/New_York")
 
 
 def _env_float(name: str, default: float) -> float:
@@ -47,6 +51,12 @@ class RiskLimits:
     min_price: float = 5.0
     stop_loss_pct: float = 3.0
     take_profit_pct: float = 6.0
+    # Day-trading mode: every entry is expected to be closed the same session.
+    day_trading: bool = False
+    pdt_min_equity: float = 25_000.0
+    pdt_max_day_trades: int = 3
+    pdt_buffer: int = 0
+    max_intraday_drawdown_pct: float = 2.0   # 0 disables the breaker
 
     @classmethod
     def from_env(cls) -> "RiskLimits":
@@ -59,6 +69,11 @@ class RiskLimits:
             min_price=_env_float("MIN_PRICE", cls.min_price),
             stop_loss_pct=stop_loss_pct,
             take_profit_pct=_env_float("TAKE_PROFIT_PCT", stop_loss_pct * 2),
+            day_trading=_env_bool("DAY_TRADING_MODE", cls.day_trading),
+            pdt_min_equity=_env_float("PDT_MIN_EQUITY", cls.pdt_min_equity),
+            pdt_max_day_trades=_env_int("PDT_MAX_DAY_TRADES", cls.pdt_max_day_trades),
+            pdt_buffer=_env_int("PDT_DAYTRADE_BUFFER", cls.pdt_buffer),
+            max_intraday_drawdown_pct=_env_float("MAX_INTRADAY_DRAWDOWN_PCT", cls.max_intraday_drawdown_pct),
         )
 
 
@@ -88,6 +103,55 @@ class RiskManager:
 
     def __init__(self, limits: Optional[RiskLimits] = None) -> None:
         self.limits = limits or RiskLimits.from_env()
+        # Intraday drawdown breaker: once tripped, stays tripped for that session.
+        self._breaker_session: Optional[date] = None
+        self._breaker_reason: Optional[str] = None
+
+    @property
+    def breaker_tripped(self) -> bool:
+        return self._breaker_reason is not None
+
+    def update_breaker(self, account: Dict[str, Any], session_date: Optional[date] = None) -> Optional[str]:
+        """Evaluate the intraday drawdown breaker; returns the halt reason if tripped.
+
+        Drawdown is (equity - start-of-day equity) / start-of-day equity, where
+        Alpaca's ``last_equity`` is the previous close, so realized and
+        unrealized P&L are both included. Call every cycle, not only on entries.
+        """
+        session_date = session_date or datetime.now(MARKET_TZ).date()
+        if session_date != self._breaker_session:
+            self._breaker_session, self._breaker_reason = session_date, None
+        limit = self.limits.max_intraday_drawdown_pct
+        if self._breaker_reason or limit <= 0:
+            return self._breaker_reason
+        equity, start = _to_float(account.get("equity")), _to_float(account.get("last_equity"))
+        if equity > 0 and start > 0:
+            drawdown = (equity - start) / start * 100
+            if drawdown <= -limit:
+                self._breaker_reason = (
+                    f"Intraday drawdown breaker tripped ({drawdown:.2f}% vs -{limit:.2f}% of starting equity); "
+                    f"no new entries for the rest of the {session_date} session"
+                )
+        return self._breaker_reason
+
+    def _pdt_block(self, account: Dict[str, Any], equity: float) -> Optional[str]:
+        """Reject intraday entries that would trip (or trade through) the PDT rule."""
+        limits = self.limits
+        if not limits.day_trading or equity >= limits.pdt_min_equity:
+            return None
+        if account.get("pattern_day_trader") in (True, "true", "True", 1):
+            return (
+                f"PDT: account is flagged as a pattern day trader with equity ${equity:,.2f} "
+                f"< ${limits.pdt_min_equity:,.0f}; day trading is restricted"
+            )
+        count = int(_to_float(account.get("daytrade_count")))
+        allowed = limits.pdt_max_day_trades - limits.pdt_buffer
+        if count >= allowed:
+            return (
+                f"PDT: {count} day trades in the last 5 business days with equity ${equity:,.2f} "
+                f"< ${limits.pdt_min_equity:,.0f}; another intraday round trip would flag the account"
+            )
+        return None
 
     def check_order(
         self,
@@ -101,6 +165,7 @@ class RiskManager:
         orders_today: Iterable[Dict[str, Any]] = (),
         stop_loss: Optional[float] = None,
         take_profit: Optional[float] = None,
+        session_date: Optional[date] = None,
     ) -> RiskDecision:
         limits = self.limits
         side = side.lower()
@@ -134,6 +199,7 @@ class RiskManager:
         if equity <= 0:
             return RiskDecision(False, reason="Account equity unavailable")
 
+
         if last_equity > 0:
             day_change_pct = (equity - last_equity) / last_equity * 100
             if day_change_pct <= -limits.max_daily_loss_pct:
@@ -144,6 +210,15 @@ class RiskManager:
                         f"-{limits.max_daily_loss_pct:.2f}%); no new entries today"
                     ),
                 )
+
+        # Latching breaker (tighter by default); evaluated after the daily loss
+        # limit so each rule reports its own reason.
+        breaker = self.update_breaker(account, session_date)
+        if breaker:
+            return RiskDecision(False, reason=breaker)
+        pdt = self._pdt_block(account, equity)
+        if pdt:
+            return RiskDecision(False, reason=pdt)
 
         entries_today = sum(
             1 for order in orders_today if str(order.get("side", "")).lower() == "buy"
