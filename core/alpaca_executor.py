@@ -123,12 +123,13 @@ class AlpacaExecutor:
             logger.info(f"Skipping execution: {action} {quantity} {symbol}")
             return None
 
-        # Safety check — make sure market is open (paper trading still
-        # queues orders, but this prevents runaway scripts overnight)
+        # Safety check — don't queue market orders while the market is
+        # closed; they would fill at an unknown price at the next open.
         if not self.is_market_open():
             logger.warning(
-                "Market is closed. Order queued but won't fill until open."
+                f"Market is closed. Skipping {action} {quantity} {symbol}."
             )
+            return None
 
         if action == "BUY":
             return self._place_order(symbol, quantity, "buy")

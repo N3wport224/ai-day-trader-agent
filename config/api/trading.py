@@ -177,7 +177,7 @@ async def submit_paper_order(
         return {
             "submitted": False,
             "order": None,
-            "skipped_reason": "Order was not submitted",
+            "skipped_reason": "Order was not submitted (market closed or no position to sell)",
         }
 
     return {

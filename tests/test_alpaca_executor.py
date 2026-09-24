@@ -72,3 +72,19 @@ def test_alpaca_executor_accepts_legacy_root_paper_url(monkeypatch):
     executor = AlpacaExecutor()
 
     assert executor.base_url == "https://paper-api.alpaca.markets/v2"
+
+
+def test_alpaca_executor_skips_orders_when_market_closed(monkeypatch):
+    monkeypatch.setenv("ALPACA_API_KEY", "key")
+    monkeypatch.setenv("ALPACA_SECRET_KEY", "secret")
+    monkeypatch.setenv("ALPACA_TRADING_BASE_URL", "https://paper-api.alpaca.markets/v2")
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("no order should be sent while the market is closed")
+
+    monkeypatch.setattr("core.alpaca_executor.requests.post", fail_if_called)
+    monkeypatch.setattr(AlpacaExecutor, "is_market_open", lambda self: False)
+
+    executor = AlpacaExecutor()
+
+    assert executor.execute_signal({"symbol": "AAPL", "recommendation": "BUY", "quantity": 2}) is None
