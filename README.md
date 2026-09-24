@@ -39,6 +39,41 @@ A sophisticated, multi-strategy AI-powered trading agent that combines technical
 
 ---
 
+## Quick start (dashboard, no command line needed after this)
+
+```bash
+pip install -r requirements.txt
+python start_dashboard.py
+```
+
+Your browser opens the dashboard at http://127.0.0.1:8000/dashboard. From there:
+
+1. **Create your account.** The first visit asks you to create the owner account.
+2. **API Keys tab:** paste your Alpaca **paper** keys. It has step-by-step instructions
+   for getting them, and a **Test connection** button. Keys are saved to `.env` on this
+   computer only, with owner-only permissions, and are never shown again. For safety they
+   can only be changed from the computer running the dashboard.
+3. **Get Started tab → Validate strategy:** a walk-forward test on real data. The bot
+   only places trades if this test finds an edge; if it does, the model is trained
+   automatically.
+4. **Paper Trading tab** (green, fake money): start or stop the auto-trader, watch it in
+   one of two modes (placing paper orders, or watch-only), see positions, activity and
+   the day's P&L, place manual paper orders, and use the emergency **Close everything**
+   button.
+5. **Live Trading tab** (red, real money), optional and only after weeks of paper
+   trading. It requires all of these:
+   - separate live keys;
+   - **arming**: type `I UNDERSTAND THIS USES REAL MONEY` plus your password;
+   - a passing validation;
+   - a confirmation tick box every time you start the bot.
+
+   **Disarm** stops the live bot instantly. Real-money trading can't be switched on from
+   another machine, and the edge gate can't be bypassed in live mode.
+
+The bot runs as its own background process (`bot.py --mode paper|live`), with separate
+logs and state per mode under `logs/<mode>/` and `data/<mode>/`. It keeps running if you
+close the browser. Stop it from the dashboard.
+
 ## Setup
 
 ### 1. Clone the Repository

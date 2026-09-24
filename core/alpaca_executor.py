@@ -29,6 +29,13 @@ logger = logging.getLogger(__name__)
 
 
 MARKET_TZ = ZoneInfo("America/New_York")
+TRADING_MODES = ("paper", "live")
+PAPER_BASE_URL = "https://paper-api.alpaca.markets/v2"
+LIVE_BASE_URL = "https://api.alpaca.markets/v2"
+
+
+def live_trading_armed() -> bool:
+    return os.getenv("LIVE_TRADING_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
 
 
 @dataclass(frozen=True)
@@ -133,7 +140,8 @@ def spread_bps(bid: float, ask: float) -> Optional[float]:
 class AlpacaExecutor:
     """
     Sends orders to Alpaca and returns results.
-    Uses Alpaca paper trading by default.
+    Uses Alpaca paper trading by default; ``mode="live"`` trades real money
+    and requires separate live keys plus LIVE_TRADING_ENABLED=true.
 
     Every order passes through a RiskManager first, and every BUY is sent as
     a bracket order so its stop-loss and take-profit live at the broker.
@@ -148,6 +156,8 @@ class AlpacaExecutor:
         session_clock: Optional[SessionClock] = None,
         execution: Optional[ExecutionConfig] = None,
         quote_lookup: Optional[Callable[[str], Optional[Dict[str, float]]]] = None,
+        mode: str = "paper",
+        require_armed: bool = True,
     ):
         self.execution = execution or ExecutionConfig.from_env()
         self.quote_lookup = quote_lookup
@@ -159,31 +169,53 @@ class AlpacaExecutor:
         # see core/fill_quality.py). Bracket legs carry their own stop/limit.
         self.expected_prices: Dict[str, float] = {}
         self.price_lookup = price_lookup or _default_price_lookup
-        self.api_key = os.getenv("ALPACA_API_KEY")
-        self.secret_key = os.getenv("ALPACA_SECRET_KEY")
-        self.base_url = self._normalize_base_url(
-            base_url
-            or os.getenv("ALPACA_TRADING_BASE_URL")
-            or os.getenv("ALPACA_BASE_URL")
-            or "https://paper-api.alpaca.markets/v2"
-        )
+        mode = (mode or "paper").strip().lower()
+        if mode not in TRADING_MODES:
+            raise ValueError(f"Unknown trading mode {mode!r}; use 'paper' or 'live'")
+        self.mode = mode
 
-        if not self.api_key or not self.secret_key:
-            raise ValueError(
-                "ALPACA_API_KEY and ALPACA_SECRET_KEY must be set in your .env file"
+        if mode == "live":
+            # Real money: separate keys, a fixed endpoint (never from config),
+            # and an explicit arming switch that the GUI/CLI sets deliberately.
+            self.api_key = os.getenv("ALPACA_LIVE_API_KEY")
+            self.secret_key = os.getenv("ALPACA_LIVE_SECRET_KEY")
+            if not self.api_key or not self.secret_key:
+                raise ValueError("Live trading needs ALPACA_LIVE_API_KEY and ALPACA_LIVE_SECRET_KEY")
+            # require_armed=False is only for read-only views and the emergency
+            # flatten (which can only reduce risk); the bot never uses it.
+            if require_armed and not live_trading_armed():
+                raise ValueError(
+                    "Live trading is not armed. Arm it on the dashboard's Live Trading tab "
+                    "(or set LIVE_TRADING_ENABLED=true) after reading the warnings."
+                )
+            self.base_url = LIVE_BASE_URL
+        else:
+            self.api_key = os.getenv("ALPACA_API_KEY")
+            self.secret_key = os.getenv("ALPACA_SECRET_KEY")
+            self.base_url = self._normalize_base_url(
+                base_url
+                or os.getenv("ALPACA_TRADING_BASE_URL")
+                or os.getenv("ALPACA_BASE_URL")
+                or PAPER_BASE_URL
             )
-
-        if "paper-api.alpaca.markets" not in self.base_url:
-            raise ValueError(
-                "Paper trading requires ALPACA_TRADING_BASE_URL=https://paper-api.alpaca.markets/v2"
-            )
+            if not self.api_key or not self.secret_key:
+                raise ValueError(
+                    "ALPACA_API_KEY and ALPACA_SECRET_KEY must be set in your .env file"
+                )
+            if "paper-api.alpaca.markets" not in self.base_url:
+                raise ValueError(
+                    "Paper trading requires ALPACA_TRADING_BASE_URL=https://paper-api.alpaca.markets/v2"
+                )
 
         self.headers = {
             "APCA-API-KEY-ID": self.api_key,
             "APCA-API-SECRET-KEY": self.secret_key,
             "Content-Type": "application/json",
         }
-        logger.info("AlpacaExecutor ready in PAPER mode")
+        if mode == "live":
+            logger.warning("AlpacaExecutor ready in LIVE mode: orders use REAL MONEY")
+        else:
+            logger.info("AlpacaExecutor ready in PAPER mode")
 
     def _normalize_base_url(self, base_url: str) -> str:
         """Accept either the Alpaca root URL or the versioned v2 URL."""

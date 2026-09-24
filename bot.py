@@ -21,6 +21,10 @@ Examples:
 
   # Swing mode on hourly bars, positions may be held overnight
   python bot.py --timeframe 1h --overnight
+
+  # REAL MONEY (separate live keys, armed on the dashboard; the edge gate
+  # cannot be bypassed in live mode)
+  python bot.py --mode live --execute
 """
 
 from __future__ import annotations
@@ -50,9 +54,23 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-def _edge_gate(bot, strategy_name: str, timeframe: str, log) -> tuple:
+def apply_mode_paths(mode: str) -> None:
+    """Keep each mode's runtime state (heartbeat, telemetry, stops, fills,
+    edge monitor) separate, unless explicitly configured."""
+    defaults = {
+        "HEARTBEAT_PATH": f"logs/{mode}/heartbeat.json",
+        "EXECUTION_LOG_PATH": f"logs/{mode}/execution_events.jsonl",
+        "TRAILING_STATE_PATH": f"data/{mode}/trailing_state.json",
+        "FILL_STATE_PATH": f"data/{mode}/fill_state.json",
+        "EDGE_MONITOR_STATE_PATH": f"data/{mode}/edge_monitor.json",
+    }
+    for name, value in defaults.items():
+        os.environ.setdefault(name, value)
+
+
+def _edge_gate(bot, strategy_name: str, timeframe: str, log, mode: str = "paper") -> tuple:
     """(block reason or None, warnings) for opening live positions."""
-    if os.getenv("EDGE_GATE", "true").strip().lower() not in {"1", "true", "yes", "on"}:
+    if mode != "live" and os.getenv("EDGE_GATE", "true").strip().lower() not in {"1", "true", "yes", "on"}:
         log.warning("EDGE_GATE=false: trading WITHOUT a validated out-of-sample edge")
         return None, []
     from core.edge_gate import check_live_setup, strategy_fingerprint
@@ -71,7 +89,14 @@ def main(argv: list[str] | None = None) -> int:
         default=os.getenv("WATCHLIST", ""),
         help="Comma-separated tickers (default: WATCHLIST from .env)",
     )
-    parser.add_argument("--portfolio", "-p", default=os.getenv("BOT_PORTFOLIO", "default"))
+    parser.add_argument(
+        "--mode",
+        choices=("paper", "live"),
+        default=os.getenv("BOT_MODE", "paper"),
+        help="paper (default, fake money) or live (REAL money; needs live keys and arming)",
+    )
+    parser.add_argument("--portfolio", "-p", default=None,
+                        help="Local book for bot trades (default: BOT_PORTFOLIO, or 'live' in live mode)")
     parser.add_argument(
         "--timeframe",
         default=os.getenv("BOT_TIMEFRAME", "5m"),
@@ -118,6 +143,12 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
     log = logging.getLogger("bot")
+    apply_mode_paths(args.mode)
+    if args.portfolio is None:
+        args.portfolio = "live" if args.mode == "live" else os.getenv("BOT_PORTFOLIO", "default")
+    if args.mode == "live":
+        log.warning("LIVE MODE: this bot trades REAL MONEY" if args.execute
+                    else "LIVE MODE (watch only): reading the live account, no orders")
 
     try:
         timeframe = normalize_timeframe(args.timeframe)
@@ -153,11 +184,16 @@ def main(argv: list[str] | None = None) -> int:
 
     session_clock = SessionClock(session)
     market_clock = broker = trailing = fills = edge_monitor = None
-    if args.execute or os.getenv("ALPACA_API_KEY"):
-        from core.alpaca_executor_provider import get_alpaca_executor
+    live_keys = os.getenv("ALPACA_LIVE_API_KEY") if args.mode == "live" else os.getenv("ALPACA_API_KEY")
+    if args.execute or live_keys:
+        from core.alpaca_executor_provider import get_executor_for_mode
         from core.trailing_stops import TrailingStopManager
 
-        broker = get_alpaca_executor()
+        try:
+            broker = get_executor_for_mode(args.mode)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
         market_clock = broker.get_clock
         # Entries obey the session rules at the executor too (the final gate),
         # and intraday entries are checked against the PDT rule.
@@ -205,7 +241,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     if args.execute:
-        block, warnings = _edge_gate(bot, args.strategy, timeframe, log)
+        block, warnings = _edge_gate(bot, args.strategy, timeframe, log, mode=args.mode)
         for warning in warnings:
             log.warning(f"Edge gate: {warning}")
         if block:

@@ -95,8 +95,8 @@ def fetch_alpaca_bars(
     *,
     http_get: Callable = requests.get,
 ) -> pd.DataFrame:
-    key = os.getenv("ALPACA_API_KEY") or os.getenv("ALPACA_KEY_ID")
-    secret = os.getenv("ALPACA_SECRET_KEY") or os.getenv("ALPACA_SECRET")
+    key = os.getenv("ALPACA_API_KEY") or os.getenv("ALPACA_KEY_ID") or os.getenv("ALPACA_LIVE_API_KEY")
+    secret = os.getenv("ALPACA_SECRET_KEY") or os.getenv("ALPACA_SECRET") or os.getenv("ALPACA_LIVE_SECRET_KEY")
     if not key or not secret:
         raise ValueError("Alpaca credentials not configured")
 

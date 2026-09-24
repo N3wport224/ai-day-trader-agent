@@ -129,12 +129,23 @@ async def get_provider_status(
     }
 
 
+def _optional_alpaca_executor() -> Optional[AlpacaExecutor]:
+    """The paper executor, or None when keys aren't configured yet (first run)."""
+    try:
+        return get_alpaca_executor()
+    except ValueError:
+        return None
+
+
 @router.get("/alpaca/account", response_model=AlpacaAccountStatusResponse)
 async def get_alpaca_account_status(
     current_user: User = Depends(get_admin_user),
-    executor: AlpacaExecutor = Depends(get_alpaca_executor),
+    executor: Optional[AlpacaExecutor] = Depends(_optional_alpaca_executor),
 ):
     """Return Alpaca paper account status."""
+    if executor is None:
+        return {"connected": False, "paper_trading": True,
+                "message": "Add your Alpaca paper keys on the API Keys tab."}
     try:
         account = await run_in_threadpool(executor.get_account)
         market_open = await run_in_threadpool(executor.is_market_open)

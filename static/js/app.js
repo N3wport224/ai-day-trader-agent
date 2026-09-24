@@ -96,6 +96,7 @@ const App = (() => {
     $('login-view').style.display = 'flex';
     $('dashboard-view').style.display = 'none';
     stopPolling();
+    if (typeof Control !== 'undefined') Control.onLogin();
   }
 
   function showDashboard() {
@@ -104,6 +105,7 @@ const App = (() => {
     renderUserInfo();
     loadAllData();
     startPolling();
+    if (typeof Control !== 'undefined') Control.onDashboard(state.user);
   }
 
   /* ── Event binding ── */
@@ -929,7 +931,7 @@ const App = (() => {
     }
   }
 
-  return { init };
+  return { init, toast, escapeHtml, fmtCurrency, fmtPercent };
 })();
 
 document.addEventListener('DOMContentLoaded', App.init);

@@ -90,17 +90,22 @@ def _num(value: Any) -> float:
     return value
 
 
+def _count(value: Any) -> int:
+    number = _num(value)
+    return int(number) if math.isfinite(number) else 0
+
+
 def evaluate_edge(metrics: Dict[str, Any], criteria: Optional[EdgeCriteria] = None) -> List[str]:
     """Reasons the pooled walk-forward metrics fail the criteria (empty = pass)."""
     c = criteria or EdgeCriteria.from_env()
     failures = []
-    trades = int(_num(metrics.get("trades")) or 0)
-    folds = int(_num(metrics.get("folds")) or 0)
+    trades = _count(metrics.get("trades"))
+    folds = _count(metrics.get("folds"))
     pf = _num(metrics.get("profit_factor"))
     if math.isnan(pf) and trades and _num(metrics.get("win_rate_pct")) == 100:
         pf = math.inf  # no losing trades at all
     avg_r = _num(metrics.get("avg_r"))
-    positive = _num(metrics.get("positive_folds"))
+    positive = _count(metrics.get("positive_folds"))
     drawdown = abs(_num(metrics.get("max_drawdown_pct")))
 
     if trades < c.min_trades:
@@ -112,7 +117,7 @@ def evaluate_edge(metrics: Dict[str, Any], criteria: Optional[EdgeCriteria] = No
     if not avg_r >= c.min_avg_r:
         failures.append(f"average R {avg_r} < {c.min_avg_r}")
     if folds and not positive / folds >= c.min_positive_fold_share:
-        failures.append(f"only {int(positive)}/{folds} folds had positive average R "
+        failures.append(f"only {positive}/{folds} folds had positive average R "
                         f"(need {c.min_positive_fold_share:.0%})")
     if not drawdown <= c.max_drawdown_pct:
         failures.append(f"max drawdown {drawdown}% > {c.max_drawdown_pct}%")
