@@ -164,25 +164,29 @@ async def submit_paper_order(
     current_user: User = Depends(get_admin_user),
     executor: AlpacaExecutor = Depends(get_alpaca_executor),
 ):
-    """Submit a direct BUY/SELL order to Alpaca paper trading."""
-    order = await run_in_threadpool(
-        executor.execute_signal,
+    """Submit a direct BUY/SELL order to Alpaca paper trading.
+
+    BUY orders go through the same risk checks as automated trades and are
+    sent as bracket orders with a stop-loss and take-profit attached.
+    """
+    execution = await run_in_threadpool(
+        executor.submit,
         {
             "symbol": request.symbol,
             "recommendation": request.action,
             "quantity": request.quantity,
         },
     )
-    if not order:
+    if not execution.order:
         return {
             "submitted": False,
             "order": None,
-            "skipped_reason": "Order was not submitted (market closed or no position to sell)",
+            "skipped_reason": execution.skipped_reason or "Order was not submitted",
         }
 
     return {
         "submitted": True,
-        "order": order,
+        "order": execution.order,
         "skipped_reason": None,
     }
 

@@ -1,0 +1,6 @@
+# Optional: FinBERT (ProsusAI/finbert) news sentiment for the ML strategy.
+# Adds several GB (PyTorch). Without these, core/news_sentiment.py falls back
+# to a lightweight lexicon scorer. Select explicitly with SENTIMENT_MODEL.
+-r requirements.txt
+transformers==5.17.0
+torch==2.14.0

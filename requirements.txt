@@ -12,9 +12,12 @@ discord.py==2.5.2
 
 # Database (SQLite3 is included with Python)
 
-# Machine Learning
+# Machine Learning (ML strategy: core/ml_strategy.py, scripts/train_model.py)
 scikit-learn==1.6.0
 joblib==1.4.2
+lightgbm==4.7.0
+# FinBERT news sentiment is optional (large download): pip install -r requirements-ml.txt
+# Without it, a built-in lexicon scorer is used.
 
 # Data visualization (for backtesting)
 matplotlib==3.10.0

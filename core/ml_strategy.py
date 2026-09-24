@@ -1,0 +1,240 @@
+#!/usr/bin/env python3
+"""
+ML inference: technical + sentiment features -> directional signal.
+
+The model is a binary classifier estimating P(price reaches an ATR-based
+take-profit before an ATR-based stop within N bars) — see
+core/ml_training.py. It is long-only:
+
+- P >= threshold          -> BUY  (confidence = P)
+- P <= exit threshold     -> SELL (exit an existing long; confidence = 1 - P)
+- otherwise               -> HOLD
+
+P is not "probability the price goes up": target hits are rare by design
+(a 2:1 reward/risk target might be hit first on only ~15% of bars), so a
+low P usually just means "no edge". The exit threshold is therefore set
+relative to the model's training base rate (half of it by default), not
+at 1 - threshold. Brackets handle normal exits; SELL is for setups that
+look clearly worse than average. Override with ML_EXIT_THRESHOLD.
+
+When no trained artifact is available (or it doesn't match the current
+feature set) a transparent trend/momentum/sentiment heuristic produces the
+same output shape, flagged ``mode="heuristic"``. Missing sentiment is passed
+to the model as NaN (LightGBM routes missing values natively) and simply
+dropped from the heuristic.
+
+Signals are advisory: the executor's RiskManager and bracket orders remain
+the final gatekeepers.
+"""
+
+from __future__ import annotations
+
+import logging
+import math
+import os
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import numpy as np
+import pandas as pd
+
+from core.features import TECHNICAL_FEATURES
+from core.news_sentiment import SENTIMENT_FEATURES, SentimentSnapshot
+
+logger = logging.getLogger(__name__)
+
+FEATURE_COLUMNS = TECHNICAL_FEATURES + SENTIMENT_FEATURES
+ARTIFACT_VERSION = 1
+DEFAULT_MODEL_PATH = "models/ml_signal.joblib"
+
+
+@dataclass(frozen=True)
+class MLSignal:
+    signal: str                   # BUY / SELL / HOLD
+    confidence: float             # 0..1, confidence in `signal`
+    probability_up: float         # P(take-profit before stop)
+    mode: str                     # "model" or "heuristic"
+    price: float
+    atr: float
+    stop_loss: Optional[float]
+    take_profit: Optional[float]
+    stop_distance: Optional[float]
+    target_distance: Optional[float]
+    sentiment: SentimentSnapshot
+    reasons: List[str] = field(default_factory=list)
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "signal": self.signal,
+            "confidence": round(self.confidence, 4),
+            "probability_up": round(self.probability_up, 4),
+            "mode": self.mode,
+            "price": self.price,
+            "atr": self.atr,
+            "stop_loss": self.stop_loss,
+            "take_profit": self.take_profit,
+            "sentiment_score": self.sentiment.score if self.sentiment.available else None,
+            "sentiment_articles": self.sentiment.article_count,
+            "sentiment_available": self.sentiment.available,
+            "reasons": list(self.reasons),
+        }
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
+def feature_vector(features: pd.DataFrame, sentiment: SentimentSnapshot) -> pd.DataFrame:
+    """One-row model input from the latest completed bar plus sentiment."""
+    if features.empty:
+        raise ValueError("No completed bars to build features from")
+    row = features.iloc[[-1]][TECHNICAL_FEATURES].copy()
+    for name, value in sentiment.as_features().items():
+        row[name] = value
+    return row[FEATURE_COLUMNS].astype(float)
+
+
+def load_artifact(path: str | os.PathLike) -> Optional[Dict[str, Any]]:
+    """Load a model artifact written by scripts/train_model.py.
+
+    joblib uses pickle, which can execute code: only load artifacts you
+    trained yourself.
+    """
+    path = Path(path)
+    if not path.exists():
+        return None
+    import joblib
+
+    try:
+        artifact = joblib.load(path)
+    except Exception as exc:
+        logger.error(f"Could not load model artifact {path}: {exc}")
+        return None
+    if not isinstance(artifact, dict) or artifact.get("version") != ARTIFACT_VERSION:
+        logger.error(f"Model artifact {path} has an unsupported format; retrain it")
+        return None
+    if list(artifact.get("feature_columns", [])) != FEATURE_COLUMNS:
+        logger.error(f"Model artifact {path} was trained on different features; retrain it")
+        return None
+    return artifact
+
+
+class MLStrategy:
+    def __init__(
+        self,
+        artifact: Optional[Dict[str, Any]] = None,
+        *,
+        model_path: Optional[str] = None,
+        confidence_threshold: Optional[float] = None,
+        stop_atr_mult: Optional[float] = None,
+        target_atr_mult: Optional[float] = None,
+        exit_threshold: Optional[float] = None,
+    ) -> None:
+        if artifact is None:
+            artifact = load_artifact(model_path or os.getenv("ML_MODEL_PATH", DEFAULT_MODEL_PATH))
+        self.artifact = artifact
+        labels = (artifact or {}).get("label_params", {})
+        # Use the same ATR multiples the model was trained to predict.
+        self.stop_atr_mult = stop_atr_mult or labels.get("stop_atr_mult") or _env_float("ATR_STOP_MULT", 1.5)
+        self.target_atr_mult = target_atr_mult or labels.get("target_atr_mult") or _env_float("ATR_TARGET_MULT", 3.0)
+        threshold = confidence_threshold or _env_float("ML_CONFIDENCE_THRESHOLD", 0.6)
+        if not 0.5 < threshold < 1:
+            raise ValueError("ML_CONFIDENCE_THRESHOLD must be between 0.5 and 1")
+        self.threshold = threshold
+
+        exit_threshold = exit_threshold or _env_float("ML_EXIT_THRESHOLD", 0.0)
+        if not exit_threshold:
+            base_rate = (artifact or {}).get("train_base_rate")
+            exit_threshold = 0.5 * base_rate if base_rate else 1 - threshold
+        if not 0 < exit_threshold < threshold:
+            raise ValueError("ML_EXIT_THRESHOLD must be between 0 and ML_CONFIDENCE_THRESHOLD")
+        self.exit_threshold = exit_threshold
+
+    @property
+    def mode(self) -> str:
+        return "model" if self.artifact else "heuristic"
+
+    def predict(self, features: pd.DataFrame, sentiment: SentimentSnapshot) -> MLSignal:
+        """``features`` is compute_features() output; the last row must be a closed bar."""
+        latest = features.iloc[-1]
+        price = float(latest["close"])
+        atr = float(latest.get("atr", float("nan")))
+        vector = feature_vector(features, sentiment)
+        reasons: List[str] = []
+
+        if self.artifact:
+            probability_up = float(self.artifact["pipeline"].predict_proba(vector)[0, 1])
+            reasons.append(f"model P(target before stop)={probability_up:.2f}")
+        else:
+            probability_up = self._heuristic_probability(latest, sentiment, reasons)
+
+        if not sentiment.available:
+            reasons.append("sentiment unavailable; technical features only")
+
+        if probability_up >= self.threshold:
+            signal, confidence = "BUY", probability_up
+        elif probability_up <= self.exit_threshold:
+            signal, confidence = "SELL", 1 - probability_up
+            reasons.append(f"at or below exit threshold {self.exit_threshold:.2f}")
+        else:
+            signal, confidence = "HOLD", probability_up
+            reasons.append(f"below confidence threshold {self.threshold:.2f}")
+
+        stop_distance = target_distance = stop_loss = take_profit = None
+        if math.isfinite(atr) and atr > 0:
+            stop_distance = round(self.stop_atr_mult * atr, 4)
+            target_distance = round(self.target_atr_mult * atr, 4)
+            stop_loss = round(price - stop_distance, 2)
+            take_profit = round(price + target_distance, 2)
+        elif signal == "BUY":
+            signal = "HOLD"
+            reasons.append("ATR unavailable (not enough history); no entry")
+
+        return MLSignal(
+            signal=signal,
+            confidence=float(confidence),
+            probability_up=probability_up,
+            mode=self.mode,
+            price=price,
+            atr=atr,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            stop_distance=stop_distance,
+            target_distance=target_distance,
+            sentiment=sentiment,
+            reasons=reasons,
+        )
+
+    @staticmethod
+    def _heuristic_probability(latest: pd.Series, sentiment: SentimentSnapshot, reasons: List[str]) -> float:
+        """Map trend/momentum/sentiment votes to a pseudo-probability in (0, 1)."""
+        votes: List[float] = []
+
+        def vote(name: str, value: float, weight: float = 1.0) -> None:
+            if value is None or (isinstance(value, float) and not math.isfinite(value)):
+                return
+            votes.append(weight * float(np.clip(value, -1, 1)))
+            reasons.append(f"{name}={value:+.2f}")
+
+        close, ema50, ema200 = latest.get("close"), latest.get("ema50"), latest.get("ema200")
+        if pd.notna(ema50) and pd.notna(ema200):
+            trend = 1.0 if close > ema50 > ema200 else -1.0 if close < ema50 < ema200 else 0.0
+            vote("trend", trend, 1.5)
+        if pd.notna(latest.get("macd_hist_pct")) and pd.notna(latest.get("atr_pct")) and latest["atr_pct"] > 0:
+            vote("macd", latest["macd_hist_pct"] / latest["atr_pct"])
+        if pd.notna(latest.get("rsi")):
+            # Reward momentum (50-70), fade extremes.
+            r = latest["rsi"]
+            vote("rsi", (r - 50) / 20 if r <= 70 else (80 - r) / 10)
+        if sentiment.available and sentiment.article_count > 0:
+            vote("sentiment", sentiment.score, 1.0)
+
+        if not votes:
+            reasons.append("no usable indicators yet")
+            return 0.5
+        score = sum(votes) / (len(votes) + 0.5)  # shrink toward neutral
+        return float(0.5 + 0.5 * np.clip(score, -1, 1))

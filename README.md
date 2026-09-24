@@ -165,6 +165,86 @@ python run.py --analyze-portfolio
 python run.py --analyze-portfolio --portfolio my_portfolio
 ```
 
+### Scheduled Trading Bot
+
+`bot.py` scans a watchlist while the market is open. It is a dry run by
+default: it analyzes and logs, and places no orders.
+
+```bash
+# Dry run every 15 minutes
+python bot.py --symbols AAPL,MSFT,NVDA
+
+# Trade on Alpaca paper with risk limits from .env
+python bot.py --symbols AAPL,MSFT,NVDA --portfolio default --execute
+
+# One cycle and exit (for cron)
+python bot.py --once --execute
+```
+
+#### ML strategy (default for the bot)
+
+The bot scores each symbol with a model that combines candlestick/trend
+technicals with news sentiment, then hands actionable signals to the same
+executor and risk manager as everything else:
+
+```
+bars (Alpaca/Yahoo) -> core/features.py ─┐
+news (Alpaca News)  -> core/news_sentiment.py ─┤-> core/ml_strategy.py -> core/ml_signal_engine.py
+                                                         -> TradingWorkflow -> RiskManager -> bracket order
+```
+
+- **Features** (`core/features.py`): candle body ratio `(C-O)/(H-L)`, upper and
+  lower wick ratios, gap %, EMA 20/50/200 spreads and slope, RSI, MACD, ATR,
+  trailing returns and volume z-score. All causal: a row only uses bars up
+  to that candle's close, and the still-forming bar is dropped.
+- **Sentiment** (`core/news_sentiment.py`): Alpaca News headlines scored with
+  FinBERT (`pip install -r requirements-ml.txt`) or a built-in lexicon
+  fallback, aggregated into a 24-hour time-decayed score in [-1, +1].
+  If news is unavailable, the model gets "missing" and keeps working on
+  technicals alone.
+- **Model** (`core/ml_strategy.py`): LightGBM in a scikit-learn pipeline
+  predicts P(ATR take-profit is hit before the ATR stop). BUY at or above
+  `ML_CONFIDENCE_THRESHOLD`; SELL (exit a held position) only when P is at
+  or below half the training base rate (`ML_EXIT_THRESHOLD`), since target
+  hits are rare by design and a low P usually means "no edge", not
+  "bearish"; otherwise HOLD. With no trained model it falls back to a
+  trend/momentum/sentiment heuristic (`mode=heuristic` in the logs).
+- **Sizing and stops**: risk `RISK_PER_TRADE_PCT` of capital between entry
+  and a `ATR_STOP_MULT` x ATR stop; target at `ATR_TARGET_MULT` x ATR. Both
+  are re-centred on the live price at order time and then subject to every
+  risk check below.
+
+Train a model (writes `models/ml_signal.joblib`):
+
+```bash
+python scripts/train_model.py --symbols AAPL,MSFT,NVDA,AMD,SPY --days 365
+python scripts/train_model.py --no-news --timeframe 1Day --days 1500   # technicals only
+python scripts/train_model.py --synthetic                              # offline demo
+```
+
+The script labels each bar by whether price hit the take-profit before the
+stop within `--horizon` bars, holds out the most recent 20% (with a purge
+gap so no training label sees test prices), and prints AUC, base rate, and
+win rate / approximate expectancy at your threshold. **If AUC is near 0.5 or
+expectancy is negative, the model has no edge: keep the bot in dry-run.**
+Retrain after changing `ATR_*_MULT`, the timeframe, or the feature code.
+Use `--strategy classic` to run the original rule-based pipeline.
+
+Every order, whether from the bot, the CLI (`--paper-trade`), the API or
+the dashboard, goes through the same safeguards:
+
+- **Bracket orders**: each BUY is sent with a broker-side stop-loss and
+  take-profit, so the position is protected even if the bot stops running.
+  The strategy's ATR-based levels are used when they fit the live price,
+  otherwise `STOP_LOSS_PCT` / `TAKE_PROFIT_PCT`.
+- **Risk checks** (`core/risk_manager.py`): kill switch (`TRADING_ENABLED`),
+  daily loss limit (`MAX_DAILY_LOSS_PCT`), daily entry limit
+  (`MAX_DAILY_TRADES`), per-symbol position cap (`MAX_PORTFOLIO_ALLOCATION`
+  of equity), buying power, and `MIN_PRICE`. Orders are shrunk to fit, never
+  enlarged. Exits are allowed even after the loss limit trips.
+- **No orders while the market is closed**, and sells never exceed the shares
+  held (no accidental shorts).
+
 ### REST API Server
 
 The AI Day Trader Agent now includes a professional REST API with WebSocket support for real-time updates.

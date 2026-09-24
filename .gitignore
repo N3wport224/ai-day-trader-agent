@@ -154,3 +154,6 @@ $RECYCLE.BIN/
 
 # VSCode
 .vscode/
+
+# Trained ML model artifacts
+models/

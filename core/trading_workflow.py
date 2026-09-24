@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional, Protocol
 
 from config.env_loader import load_env_variables
+from core.alpaca_executor import ExecutionResult
 from core.pipeline import run_enhanced_analysis
 from core.portfolio_manager import PortfolioManager
 
@@ -23,7 +24,7 @@ class AnalysisRunner(Protocol):
 
 
 class PaperOrderExecutor(Protocol):
-    def execute_signal(self, signal: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def submit(self, signal: Dict[str, Any]) -> ExecutionResult:
         ...
 
 
@@ -108,24 +109,28 @@ class TradingWorkflow:
         alpaca_order = None
         if submit_alpaca_paper_order:
             executor = self._get_paper_order_executor()
-            alpaca_order = executor.execute_signal(
+            execution = executor.submit(
                 {
                     **analysis,
                     "symbol": symbol,
                     "recommendation": action,
                     "quantity": quantity,
+                    "price": price,
                 }
             )
+            alpaca_order = execution.order
             if not alpaca_order:
                 return WorkflowResult(
                     symbol=symbol,
                     portfolio_name=portfolio_name,
                     analysis=analysis,
                     skipped_reason=(
-                        "Alpaca paper order was not submitted "
-                        "(market closed or no position to sell)"
+                        "Alpaca paper order was not submitted: "
+                        f"{execution.skipped_reason or 'unknown reason'}"
                     ),
                 )
+            # Risk checks may have reduced the size; record what was ordered.
+            quantity = int(float(alpaca_order.get("qty") or quantity))
 
         notes = "Recorded by TradingWorkflow local paper mode"
         if alpaca_order:
@@ -135,17 +140,30 @@ class TradingWorkflow:
                 f"status={alpaca_order.get('status', 'unknown')}"
             )
 
-        trade_id = self.portfolio_manager.record_trade(
-            name=portfolio_name,
-            symbol=symbol,
-            action=action,
-            quantity=quantity,
-            price=price,
-            strategy=str(analysis.get("primary_strategy") or "analysis"),
-            confidence=self._extract_confidence(analysis),
-            notes=notes,
-            user_id=user_id,
-        )
+        try:
+            trade_id = self.portfolio_manager.record_trade(
+                name=portfolio_name,
+                symbol=symbol,
+                action=action,
+                quantity=quantity,
+                price=price,
+                strategy=str(analysis.get("primary_strategy") or "analysis"),
+                confidence=self._extract_confidence(analysis),
+                notes=notes,
+                user_id=user_id,
+            )
+        except ValueError as exc:
+            if not alpaca_order:
+                raise
+            # The broker order is already live; report the local mismatch
+            # instead of failing as if nothing happened.
+            return WorkflowResult(
+                symbol=symbol,
+                portfolio_name=portfolio_name,
+                analysis=analysis,
+                alpaca_order=alpaca_order,
+                skipped_reason=f"Order placed but not recorded locally: {exc}",
+            )
 
         return WorkflowResult(
             symbol=symbol,
