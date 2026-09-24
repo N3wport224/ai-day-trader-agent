@@ -172,7 +172,8 @@ class AlpacaExecutor:
         will run risk checks and place the order when conditions are right.
 
         Recognised keys: symbol, recommendation/signal, quantity, and
-        optionally price and risk_parameters.stop_loss/take_profit.
+        optionally price and risk_parameters (stop_loss/take_profit, or
+        stop_distance/target_distance to place ATR levels around the live price).
         """
         action = str(signal.get("recommendation") or signal.get("signal") or "HOLD").upper()
         symbol = str(signal.get("symbol") or "").upper()
@@ -201,6 +202,13 @@ class AlpacaExecutor:
                 live_price = 0.0
             price = live_price or price
 
+        stop_loss, take_profit = risk.get("stop_loss"), risk.get("take_profit")
+        stop_distance = float(risk.get("stop_distance") or 0)
+        target_distance = float(risk.get("target_distance") or 0)
+        if action == "BUY" and price > 0 and stop_distance > 0 and target_distance > 0:
+            # ATR-based distances re-centred on the live entry price.
+            stop_loss, take_profit = price - stop_distance, price + target_distance
+
         decision = self.risk_manager.check_order(
             side=action,
             symbol=symbol,
@@ -209,8 +217,8 @@ class AlpacaExecutor:
             account=self.get_account(),
             position=position,
             orders_today=self.get_orders_today() if action == "BUY" else (),
-            stop_loss=risk.get("stop_loss"),
-            take_profit=risk.get("take_profit"),
+            stop_loss=stop_loss,
+            take_profit=take_profit,
         )
         if not decision.approved:
             logger.warning(f"Risk check blocked {action} {quantity} {symbol}: {decision.reason}")

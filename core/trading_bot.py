@@ -15,9 +15,24 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
+from core.portfolio_manager import PortfolioManager
 from core.trading_workflow import TradingWorkflow, WorkflowResult
 
 logger = logging.getLogger(__name__)
+
+STRATEGIES = ("ml", "classic")
+
+
+def create_workflow(portfolio_manager: PortfolioManager, strategy: str = "ml") -> TradingWorkflow:
+    """Build the workflow for a strategy. Both paths end in the same executor
+    and RiskManager, so risk limits and bracket orders apply either way."""
+    if strategy == "ml":
+        from core.ml_signal_engine import MLSignalEngine
+
+        return TradingWorkflow(portfolio_manager, analysis_runner=MLSignalEngine(portfolio_manager))
+    if strategy == "classic":
+        return TradingWorkflow(portfolio_manager)
+    raise ValueError(f"Unknown strategy {strategy!r}; choose from {STRATEGIES}")
 
 
 @dataclass
@@ -89,6 +104,15 @@ class TradingBot:
                 f"{symbol}: {analysis.get('recommendation', analysis.get('signal', '?'))} "
                 f"{analysis.get('quantity', 0)} @ confidence {analysis.get('confidence', '?')}"
             )
+            ml = (analysis.get("all_signals") or {}).get("ml")
+            if ml:
+                sentiment = (
+                    f"{ml['sentiment_score']:+.2f}/{ml['sentiment_articles']} articles"
+                    if ml.get("sentiment_available") else "n/a"
+                )
+                summary += (
+                    f" [{ml['mode']} P(up)={ml['probability_up']:.2f} sentiment {sentiment}]"
+                )
             if result.alpaca_order:
                 logger.info(f"{summary} -> ORDER {result.alpaca_order.get('id')}")
             else:

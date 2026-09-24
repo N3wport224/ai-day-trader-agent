@@ -11,6 +11,9 @@ Examples:
 
   # One pass and exit (handy for cron)
   python bot.py --once --execute
+
+  # Use the original rule-based pipeline instead of the ML strategy
+  python bot.py --strategy classic
 """
 
 from __future__ import annotations
@@ -25,8 +28,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from core.portfolio_manager import PortfolioManager  # noqa: E402
-from core.trading_bot import TradingBot  # noqa: E402
-from core.trading_workflow import TradingWorkflow  # noqa: E402
+from core.trading_bot import STRATEGIES, TradingBot, create_workflow  # noqa: E402
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -49,6 +51,12 @@ def main(argv: list[str] | None = None) -> int:
         help="Submit risk-checked bracket orders to Alpaca paper trading",
     )
     parser.add_argument("--once", action="store_true", help="Run one cycle and exit")
+    parser.add_argument(
+        "--strategy",
+        choices=STRATEGIES,
+        default=os.getenv("BOT_STRATEGY", "ml"),
+        help="ml (technical + news sentiment model, default) or classic (rule-based pipeline)",
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(
@@ -72,7 +80,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         bot = TradingBot(
-            TradingWorkflow(portfolio_manager),
+            create_workflow(portfolio_manager, args.strategy),
             args.symbols.split(","),
             args.portfolio,
             execute=args.execute,
