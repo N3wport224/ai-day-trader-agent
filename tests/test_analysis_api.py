@@ -202,3 +202,21 @@ async def test_analysis_job_delete_is_persistent(
     )
 
     assert portfolio_manager.get_analysis_job("delete-me", current_user.id) is None
+
+
+def test_pipeline_config_is_isolated_per_instance(
+    monkeypatch,
+    portfolio_manager: PortfolioManager,
+) -> None:
+    from config.settings import trading_config
+
+    monkeypatch.setattr("core.pipeline.get_portfolio_manager", lambda: portfolio_manager)
+    user = portfolio_manager.get_user_by_username("api-user")
+    portfolio_manager.create_portfolio("small", 1234.0, user_id=user["id"])
+    shared_capital = trading_config.TRADING_CAPITAL
+
+    pipeline = EnhancedTradingPipeline("AAPL", "small", user_id=user["id"])
+    pipeline.config.TRADING_CAPITAL = 999999.0
+
+    assert trading_config.TRADING_CAPITAL == shared_capital
+    assert EnhancedTradingPipeline("AAPL", "small", user_id=user["id"]).config.TRADING_CAPITAL == 1234.0

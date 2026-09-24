@@ -22,7 +22,7 @@ def main():
     """Start the API server with production-ready settings."""
     
     # Get configuration from environment or use defaults
-    host = os.getenv("API_HOST", "0.0.0.0")
+    host = os.getenv("API_HOST", "127.0.0.1")
     port = int(os.getenv("API_PORT", "8000"))
     reload = os.getenv("API_RELOAD", "false").lower() == "true"
     workers = int(os.getenv("API_WORKERS", "1"))
@@ -30,9 +30,9 @@ def main():
     
     # Security warning for JWT secret
     jwt_secret = os.getenv("JWT_SECRET_KEY")
-    if not jwt_secret or jwt_secret == "dev_secret_key_for_testing_only_change_in_production":
-        print("\n⚠️  WARNING: Using default JWT secret key!")
-        print("   Set JWT_SECRET_KEY environment variable for production use.")
+    if not jwt_secret:
+        print("\n⚠️  WARNING: JWT_SECRET_KEY is not set; using a random per-process key.")
+        print("   Logins reset on restart and break with multiple workers.")
         print("   Generate a secure key with: openssl rand -hex 32\n")
     
     print(f"""

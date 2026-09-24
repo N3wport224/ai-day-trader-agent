@@ -62,7 +62,8 @@ Add to your `.env` file:
 JWT_SECRET_KEY=$(openssl rand -hex 32)
 
 # Optional API configuration
-API_HOST=0.0.0.0
+# 127.0.0.1 (default) keeps the API local; only use 0.0.0.0 behind a firewall/proxy
+API_HOST=127.0.0.1
 API_PORT=8000
 API_WORKERS=4
 API_LOG_LEVEL=info
@@ -77,7 +78,7 @@ python api_server.py
 API_RELOAD=true python api_server.py
 
 # Custom configuration
-API_HOST=0.0.0.0 API_PORT=8080 API_WORKERS=4 python api_server.py
+API_HOST=127.0.0.1 API_PORT=8080 API_WORKERS=4 python api_server.py
 ```
 
 ### 4. Access the API
@@ -146,6 +147,12 @@ Content-Type: application/json
 
 ### Register New User
 
+Registration is disabled by default (returns `403`) because every account can
+use the server's Alpaca account. Create accounts with
+`python scripts/create_admin.py`, or set `ALLOW_REGISTRATION=true` to allow
+self-service signup. Registered users are never admins: they can't submit
+Alpaca orders or claim portfolios created from the CLI.
+
 ```http
 POST /api/auth/register
 Content-Type: application/json
@@ -165,7 +172,7 @@ Content-Type: application/json
 |--------|----------|-------------|
 | POST | `/api/auth/login` | Login and get JWT tokens |
 | POST | `/api/auth/refresh` | Refresh access token |
-| POST | `/api/auth/register` | Register new user |
+| POST | `/api/auth/register` | Register new user (requires `ALLOW_REGISTRATION=true`) |
 | GET | `/api/auth/me` | Get current user info |
 | POST | `/api/auth/logout` | Logout (client-side) |
 
@@ -216,8 +223,8 @@ Content-Type: application/json
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | GET | `/api/trading/provider-status` | Show market data provider order and configured providers without exposing secrets |
-| GET | `/api/trading/alpaca/account` | Check Alpaca paper account status, buying power, equity, and market clock |
-| POST | `/api/trading/paper-order` | Submit a direct BUY/SELL order to Alpaca paper trading |
+| GET | `/api/trading/alpaca/account` | Check Alpaca paper account status, buying power, equity, and market clock (admin only) |
+| POST | `/api/trading/paper-order` | Submit a direct BUY/SELL order to Alpaca paper trading (admin only) |
 | POST | `/api/trading/analyze-and-paper-trade` | Run analysis and optionally submit an actionable result to Alpaca paper trading |
 
 ### System Endpoints
@@ -417,13 +424,14 @@ API_RELOAD=true python api_server.py
 
 ```bash
 # API Server
-API_HOST=0.0.0.0
+API_HOST=127.0.0.1
 API_PORT=8000
 API_WORKERS=4
 API_LOG_LEVEL=info
 
-# Security
+# Security (required; without it logins reset on every restart)
 JWT_SECRET_KEY=your-secret-key-here
+ALLOW_REGISTRATION=false
 
 # Generate a secure key
 openssl rand -hex 32

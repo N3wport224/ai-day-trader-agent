@@ -22,7 +22,7 @@ from core.pipeline import EnhancedTradingPipeline
 from core.portfolio_manager import PortfolioManager
 from config.env_loader import load_env_variables
 from config.api.auth import get_current_active_user, User
-from config.api.dependencies import get_portfolio_manager
+from config.api.dependencies import claim_legacy_portfolios, get_portfolio_manager
 from utils.formatter import format_analysis_result
 
 # Logging
@@ -361,7 +361,7 @@ async def analyze_symbol(
     """
     # Verify portfolio exists if specified
     if request.portfolio_name and request.portfolio_name != "default":
-        await run_in_threadpool(db.claim_unowned_portfolios, current_user.id)
+        await claim_legacy_portfolios(db, current_user)
         portfolio = await run_in_threadpool(
             db.get_portfolio,
             request.portfolio_name,
@@ -406,7 +406,7 @@ async def analyze_batch(
     """
     # Verify portfolio exists if specified
     if request.portfolio_name and request.portfolio_name != "default":
-        await run_in_threadpool(db.claim_unowned_portfolios, current_user.id)
+        await claim_legacy_portfolios(db, current_user)
         portfolio = await run_in_threadpool(
             db.get_portfolio,
             request.portfolio_name,
@@ -444,7 +444,7 @@ async def analyze_portfolio(
     in the portfolio and returns a job ID to check status.
     """
     # Verify portfolio exists
-    await run_in_threadpool(db.claim_unowned_portfolios, current_user.id)
+    await claim_legacy_portfolios(db, current_user)
     portfolio = await run_in_threadpool(db.get_portfolio, portfolio_name, current_user.id)
     if not portfolio:
         raise HTTPException(
