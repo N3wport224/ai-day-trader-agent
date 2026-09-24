@@ -72,11 +72,15 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
-    market_clock = None
+    market_clock = broker = trailing = None
     if args.execute or os.getenv("ALPACA_API_KEY"):
         from core.alpaca_executor_provider import get_alpaca_executor
+        from core.trailing_stops import TrailingStopManager
 
-        market_clock = get_alpaca_executor().get_clock
+        broker = get_alpaca_executor()
+        market_clock = broker.get_clock
+        # Reconcile every cycle (report-only in dry run); trail stops only when executing.
+        trailing = TrailingStopManager(broker) if args.execute else None
 
     try:
         bot = TradingBot(
@@ -86,6 +90,8 @@ def main(argv: list[str] | None = None) -> int:
             execute=args.execute,
             interval_seconds=args.interval * 60,
             market_clock=market_clock,
+            broker=broker,
+            trailing_manager=trailing,
         )
     except ValueError as exc:
         print(str(exc), file=sys.stderr)

@@ -3,10 +3,11 @@
 Event-driven backtest of the ML trading path.
 
 The backtest reuses the live decision code rather than re-implementing it:
-  features      core/features.compute_features        (causal)
-  signals       core/ml_strategy.MLStrategy.decide     (same thresholds / ATR levels)
-  sizing        core/ml_signal_engine.risk_based_quantity
+  features      core/feature_pipeline.build_feature_frame (causal; regime + MTF)
+  signals       core/ml_strategy.MLStrategy.decide     (same thresholds, gates, ATR levels)
+  sizing        core/risk_manager.risk_pct_for_trade / position_size
   risk checks   core/risk_manager.RiskManager.check_order (same limits)
+  trailing      core/risk_manager.trailing_stop_price  (same rule as the live manager)
 
 and simulates what the broker would do:
   - A decision is made at a bar's close; the order fills at the NEXT
@@ -19,6 +20,8 @@ and simulates what the broker would do:
   - SELL signals exit an open position at the next regular-session open.
   - Intraday decisions happen only on bars that close while the market is
     open (as the live bot only runs while Alpaca's clock says open).
+  - Trailing stops (optional) are recomputed from each bar's high after its
+    exits are processed, so a raised stop only applies from the next bar.
   - One position per symbol; open positions are closed at the final bar.
 """
 
@@ -34,11 +37,17 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 
-from core.features import compute_features
-from core.ml_signal_engine import risk_based_quantity
+from core.feature_pipeline import build_feature_frame, macro_from_primary
 from core.ml_strategy import MLStrategy, _snapshot_from_row
 from core.news_sentiment import SENTIMENT_FEATURES
-from core.risk_manager import RiskManager
+from core.risk_manager import (
+    RiskManager,
+    SizingConfig,
+    TrailingConfig,
+    position_size,
+    risk_pct_for_trade,
+    trailing_stop_price,
+)
 
 MARKET_TZ = ZoneInfo("America/New_York")
 SESSION_OPEN, SESSION_CLOSE = time(9, 30), time(16, 0)
@@ -52,6 +61,23 @@ class BacktestConfig:
     commission_per_share: float = 0.0
     bar_length: timedelta = timedelta(hours=1)
     regular_hours_only: bool = True
+    sizing_method: str = "fixed"
+    kelly_fraction: float = 0.25
+    trailing: TrailingConfig = field(default_factory=lambda: TrailingConfig(enabled=False))
+
+    @property
+    def sizing(self) -> SizingConfig:
+        return SizingConfig(
+            method=self.sizing_method, base_risk_pct=self.risk_per_trade_pct, kelly_fraction=self.kelly_fraction
+        )
+
+    @property
+    def timeframe(self) -> str:
+        names = {timedelta(minutes=15): "15Min", timedelta(hours=1): "1Hour", timedelta(days=1): "1Day"}
+        try:
+            return names[self.bar_length]
+        except KeyError as exc:
+            raise ValueError(f"Unsupported bar length {self.bar_length}") from exc
 
 
 @dataclass
@@ -67,6 +93,14 @@ class Trade:
     exit_price: Optional[float] = None
     exit_reason: str = ""
     costs: float = 0.0
+    initial_stop: Optional[float] = None
+    high_water: Optional[float] = None
+
+    def __post_init__(self) -> None:
+        if self.initial_stop is None:
+            self.initial_stop = self.stop
+        if self.high_water is None:
+            self.high_water = self.entry_price
 
     @property
     def pnl(self) -> float:
@@ -74,7 +108,7 @@ class Trade:
 
     @property
     def r_multiple(self) -> float:
-        risk = (self.entry_price - self.stop) * self.quantity
+        risk = (self.entry_price - self.initial_stop) * self.quantity
         return self.pnl / risk if risk > 0 else float("nan")
 
 
@@ -88,6 +122,8 @@ class BacktestResult:
     benchmark_return: float
     config: BacktestConfig
     metrics: Dict[str, float] = field(default_factory=dict)
+    gated: Dict[str, int] = field(default_factory=dict)
+    regime_mix: Dict[str, int] = field(default_factory=dict)
 
     def trades_frame(self) -> pd.DataFrame:
         return pd.DataFrame(
@@ -103,6 +139,7 @@ class BacktestResult:
                     "exit_time": t.exit_time,
                     "exit_price": round(t.exit_price, 4),
                     "exit_reason": t.exit_reason,
+                    "initial_stop": t.initial_stop,
                     "pnl": round(t.pnl, 2),
                     "r_multiple": round(t.r_multiple, 3),
                 }
@@ -153,14 +190,25 @@ class Backtester:
         bars: Dict[str, pd.DataFrame],
         sentiment: Optional[Dict[str, pd.DataFrame]] = None,
         start: Optional[pd.Timestamp] = None,
+        macro_bars: Optional[Dict[str, pd.DataFrame]] = None,
     ) -> BacktestResult:
-        """Simulate from ``start`` (default: first bar). Earlier bars only warm up indicators."""
+        """Simulate from ``start`` (default: first bar). Earlier bars only warm up indicators.
+
+        ``macro_bars`` are higher-timeframe bars per symbol (daily for intraday
+        runs). If the strategy needs them and none are given, they are
+        resampled from the primary bars.
+        """
         cfg = self.config
         slip = cfg.slippage_bps / 10_000
+        sizing = cfg.sizing
+        calibrated = self.strategy.mode == "model"
 
         prepared: Dict[str, pd.DataFrame] = {}
         for symbol, frame in bars.items():
-            feats = compute_features(frame)
+            macro = (macro_bars or {}).get(symbol)
+            if macro is None and self.strategy.uses_macro:
+                macro = macro_from_primary(frame, cfg.timeframe)
+            feats = build_feature_frame(frame, cfg.timeframe, macro_bars=macro)
             sent = (sentiment or {}).get(symbol)
             if sent is None:
                 sent = pd.DataFrame(np.nan, index=feats.index, columns=SENTIMENT_FEATURES)
@@ -183,6 +231,8 @@ class Backtester:
         blocked: Dict[str, int] = {}
         signals = {"BUY": 0, "SELL": 0, "HOLD": 0}
         skipped_outside_session = 0
+        gated: Dict[str, int] = {}
+        regime_mix: Dict[str, int] = {}
         equity_points: Dict[pd.Timestamp, float] = {}
         entries_by_day: Dict[object, int] = {}
         prev_day_equity: Optional[float] = None
@@ -242,18 +292,31 @@ class Backtester:
                     # 2. Bracket legs (the entry bar included).
                     trade = positions.get(symbol)
                     if trade:
+                        stop_kind = "trailing_stop" if trade.stop > trade.initial_stop else "stop"
                         if o <= trade.stop:
-                            close_position(symbol, ts, o, "stop_gap", slipped=True)
+                            close_position(symbol, ts, o, f"{stop_kind}_gap", slipped=True)
                         elif o >= trade.target:
                             close_position(symbol, ts, o, "target_gap", slipped=False)
                         elif l <= trade.stop:
-                            close_position(symbol, ts, trade.stop, "stop", slipped=True)
+                            close_position(symbol, ts, trade.stop, stop_kind, slipped=True)
                         elif h >= trade.target:
                             close_position(symbol, ts, trade.target, "target", slipped=False)
 
+                    # 3. Trail the stop for positions still open (effective next bar).
+                    trade = positions.get(symbol)
+                    if trade and cfg.trailing.enabled:
+                        trade.high_water = max(trade.high_water, h)
+                        trade.stop = trailing_stop_price(
+                            entry=trade.entry_price,
+                            initial_stop=trade.initial_stop,
+                            current_stop=trade.stop,
+                            high_water=trade.high_water,
+                            config=cfg.trailing,
+                        )
+
                 last_close[symbol] = c
 
-                # 3. Decide at this bar's close.
+                # 4. Decide at this bar's close.
                 if not np.isfinite(row["p_up"]):
                     continue
                 if not _can_decide(ts, cfg):
@@ -263,6 +326,9 @@ class Backtester:
                     continue
                 signal = self.strategy.decide(float(row["p_up"]), row, _snapshot_from_row(row))
                 signals[signal.signal] += 1
+                regime_mix[signal.regime or "n/a"] = regime_mix.get(signal.regime or "n/a", 0) + 1
+                if signal.gated_by:
+                    gated[signal.gated_by] = gated.get(signal.gated_by, 0) + 1
 
                 if signal.signal == "SELL" and symbol in positions:
                     pending_exits.add(symbol)
@@ -271,7 +337,18 @@ class Backtester:
                     # Live orders fill at once and consume buying power; queued
                     # backtest orders must reserve it until the next open.
                     reserved = sum(o["quantity"] * o["price"] * (1 + slip) for o in pending_entries.values())
-                    qty = risk_based_quantity(eq, cfg.risk_per_trade_pct, signal.stop_distance)
+                    risk_pct = risk_pct_for_trade(
+                        sizing,
+                        probability=signal.probability_up,
+                        reward_risk=(signal.target_distance / signal.stop_distance) if signal.stop_distance else None,
+                        atr_pct=row.get("atr_pct"),
+                        atr_pct_median=row.get("atr_pct_median"),
+                        calibrated=calibrated,
+                    )
+                    if risk_pct <= 0:
+                        gated["kelly_no_edge"] = gated.get("kelly_no_edge", 0) + 1
+                        continue
+                    qty = position_size(eq, risk_pct, signal.stop_distance)
                     decision = self.risk_manager.check_order(
                         side="BUY",
                         symbol=symbol,
@@ -321,6 +398,8 @@ class Backtester:
             benchmark_return=float(np.mean(benchmark)) if benchmark else float("nan"),
             config=cfg,
         )
+        result.gated = gated
+        result.regime_mix = regime_mix
         result.metrics = compute_metrics(result)
         result.metrics["exposure_pct"] = round(bars_in_market / len(timeline) * 100, 1) if timeline else 0.0
         return result
@@ -371,6 +450,18 @@ def format_report(result: BacktestResult, title: str = "Backtest") -> str:
     if result.blocked:
         lines.append(f"Blocked by risk:   {result.blocked}")
     lines.append(f"BUY-level signals outside market hours (not traded): {result.skipped_outside_session}")
+    if result.gated:
+        lines.append(f"Entries vetoed by gates: {result.gated}")
+    if result.regime_mix:
+        total = sum(result.regime_mix.values())
+        mix = ", ".join(f"{k} {v / total:.0%}" for k, v in sorted(result.regime_mix.items()))
+        lines.append(f"Regime mix (decision bars): {mix}")
+    cfg = result.config
+    trailing = (
+        f"on (trigger {cfg.trailing.trigger_r}R, lock {cfg.trailing.lock_r}R, trail {cfg.trailing.distance_r}R)"
+        if cfg.trailing.enabled else "off"
+    )
+    lines.append(f"Sizing: {cfg.sizing_method} ({cfg.risk_per_trade_pct}% base risk); trailing stops: {trailing}")
     exits: Dict[str, int] = {}
     for t in result.trades:
         exits[t.exit_reason] = exits.get(t.exit_reason, 0) + 1

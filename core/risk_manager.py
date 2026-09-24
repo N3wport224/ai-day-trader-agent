@@ -185,6 +185,10 @@ class RiskManager:
             take_profit=take_profit,
         )
 
+    def bracket_prices(self, price: float) -> tuple[Optional[float], Optional[float]]:
+        """Stop/target from the configured percentages around ``price``."""
+        return self._bracket_prices(price, None, None)
+
     def _bracket_prices(
         self,
         price: float,
@@ -207,3 +211,135 @@ class RiskManager:
         if not (0 < stop <= price - tick) or target < price + tick:
             return None, None
         return stop, target
+
+
+# ---------------------------------------------------------------------------
+# Position sizing (the size *requested*; check_order still caps it)
+# ---------------------------------------------------------------------------
+
+SIZING_METHODS = ("fixed", "volatility", "kelly")
+
+
+@dataclass(frozen=True)
+class SizingConfig:
+    """POSITION_SIZING_METHOD: fixed | volatility | kelly.
+
+    fixed       risk ``base_risk_pct`` of equity between entry and stop.
+    volatility  scale that risk by median(ATR%) / current ATR%, clipped to
+                [vol_scale_min, vol_scale_max]: less risk when the symbol is
+                unusually volatile, more when it is unusually calm.
+    kelly       fractional Kelly on the model's calibrated probability, capped
+                at ``base_risk_pct`` (Kelly can only shrink the bet), then
+                volatility-scaled. Uncalibrated (heuristic) probabilities fall
+                back to ``volatility``.
+    """
+
+    method: str = "fixed"
+    base_risk_pct: float = 1.0
+    kelly_fraction: float = 0.25
+    vol_scale_min: float = 0.5
+    vol_scale_max: float = 1.5
+
+    def __post_init__(self) -> None:
+        if self.method not in SIZING_METHODS:
+            raise ValueError(f"POSITION_SIZING_METHOD must be one of {SIZING_METHODS}")
+
+    @classmethod
+    def from_env(cls) -> "SizingConfig":
+        return cls(
+            method=os.getenv("POSITION_SIZING_METHOD", "fixed").strip().lower(),
+            base_risk_pct=_env_float("RISK_PER_TRADE_PCT", 1.0),
+            kelly_fraction=_env_float("KELLY_FRACTION", 0.25),
+            vol_scale_min=_env_float("VOL_SCALE_MIN", 0.5),
+            vol_scale_max=_env_float("VOL_SCALE_MAX", 1.5),
+        )
+
+
+def volatility_scale(atr_pct: Optional[float], atr_pct_median: Optional[float], lo: float = 0.5, hi: float = 1.5) -> float:
+    """median / current ATR%, clipped. 1.0 when either value is unknown."""
+    cur, med = _to_float(atr_pct), _to_float(atr_pct_median)
+    if not (cur > 0 and med > 0) or cur != cur or med != med:
+        return 1.0
+    return max(lo, min(hi, med / cur))
+
+
+def kelly_fraction_of_equity(probability: float, reward_risk: float) -> float:
+    """Full-Kelly fraction f* = p - (1 - p) / b for a win of b R vs a loss of 1 R."""
+    if reward_risk <= 0:
+        return 0.0
+    return probability - (1 - probability) / reward_risk
+
+
+def risk_pct_for_trade(
+    config: SizingConfig,
+    *,
+    probability: Optional[float],
+    reward_risk: Optional[float],
+    atr_pct: Optional[float],
+    atr_pct_median: Optional[float],
+    calibrated: bool,
+) -> float:
+    """Percent of equity to put at risk between entry and stop."""
+    scale = volatility_scale(atr_pct, atr_pct_median, config.vol_scale_min, config.vol_scale_max)
+    if config.method == "fixed":
+        return config.base_risk_pct
+    if config.method == "kelly" and calibrated and probability is not None and reward_risk:
+        kelly_pct = config.kelly_fraction * kelly_fraction_of_equity(probability, reward_risk) * 100
+        if kelly_pct <= 0:
+            return 0.0  # the model's own odds say this bet has no edge
+        return min(config.base_risk_pct, kelly_pct) * scale
+    return config.base_risk_pct * scale
+
+
+def position_size(equity: float, risk_pct: float, stop_distance: Optional[float]) -> int:
+    """Shares such that a stop-out loses ``risk_pct`` of equity."""
+    stop_distance = _to_float(stop_distance)
+    if stop_distance <= 0 or equity <= 0 or risk_pct <= 0:
+        return 0
+    return max(0, int(equity * risk_pct / 100 // stop_distance))
+
+
+# ---------------------------------------------------------------------------
+# Trailing protection for winners
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class TrailingConfig:
+    """Once price has moved ``trigger_r`` R in favour, raise the stop to
+    entry + ``lock_r`` R (breakeven by default), then trail it ``distance_r``
+    R below the highest price seen. Stops only ever move up."""
+
+    enabled: bool = True
+    trigger_r: float = 1.5
+    lock_r: float = 0.0
+    distance_r: Optional[float] = 1.5
+
+    @classmethod
+    def from_env(cls) -> "TrailingConfig":
+        distance = os.getenv("TRAILING_STOP_DISTANCE_R", "1.5").strip()
+        return cls(
+            enabled=_env_bool("TRAILING_STOP_ENABLED", True),
+            trigger_r=_env_float("TRAILING_STOP_TRIGGER_R", 1.5),
+            lock_r=_env_float("TRAILING_STOP_LOCK_R", 0.0),
+            distance_r=float(distance) if distance not in {"", "none", "off"} else None,
+        )
+
+
+def trailing_stop_price(
+    *,
+    entry: float,
+    initial_stop: float,
+    current_stop: float,
+    high_water: float,
+    config: TrailingConfig,
+) -> float:
+    """New stop for a long position (never lower than ``current_stop``)."""
+    risk = entry - initial_stop
+    if not config.enabled or risk <= 0:
+        return current_stop
+    if (high_water - entry) / risk < config.trigger_r:
+        return current_stop
+    new_stop = entry + config.lock_r * risk
+    if config.distance_r is not None:
+        new_stop = max(new_stop, high_water - config.distance_r * risk)
+    return max(current_stop, round_price(new_stop))

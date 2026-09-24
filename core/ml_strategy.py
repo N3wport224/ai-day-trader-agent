@@ -39,12 +39,16 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import pandas as pd
 
-from core.features import TECHNICAL_FEATURES
+from core.features import MACRO_FEATURES, TECHNICAL_FEATURES
 from core.news_sentiment import SENTIMENT_FEATURES, UNAVAILABLE, SentimentSnapshot
+from core.regime import TRENDING_BULL
 
 logger = logging.getLogger(__name__)
 
 FEATURE_COLUMNS = TECHNICAL_FEATURES + SENTIMENT_FEATURES
+# Optional inputs a model may be trained with (scripts/train_model.py --mtf).
+KNOWN_FEATURES = FEATURE_COLUMNS + MACRO_FEATURES
+REGIME_POLICIES = ("off", "suppress", "penalty")
 ARTIFACT_VERSION = 1
 DEFAULT_MODEL_PATH = "models/ml_signal.joblib"
 
@@ -63,6 +67,9 @@ class MLSignal:
     target_distance: Optional[float]
     sentiment: SentimentSnapshot
     reasons: List[str] = field(default_factory=list)
+    regime: Optional[str] = None          # TRENDING_BULL / TRENDING_BEAR / CHOPPY / UNKNOWN
+    macro_aligned: Optional[float] = None  # 1.0 if aligned with the daily trend, 0.0 if not
+    gated_by: Optional[str] = None        # "regime" or "mtf" when a BUY was vetoed
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -78,6 +85,9 @@ class MLSignal:
             "sentiment_articles": self.sentiment.article_count,
             "sentiment_available": self.sentiment.available,
             "reasons": list(self.reasons),
+            "regime": self.regime,
+            "macro_aligned": self.macro_aligned,
+            "gated_by": self.gated_by,
         }
 
 
@@ -88,14 +98,23 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
-def feature_vector(features: pd.DataFrame, sentiment: SentimentSnapshot) -> pd.DataFrame:
+def feature_vector(
+    features: pd.DataFrame,
+    sentiment: SentimentSnapshot,
+    columns: Optional[List[str]] = None,
+) -> pd.DataFrame:
     """One-row model input from the latest completed bar plus sentiment."""
     if features.empty:
         raise ValueError("No completed bars to build features from")
-    row = features.iloc[[-1]][TECHNICAL_FEATURES].copy()
+    columns = columns or FEATURE_COLUMNS
+    bar_columns = [c for c in columns if c not in SENTIMENT_FEATURES]
+    missing = [c for c in bar_columns if c not in features.columns]
+    if missing:
+        raise ValueError(f"Features missing columns the model needs: {missing}")
+    row = features.iloc[[-1]][bar_columns].copy()
     for name, value in sentiment.as_features().items():
         row[name] = value
-    return row[FEATURE_COLUMNS].astype(float)
+    return row[columns].astype(float)
 
 
 def load_artifact(path: str | os.PathLike) -> Optional[Dict[str, Any]]:
@@ -117,7 +136,8 @@ def load_artifact(path: str | os.PathLike) -> Optional[Dict[str, Any]]:
     if not isinstance(artifact, dict) or artifact.get("version") != ARTIFACT_VERSION:
         logger.error(f"Model artifact {path} has an unsupported format; retrain it")
         return None
-    if list(artifact.get("feature_columns", [])) != FEATURE_COLUMNS:
+    columns = list(artifact.get("feature_columns", []))
+    if not columns or not set(columns) <= set(KNOWN_FEATURES) or not set(FEATURE_COLUMNS) <= set(columns):
         logger.error(f"Model artifact {path} was trained on different features; retrain it")
         return None
     return artifact
@@ -144,6 +164,9 @@ class MLStrategy:
         stop_atr_mult: Optional[float] = None,
         target_atr_mult: Optional[float] = None,
         exit_threshold: Optional[float] = None,
+        regime_policy: Optional[str] = None,
+        regime_bump: Optional[float] = None,
+        mtf_confirmation: Optional[bool] = None,
     ) -> None:
         if artifact is None:
             artifact = load_artifact(model_path or os.getenv("ML_MODEL_PATH", DEFAULT_MODEL_PATH))
@@ -165,6 +188,22 @@ class MLStrategy:
             raise ValueError("ML_EXIT_THRESHOLD must be between 0 and ML_CONFIDENCE_THRESHOLD")
         self.exit_threshold = exit_threshold
 
+        # Entry gates (longs only; exits are never blocked).
+        policy = (regime_policy or os.getenv("REGIME_FILTER", "penalty")).strip().lower()
+        if policy not in REGIME_POLICIES:
+            raise ValueError(f"REGIME_FILTER must be one of {REGIME_POLICIES}")
+        self.regime_policy = policy
+        self.regime_bump = regime_bump if regime_bump is not None else _env_float("REGIME_THRESHOLD_BUMP", 0.10)
+        if mtf_confirmation is None:
+            mtf_confirmation = os.getenv("MTF_CONFIRMATION", "false").strip().lower() in {"1", "true", "yes", "on"}
+        self.mtf_confirmation = mtf_confirmation
+        self.feature_columns = list((artifact or {}).get("feature_columns") or FEATURE_COLUMNS)
+
+    @property
+    def uses_macro(self) -> bool:
+        """True when the model or the MTF gate needs daily-timeframe features."""
+        return self.mtf_confirmation or any(c in MACRO_FEATURES for c in self.feature_columns)
+
     @property
     def mode(self) -> str:
         return "model" if self.artifact else "heuristic"
@@ -175,7 +214,9 @@ class MLStrategy:
         reasons: List[str] = []
         if self.artifact:
             probability_up = float(
-                self.artifact["pipeline"].predict_proba(feature_vector(features, sentiment))[0, 1]
+                self.artifact["pipeline"].predict_proba(
+                    feature_vector(features, sentiment, self.feature_columns)
+                )[0, 1]
             )
             reasons.append(f"model P(target before stop)={probability_up:.2f}")
         else:
@@ -190,7 +231,8 @@ class MLStrategy:
         is causal.
         """
         if self.artifact:
-            vectors = features[TECHNICAL_FEATURES].join(sentiment[SENTIMENT_FEATURES])[FEATURE_COLUMNS]
+            bar_columns = [c for c in self.feature_columns if c not in SENTIMENT_FEATURES]
+            vectors = features[bar_columns].join(sentiment[SENTIMENT_FEATURES])[self.feature_columns]
             return self.artifact["pipeline"].predict_proba(vectors.astype(float))[:, 1]
         return np.array(
             [
@@ -223,6 +265,15 @@ class MLStrategy:
             signal, confidence = "HOLD", probability_up
             reasons.append(f"below confidence threshold {self.threshold:.2f}")
 
+        regime = latest.get("regime") if isinstance(latest.get("regime"), str) else None
+        macro_aligned = latest.get("macro_trend_aligned")
+        macro_aligned = float(macro_aligned) if macro_aligned is not None and pd.notna(macro_aligned) else None
+        gated_by = None
+        if signal == "BUY":
+            gated_by = self._entry_gate(probability_up, regime, macro_aligned, reasons)
+            if gated_by:
+                signal, confidence = "HOLD", probability_up
+
         stop_distance = target_distance = stop_loss = take_profit = None
         if math.isfinite(atr) and atr > 0:
             stop_distance = round(self.stop_atr_mult * atr, 4)
@@ -246,7 +297,35 @@ class MLStrategy:
             target_distance=target_distance,
             sentiment=sentiment,
             reasons=reasons,
+            regime=regime,
+            macro_aligned=macro_aligned,
+            gated_by=gated_by,
         )
+
+    def _entry_gate(
+        self,
+        probability_up: float,
+        regime: Optional[str],
+        macro_aligned: Optional[float],
+        reasons: List[str],
+    ) -> Optional[str]:
+        """Return "regime"/"mtf" if a long entry should be vetoed, else None."""
+        if regime is not None and self.regime_policy != "off" and regime != TRENDING_BULL:
+            if self.regime_policy == "suppress":
+                reasons.append(f"{regime} regime: long entries suppressed")
+                return "regime"
+            required = min(0.99, self.threshold + self.regime_bump)
+            if probability_up < required:
+                reasons.append(f"{regime} regime requires P >= {required:.2f}")
+                return "regime"
+            reasons.append(f"{regime} regime: cleared raised threshold {required:.2f}")
+        if self.mtf_confirmation and macro_aligned != 1.0:
+            reasons.append(
+                "not aligned with the daily trend (needs close > daily EMA50 and daily EMA20 > EMA50)"
+                if macro_aligned == 0.0 else "daily trend unavailable; no MTF confirmation"
+            )
+            return "mtf"
+        return None
 
     @staticmethod
     def _heuristic_probability(latest: pd.Series, sentiment: SentimentSnapshot, reasons: List[str]) -> float:

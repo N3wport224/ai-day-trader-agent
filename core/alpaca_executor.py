@@ -20,6 +20,7 @@ from zoneinfo import ZoneInfo
 import requests
 from dotenv import load_dotenv
 
+from core.execution_telemetry import EventLog, Rejection, classify_rejection
 from core.risk_manager import RiskManager
 
 load_dotenv()
@@ -35,6 +36,35 @@ class ExecutionResult:
 
     order: Optional[Dict[str, Any]] = None
     skipped_reason: Optional[str] = None
+    rejection: Optional[Rejection] = None   # set when the broker refused the order
+    recovered: bool = False                 # True when a retry after a rejection succeeded
+
+
+@dataclass(frozen=True)
+class BrokerSnapshot:
+    positions: List[Dict[str, Any]]
+    open_orders: List[Dict[str, Any]]
+
+
+def flatten_orders(orders: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Include nested bracket legs as top-level entries (deduplicated by id)."""
+    flat: Dict[str, Dict[str, Any]] = {}
+    for order in orders or []:
+        flat[order.get("id") or str(len(flat))] = order
+        for leg in order.get("legs") or []:
+            if leg.get("status") not in {"filled", "canceled", "expired", "replaced", "rejected"}:
+                flat[leg.get("id") or str(len(flat))] = {**leg, "parent_id": order.get("id")}
+    return list(flat.values())
+
+
+def protective_stop_orders(open_orders: List[Dict[str, Any]], symbol: str) -> List[Dict[str, Any]]:
+    """Working sell-side stop orders for ``symbol``."""
+    return [
+        o for o in open_orders
+        if o.get("symbol") == symbol
+        and str(o.get("side", "")).lower() == "sell"
+        and str(o.get("type", o.get("order_type", ""))).lower() in {"stop", "stop_limit", "trailing_stop"}
+    ]
 
 
 def _default_price_lookup(symbol: str) -> float:
@@ -58,8 +88,10 @@ class AlpacaExecutor:
         base_url: Optional[str] = None,
         risk_manager: Optional[RiskManager] = None,
         price_lookup: Optional[Callable[[str], float]] = None,
+        telemetry: Optional[EventLog] = None,
     ):
         self.risk_manager = risk_manager or RiskManager()
+        self.telemetry = telemetry or EventLog.from_env()
         self.price_lookup = price_lookup or _default_price_lookup
         self.api_key = os.getenv("ALPACA_API_KEY")
         self.secret_key = os.getenv("ALPACA_SECRET_KEY")
@@ -235,8 +267,80 @@ class AlpacaExecutor:
             )
             return ExecutionResult(order=order)
         except requests.exceptions.HTTPError as exc:
-            detail = exc.response.text if exc.response is not None else str(exc)
-            return ExecutionResult(skipped_reason=f"Alpaca rejected the order: {detail}")
+            return self._recover_from_rejection(exc, action, symbol, decision.quantity, price)
+
+    # ------------------------------------------------------------------
+    # Rejection handling
+    # ------------------------------------------------------------------
+
+    def _rejection(self, exc: requests.exceptions.HTTPError, **context: Any) -> Rejection:
+        response = exc.response
+        status = getattr(response, "status_code", None) if response is not None else None
+        body = getattr(response, "text", "") if response is not None else str(exc)
+        rejection = classify_rejection(status, body or str(exc))
+        self.telemetry.record("order_rejected", logging.WARNING, **context, **rejection.as_dict())
+        return rejection
+
+    def _recover_from_rejection(
+        self,
+        exc: requests.exceptions.HTTPError,
+        action: str,
+        symbol: str,
+        quantity: int,
+        price: float,
+    ) -> ExecutionResult:
+        """Classify the rejection, log it, and retry once when a safe fix exists."""
+        rejection = self._rejection(exc, symbol=symbol, side=action, qty=quantity, attempt=1)
+        retry: Optional[Callable[[], Dict]] = None
+        plan = ""
+
+        if action == "BUY" and rejection.category == "buying_power":
+            buying_power = float(self.get_account().get("buying_power") or 0)
+            affordable = int(buying_power * 0.97 // price) if price > 0 else 0
+            if 0 < affordable < quantity:
+                stop, target = self.risk_manager.bracket_prices(price)
+                if stop is not None:
+                    plan = f"retry with {affordable} shares (buying power ${buying_power:,.2f})"
+                    retry = lambda: self._place_bracket_order(symbol, affordable, stop, target)  # noqa: E731
+        elif action == "BUY" and rejection.category == "invalid_price":
+            try:
+                fresh = float(self.price_lookup(symbol) or 0)
+            except Exception:
+                fresh = 0.0
+            stop, target = self.risk_manager.bracket_prices(fresh) if fresh > 0 else (None, None)
+            if stop is not None:
+                plan = f"retry with levels from fresh quote ${fresh:.2f}: stop {stop}, target {target}"
+                retry = lambda: self._place_bracket_order(symbol, quantity, stop, target)  # noqa: E731
+        elif action == "SELL" and rejection.category in {"wash_trade", "qty_held"}:
+            self.cancel_open_orders(symbol)
+            position = self.get_position(symbol) or {}
+            available = int(float(position.get("qty_available") or position.get("qty") or 0))
+            sell_qty = min(quantity, available)
+            if sell_qty > 0:
+                plan = f"cancelled open {symbol} orders; retry selling {sell_qty}"
+                retry = lambda: self._place_order(symbol, sell_qty, "sell")  # noqa: E731
+
+        if retry is None:
+            return ExecutionResult(
+                skipped_reason=f"Alpaca rejected the order ({rejection.category}): {rejection.message}",
+                rejection=rejection,
+            )
+
+        self.telemetry.record("order_retry", symbol=symbol, side=action, category=rejection.category, plan=plan)
+        try:
+            order = retry()
+        except requests.exceptions.HTTPError as retry_exc:
+            second = self._rejection(retry_exc, symbol=symbol, side=action, qty=quantity, attempt=2)
+            return ExecutionResult(
+                skipped_reason=(
+                    f"Alpaca rejected the order ({rejection.category}) and the retry ({second.category}): "
+                    f"{second.message}"
+                ),
+                rejection=second,
+            )
+        self.telemetry.record("order_recovered", symbol=symbol, side=action, category=rejection.category,
+                              order_id=order.get("id"), plan=plan)
+        return ExecutionResult(order=order, rejection=rejection, recovered=True)
 
     def _place_order(
         self,
@@ -359,6 +463,35 @@ class AlpacaExecutor:
         resp.raise_for_status()
         logger.info("All open orders cancelled")
         return resp.json() if resp.text else []
+
+    # ------------------------------------------------------------------
+    # Broker state (reconciliation / trailing stops)
+    # ------------------------------------------------------------------
+
+    def get_open_orders(self) -> List[Dict]:
+        """All open orders with bracket legs flattened into the list."""
+        resp = requests.get(
+            f"{self.base_url}/orders",
+            headers=self.headers,
+            params={"status": "open", "nested": "true", "limit": 500},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        return flatten_orders(resp.json())
+
+    def get_snapshot(self) -> "BrokerSnapshot":
+        return BrokerSnapshot(positions=self.get_positions(), open_orders=self.get_open_orders())
+
+    def replace_stop_price(self, order_id: str, stop_price: float) -> Dict:
+        """Move a working stop order (e.g. a bracket stop leg) to a new price."""
+        resp = requests.patch(
+            f"{self.base_url}/orders/{order_id}",
+            headers=self.headers,
+            json={"stop_price": str(stop_price)},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        return resp.json()
 
     def cancel_open_orders(self, symbol: str) -> int:
         """Cancel open orders for one symbol (e.g. bracket legs) before an exit."""

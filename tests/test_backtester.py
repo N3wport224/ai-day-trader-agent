@@ -256,3 +256,58 @@ def test_buy_signals_outside_market_hours_are_counted_not_traded() -> None:
 
     assert result.skipped_outside_session == 1
     assert [t.entry_time for t in result.trades] == [session + timedelta(hours=1)]
+
+
+def test_trailing_stop_locks_breakeven_in_backtest() -> None:
+    from core.risk_manager import TrailingConfig
+
+    bars = _flat_bars(n=45)
+    # Entry ~100 on bar 31 (ATR ~1 -> stop ~99, target ~102). Bar 32 runs to
+    # +1.8R without touching the target; bar 33 falls back through entry.
+    bars.loc[bars.index[32], ["open", "high", "low", "close"]] = [100.0, 101.8, 99.6, 101.5]
+    bars.loc[bars.index[33], ["open", "high", "low", "close"]] = [101.0, 101.2, 98.0, 98.5]
+    schedule = {bars.index[30]: 0.9}
+
+    def run(trailing):
+        config = BacktestConfig(initial_capital=10_000, bar_length=DAY, slippage_bps=0, trailing=trailing)
+        manager = RiskManager(RiskLimits(min_price=1.0, max_position_pct=1.0))
+        return Backtester(_strategy(schedule), manager, config).run({"AAA": bars}).trades[0]
+
+    plain = run(TrailingConfig(enabled=False))
+    trailed = run(TrailingConfig(enabled=True, trigger_r=1.5, lock_r=0.0, distance_r=None))
+
+    assert plain.exit_reason == "stop" and plain.r_multiple == pytest.approx(-1.0, abs=0.05)
+    assert trailed.exit_reason == "trailing_stop"
+    assert trailed.exit_price == pytest.approx(trailed.entry_price, abs=0.01)
+    assert trailed.initial_stop < trailed.entry_price  # R still measured from the original stop
+
+
+def test_sizing_methods_apply_in_backtest() -> None:
+    bars = _flat_bars()
+    schedule = {bars.index[30]: 0.9}
+
+    def qty(method):
+        config = BacktestConfig(initial_capital=10_000, bar_length=DAY, slippage_bps=0, sizing_method=method,
+                                risk_per_trade_pct=0.5)
+        manager = RiskManager(RiskLimits(min_price=1.0, max_position_pct=1.0))
+        return Backtester(_strategy(schedule), manager, config).run({"AAA": bars}).trades[0].quantity
+
+    assert qty("fixed") == 50        # 0.5% of $10k over a 1 ATR stop
+    assert qty("kelly") == 50        # strong edge: Kelly capped at the base risk
+
+
+def test_backtest_cli_compare_runs_baseline_and_enhanced(tmp_path: Path) -> None:
+    from scripts import backtest
+
+    out = tmp_path / "cmp"
+    code = backtest.main([
+        "--synthetic", "--symbols", "AAA,BBB", "--days", "200", "--threshold", "0.55",
+        "--regime", "suppress", "--mtf", "--mtf-gate", "--sizing", "volatility", "--trailing",
+        "--compare", "--out", str(out),
+    ])
+
+    assert code == 0
+    assert (out / "comparison.csv").exists()
+    assert (out / "baseline" / "summary.json").exists() and (out / "enhanced" / "summary.json").exists()
+    table = pd.read_csv(out / "comparison.csv")
+    assert list(table.columns) == ["metric", "baseline", "enhanced"]
