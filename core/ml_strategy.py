@@ -40,7 +40,7 @@ import numpy as np
 import pandas as pd
 
 from core.features import TECHNICAL_FEATURES
-from core.news_sentiment import SENTIMENT_FEATURES, SentimentSnapshot
+from core.news_sentiment import SENTIMENT_FEATURES, UNAVAILABLE, SentimentSnapshot
 
 logger = logging.getLogger(__name__)
 
@@ -123,6 +123,17 @@ def load_artifact(path: str | os.PathLike) -> Optional[Dict[str, Any]]:
     return artifact
 
 
+def _snapshot_from_row(row: pd.Series) -> SentimentSnapshot:
+    """Inverse of SentimentSnapshot.as_features() for one feature row."""
+    if not row.get("sentiment_available"):
+        return UNAVAILABLE
+    return SentimentSnapshot(
+        score=float(row["sentiment_score"]),
+        article_count=int(row["sentiment_article_count"]),
+        available=True,
+    )
+
+
 class MLStrategy:
     def __init__(
         self,
@@ -161,16 +172,44 @@ class MLStrategy:
     def predict(self, features: pd.DataFrame, sentiment: SentimentSnapshot) -> MLSignal:
         """``features`` is compute_features() output; the last row must be a closed bar."""
         latest = features.iloc[-1]
-        price = float(latest["close"])
-        atr = float(latest.get("atr", float("nan")))
-        vector = feature_vector(features, sentiment)
         reasons: List[str] = []
-
         if self.artifact:
-            probability_up = float(self.artifact["pipeline"].predict_proba(vector)[0, 1])
+            probability_up = float(
+                self.artifact["pipeline"].predict_proba(feature_vector(features, sentiment))[0, 1]
+            )
             reasons.append(f"model P(target before stop)={probability_up:.2f}")
         else:
             probability_up = self._heuristic_probability(latest, sentiment, reasons)
+        return self.decide(probability_up, latest, sentiment, reasons)
+
+    def probabilities(self, features: pd.DataFrame, sentiment: pd.DataFrame) -> np.ndarray:
+        """P(target before stop) for every row at once (backtesting).
+
+        ``sentiment`` has SENTIMENT_FEATURES columns aligned to ``features``.
+        Equivalent to calling predict() on each prefix because every feature
+        is causal.
+        """
+        if self.artifact:
+            vectors = features[TECHNICAL_FEATURES].join(sentiment[SENTIMENT_FEATURES])[FEATURE_COLUMNS]
+            return self.artifact["pipeline"].predict_proba(vectors.astype(float))[:, 1]
+        return np.array(
+            [
+                self._heuristic_probability(row, _snapshot_from_row(sent), [])
+                for (_, row), (_, sent) in zip(features.iterrows(), sentiment.iterrows())
+            ]
+        )
+
+    def decide(
+        self,
+        probability_up: float,
+        latest: pd.Series,
+        sentiment: SentimentSnapshot,
+        reasons: Optional[List[str]] = None,
+    ) -> MLSignal:
+        """Turn a probability for one closed bar into a signal with ATR levels."""
+        reasons = list(reasons or [])
+        price = float(latest["close"])
+        atr = float(latest.get("atr", float("nan")))
 
         if not sentiment.available:
             reasons.append("sentiment unavailable; technical features only")
@@ -197,7 +236,7 @@ class MLStrategy:
         return MLSignal(
             signal=signal,
             confidence=float(confidence),
-            probability_up=probability_up,
+            probability_up=float(probability_up),
             mode=self.mode,
             price=price,
             atr=atr,

@@ -39,6 +39,13 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def risk_based_quantity(capital: float, risk_per_trade_pct: float, stop_distance: Optional[float]) -> int:
+    """Shares such that hitting the stop loses ``risk_per_trade_pct`` of capital."""
+    if not stop_distance or stop_distance <= 0 or capital <= 0:
+        return 0
+    return max(0, int(capital * risk_per_trade_pct / 100 // stop_distance))
+
+
 class MLSignalEngine:
     """Callable with the TradingWorkflow ``AnalysisRunner`` signature."""
 
@@ -85,11 +92,8 @@ class MLSignalEngine:
 
     def _size(self, ml: MLSignal, symbol: str, portfolio_name: str, user_id: Optional[int]) -> int:
         if ml.signal == "BUY":
-            if not ml.stop_distance or ml.stop_distance <= 0:
-                return 0
             capital = self._capital(portfolio_name, user_id)
-            # Risk a fixed % of capital between entry and stop.
-            return max(0, int(capital * self.risk_per_trade_pct / 100 // ml.stop_distance))
+            return risk_based_quantity(capital, self.risk_per_trade_pct, ml.stop_distance)
         if ml.signal == "SELL":
             holdings = self.portfolio_manager.get_holdings(portfolio_name, user_id=user_id) \
                 if self.portfolio_manager.get_portfolio(portfolio_name, user_id=user_id) else []

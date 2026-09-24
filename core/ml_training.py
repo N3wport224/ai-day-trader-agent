@@ -176,6 +176,8 @@ def train(
         "symbols": sorted(datasets),
         "uses_sentiment": bool(data["sentiment_available"].max() > 0),
         "train_base_rate": float(data["label"].mean()),
+        "data_start": data.index.min().isoformat(),
+        "data_end": data.index.max().isoformat(),
         "trained_at": datetime.now(timezone.utc).isoformat(),
         "metrics": metrics,
     }

@@ -230,6 +230,39 @@ expectancy is negative, the model has no edge: keep the bot in dry-run.**
 Retrain after changing `ATR_*_MULT`, the timeframe, or the feature code.
 Use `--strategy classic` to run the original rule-based pipeline.
 
+#### Backtesting
+
+`scripts/backtest.py` replays the whole path on history using the live code:
+the same features, `MLStrategy` decisions, risk-per-trade sizing and
+`RiskManager` checks (with a simulated account), with realistic execution:
+
+- Decide at a bar's close; fill at the **next** bar's open plus slippage.
+- Brackets at the signal's ATR distances around the fill price; a gap through
+  a level fills at the open, and a bar touching both counts as the stop.
+- Intraday: decisions only while the market is open; brackets only trigger in
+  bars overlapping the regular session. Queued orders reserve buying power.
+
+```bash
+# Walk-forward (default): train on the first 60%, trade only the unseen 40%
+python scripts/backtest.py --symbols AAPL,MSFT,NVDA,AMD,SPY --days 730
+
+# Add news sentiment, write trades.csv / equity.csv / summary.json
+python scripts/backtest.py --news --out reports/bt
+
+# A saved model (warns if the test period overlaps its training data)
+python scripts/backtest.py --mode model
+
+# The no-model heuristic, or an offline demo
+python scripts/backtest.py --mode heuristic --timeframe 1Day --days 1500
+python scripts/backtest.py --synthetic
+```
+
+The report shows return vs. equal-weight buy-and-hold, max drawdown, daily
+Sharpe, trade count, win rate, average R, profit factor, exit reasons and how
+often each risk limit blocked an entry. Treat fewer than ~30 trades as
+inconclusive, and only use `--execute` if the walk-forward result beats
+buy-and-hold with positive average R after slippage.
+
 Every order, whether from the bot, the CLI (`--paper-trade`), the API or
 the dashboard, goes through the same safeguards:
 
