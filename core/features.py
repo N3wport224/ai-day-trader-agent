@@ -11,6 +11,8 @@ serves both training and live inference without lookahead bias.
 
 from __future__ import annotations
 
+from typing import Any, Optional
+
 import numpy as np
 import pandas as pd
 
@@ -213,8 +215,27 @@ INTRADAY_FEATURES = [
     "close_vs_orb_high",
     "close_vs_orb_low",
     "orb_range_pct",
+    "close_vs_orb30_high",
+    "close_vs_orb30_low",
+    "orb30_range_pct",
     "minutes_from_open",
 ]
+# Where the close sits against session VWAP (a label for attribution, not a model input).
+VWAP_ZONES = ["below -2σ", "-2σ to -1σ", "-1σ to VWAP", "VWAP to +1σ", "+1σ to +2σ", "above +2σ"]
+
+
+def vwap_zone(z: Any) -> Optional[str]:
+    """The VWAP band a price sits in, from its distance to VWAP in sigma."""
+    try:
+        z = float(z)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(z):
+        return None
+    for edge, label in zip((-2, -1, 0, 1, 2), VWAP_ZONES):
+        if z < edge:
+            return label
+    return VWAP_ZONES[-1]
 _SESSION_OPEN_MIN = 9 * 60 + 30
 _SESSION_CLOSE_MIN = 16 * 60
 
@@ -237,8 +258,11 @@ def add_intraday_features(
       NaN (they aren't part of the anchored session).
     - RVOL: bar volume / mean volume of the same time-of-day bucket over the
       previous ``rvol_sessions`` sessions (today excluded).
-    - Opening range: high/low of the first ``orb_minutes``; NaN until that
-      window has closed. Not defined when bars are longer than the window.
+    - Opening ranges: high/low of the first ``orb_minutes`` (default 15) and of
+      the first 30 minutes; NaN until each window has closed. Not defined when
+      bars are longer than the window.
+    - vwap_dist is the VWAP ratio (close - VWAP) / VWAP; vwap_z the distance in
+      sigma; vwap_zone labels the band (for attribution).
     """
     out = features.copy()
     local = out.index.tz_convert("America/New_York")
@@ -271,22 +295,36 @@ def add_intraday_features(
     )
     out["rvol"] = (out["volume"] / prior_mean.replace(0.0, np.nan)).where(regular)
 
-    # Opening range: only once the window has fully closed.
-    out["orb_high"] = np.nan
-    out["orb_low"] = np.nan
-    if 0 < bar_minutes <= orb_minutes:
-        in_window = regular & (minutes + bar_minutes <= _SESSION_OPEN_MIN + orb_minutes)
-        after_window = regular & (minutes >= _SESSION_OPEN_MIN + orb_minutes)
-        window_high = out["high"].where(in_window).groupby(session).transform("max")
-        window_low = out["low"].where(in_window).groupby(session).transform("min")
-        out["orb_high"] = window_high.where(after_window)
-        out["orb_low"] = window_low.where(after_window)
+    # Opening ranges (15 min by default, and 30 min): only once the window has fully closed.
+    out["orb_high"], out["orb_low"] = _opening_range(out, minutes, regular, session, bar_minutes, orb_minutes)
     out["close_vs_orb_high"] = out["close"] / out["orb_high"] - 1
     out["close_vs_orb_low"] = out["close"] / out["orb_low"] - 1
     out["orb_range_pct"] = (out["orb_high"] - out["orb_low"]) / out["orb_low"]
+    out["orb30_high"], out["orb30_low"] = _opening_range(out, minutes, regular, session, bar_minutes, 30)
+    out["close_vs_orb30_high"] = out["close"] / out["orb30_high"] - 1
+    out["close_vs_orb30_low"] = out["close"] / out["orb30_low"] - 1
+    out["orb30_range_pct"] = (out["orb30_high"] - out["orb30_low"]) / out["orb30_low"]
 
     out["minutes_from_open"] = pd.Series(minutes - _SESSION_OPEN_MIN, index=out.index, dtype=float).where(regular)
-    return out.replace([np.inf, -np.inf], np.nan)
+    out = out.replace([np.inf, -np.inf], np.nan)
+    z = out["vwap_z"]  # label added after the numeric clean-up (text column)
+    out["vwap_zone"] = pd.Series(
+        np.select([z < -2, z < -1, z < 0, z < 1, z < 2, z >= 2], VWAP_ZONES, default=""), index=out.index
+    ).where(z.notna())
+    return out
+
+
+def _opening_range(out, minutes, regular, session, bar_minutes: float, window: int):
+    """(high, low) of the first ``window`` minutes of each session, exposed only
+    on bars that start after the window has closed (no lookahead). NaN when bars
+    are longer than the window."""
+    if not 0 < bar_minutes <= window:
+        return pd.Series(np.nan, index=out.index), pd.Series(np.nan, index=out.index)
+    in_window = regular & (minutes + bar_minutes <= _SESSION_OPEN_MIN + window)
+    after_window = regular & (minutes >= _SESSION_OPEN_MIN + window)
+    high = out["high"].where(in_window).groupby(session).transform("max")
+    low = out["low"].where(in_window).groupby(session).transform("min")
+    return high.where(after_window), low.where(after_window)
 
 
 def bars_from_candles(candles: list[dict]) -> pd.DataFrame:

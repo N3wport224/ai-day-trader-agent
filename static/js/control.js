@@ -672,6 +672,9 @@ const Control = (() => {
       case 'bot_stopped': return ['⏹️', `Bot stopped (${e.reason || 'requested'})`];
       case 'bot_error': return ['❗', `Error: ${e.message}`];
       case 'bot_restarted': return ['🔁', 'Bot restarted automatically'];
+      case 'flatten_fill': return e.status === 'filled' ? ['🌙', `Closed ${e.filled_qty} ${e.symbol} at ${e.fill_price} (${e.filled_at ? new Date(e.filled_at).toLocaleTimeString() : ''})`] : ['⚠️', `${e.symbol} close order ${e.status}`];
+      case 'flat_confirmed': return ['✅', `Flat for the day at ${e.at_et} ET`];
+      case 'not_flat': return ['🚨', `NOT FLAT ${e.minutes_to_close} min before the close: ${(e.positions || []).map((p) => p.symbol).join(', ') || 'open orders'}`];
       case 'edge_gate': return e.passed ? ['✅', 'Validation passes again; new trades allowed'] : ['🚧', `New trades blocked: ${e.reason}`];
       case 'bot_restart_blocked': return ['⚠️', `Bot is down and was not restarted: ${e.reason}`];
       default: return null;

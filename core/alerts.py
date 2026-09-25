@@ -47,6 +47,8 @@ DEFAULT_EVENTS = (
     "bot_restarted",
     "bot_restart_blocked",
     "revalidation",
+    "not_flat",
+    "flat_confirmed",
 )
 
 
@@ -102,6 +104,12 @@ def format_alert(event: Dict[str, Any]) -> Optional[str]:
         return f"▶️ Bot started: {event.get('mode')}, {event.get('timeframe')}, {event.get('symbols')}"
     if name == "bot_stopped":
         return f"⏹️ Bot stopped ({event.get('reason')})"
+    if name == "not_flat":
+        held = ", ".join(f"{p.get('symbol')} {p.get('qty')}" for p in event.get("positions") or []) or "open orders"
+        return (f"🚨 NOT FLAT {event.get('minutes_to_close')} min before the close: {held}. "
+                "Close them in the dashboard (Close everything) or at alpaca.markets.")
+    if name == "flat_confirmed":
+        return f"✅ Flat for the day at {event.get('at_et')} ET"
     if name == "revalidation":
         result = event.get("result")
         if result == "validated":

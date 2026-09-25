@@ -76,7 +76,7 @@ def test_position_cap_shrinks_order_including_existing_holding() -> None:
 
 
 def test_buying_power_limits_size() -> None:
-    manager = RiskManager(RiskLimits(max_position_pct=1.0))
+    manager = RiskManager(RiskLimits(max_position_pct=1.0, margin_buffer_pct=0))
 
     decision = _buy(manager, quantity=50, account={**ACCOUNT, "buying_power": "450"})
 

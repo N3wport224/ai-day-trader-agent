@@ -12,6 +12,7 @@ Usage:
 
 import os
 import logging
+import time as _time
 from dataclasses import dataclass, field
 from datetime import datetime, time, timezone
 from typing import Any, Callable, Dict, List, Optional
@@ -168,6 +169,7 @@ class AlpacaExecutor:
         # order id -> price we expected to fill at (for slippage measurement,
         # see core/fill_quality.py). Bracket legs carry their own stop/limit.
         self.expected_prices: Dict[str, float] = {}
+        self.sleep = _time.sleep  # injectable for tests (flatten fill confirmation)
         self.price_lookup = price_lookup or _default_price_lookup
         mode = (mode or "paper").strip().lower()
         if mode not in TRADING_MODES:
@@ -661,6 +663,7 @@ class AlpacaExecutor:
                 rejection = self._rejection(exc, symbol=symbol, side="close", qty=qty, attempt=1)
                 report.failures.append({"symbol": symbol, **rejection.as_dict()})
 
+        self._confirm_flatten_fills(report)
         self.telemetry.record(
             "flatten",
             logging.WARNING if report.failures else logging.INFO,
@@ -670,6 +673,42 @@ class AlpacaExecutor:
             failures=report.failures,
         )
         return report
+
+    def get_order(self, order_id: str) -> Dict:
+        resp = requests.get(f"{self.base_url}/orders/{order_id}", headers=self.headers, timeout=10)
+        resp.raise_for_status()
+        return resp.json()
+
+    def _confirm_flatten_fills(self, report: "FlattenReport") -> None:
+        """Wait briefly for the closing orders to fill and log each one's exact
+        fill time and price (flatten_fill). Unfilled ones are reported as such;
+        the bot re-checks and retries while the FLATTEN window lasts."""
+        pending = {c["order_id"]: c for c in report.closed if c.get("order_id")}
+        deadline = _time.monotonic() + float(os.getenv("FLATTEN_CONFIRM_SECONDS", "10"))
+        while pending:
+            for order_id, entry in list(pending.items()):
+                try:
+                    order = self.get_order(order_id)
+                except requests.exceptions.RequestException:
+                    continue
+                status = str(order.get("status", "")).lower()
+                if status in {"filled", "canceled", "expired", "rejected", "done_for_day"}:
+                    entry.update(status=status, filled_at=order.get("filled_at"),
+                                 fill_price=float(order["filled_avg_price"]) if order.get("filled_avg_price") else None,
+                                 filled_qty=float(order.get("filled_qty") or 0),
+                                 submitted_at=order.get("submitted_at"))
+                    self.telemetry.record(
+                        "flatten_fill", logging.INFO if status == "filled" else logging.WARNING,
+                        symbol=entry["symbol"], order_id=order_id, status=status, qty=entry.get("qty"),
+                        filled_qty=entry["filled_qty"], fill_price=entry["fill_price"],
+                        submitted_at=entry["submitted_at"], filled_at=entry["filled_at"],
+                    )
+                    del pending[order_id]
+            if not pending or _time.monotonic() >= deadline:
+                break
+            self.sleep(1.0)
+        for entry in pending.values():
+            entry["status"] = "unconfirmed"
 
     def cancel_all_orders(self) -> list:
         """Cancel every open order — useful for end-of-day cleanup."""

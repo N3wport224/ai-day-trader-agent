@@ -54,7 +54,7 @@ from core.market_history import bar_length, get_history  # noqa: E402
 from core.ml_strategy import DEFAULT_MODEL_PATH, REGIME_POLICIES, MLStrategy, load_artifact  # noqa: E402
 from dataclasses import replace  # noqa: E402
 
-from core.market_history import is_intraday, normalize_timeframe  # noqa: E402
+from core.market_history import DEFAULT_TIMEFRAME, default_history_days, is_intraday, normalize_timeframe  # noqa: E402
 from core.session_clock import SessionConfig  # noqa: E402
 from core.ml_training import (  # noqa: E402
     LabelParams,
@@ -370,6 +370,7 @@ def _write_variant_reports(out: Path, results, audit) -> None:
     pd.concat([r.trades_frame() for _, r in results], ignore_index=True).to_csv(out / "trades.csv", index=False)
     attribution(trades, "regime").to_csv(out / "by_regime.csv", index=False)
     attribution(trades, "entry_hour_et").to_csv(out / "by_entry_hour.csv", index=False)
+    attribution(trades, "vwap_zone").to_csv(out / "by_vwap_zone.csv", index=False)
     fold_table(results).to_csv(out / "folds.csv", index=False)
     summary = {"pooled": pooled_metrics(results)}
     if audit and "thresholds" in audit:
@@ -387,6 +388,7 @@ def _write_reports(out: Path, result, audit) -> None:
     result.equity.rename("equity").to_csv(out / "equity.csv", index_label="time")
     attribution(result.trades, "regime").to_csv(out / "by_regime.csv", index=False)
     attribution(result.trades, "entry_hour_et").to_csv(out / "by_entry_hour.csv", index=False)
+    attribution(result.trades, "vwap_zone").to_csv(out / "by_vwap_zone.csv", index=False)
     summary = {
         "metrics": result.metrics,
         "signals": result.signals,
@@ -411,9 +413,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--symbols", default=os.getenv("WATCHLIST", "AAPL,MSFT,NVDA,AMD,SPY"))
     parser.add_argument("--mode", choices=["walkforward", "model", "heuristic"], default="walkforward")
     parser.add_argument("--model", default=os.getenv("ML_MODEL_PATH", DEFAULT_MODEL_PATH))
-    parser.add_argument("--timeframe", default=os.getenv("ML_TIMEFRAME", "1Hour"),
-                        help="1m, 5m, 15m, 1h (default) or 1d")
-    parser.add_argument("--days", type=int, default=730)
+    parser.add_argument("--timeframe", default=os.getenv("ML_TIMEFRAME", DEFAULT_TIMEFRAME),
+                        help="1m, 5m (default), 15m, 1h or 1d")
+    parser.add_argument("--days", type=int, default=None,
+                        help="Days of history (default: 30 for 1m, 120 for 5m, 180 for 15m, 730 otherwise)")
     parser.add_argument("--train-fraction", type=float, default=0.6,
                         help="walkforward: share of history before the first test block")
     parser.add_argument("--folds", type=int, default=1,
@@ -491,6 +494,8 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:
         logger.error(str(exc))
         return 1
+    if args.days is None:
+        args.days = default_history_days(args.timeframe, 730)
     intraday_run = is_intraday(args.timeframe)
     no_overnight = (not args.overnight) if args.overnight is not None else intraday_run
     args.session = SessionConfig(
@@ -563,6 +568,9 @@ def main(argv: list[str] | None = None) -> int:
             if bar_len < timedelta(days=1):
                 print("\nBy entry hour ET (all folds):")
                 print(attribution(trades, "entry_hour_et").to_string(index=False))
+            if any(t.vwap_zone for t in trades):
+                print("\nBy VWAP location at entry (all folds):")
+                print(attribution(trades, "vwap_zone").to_string(index=False))
     main_name = variants[-1]["name"]
     if audits.get(main_name) and "thresholds" in audits[main_name]:
         _print_audit(audits[main_name])

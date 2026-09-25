@@ -65,6 +65,11 @@ class RiskLimits:
     # the new entry, as % of equity; and a cap on concurrent positions (0 = off).
     max_portfolio_heat_pct: float = 4.0
     max_open_positions: int = 5
+    # Intraday margin guard: keep a cushion of this % of equity unused in buying
+    # power / margin excess, and assume new longs need this maintenance margin
+    # (the Reg T / FINRA minimum is 25%).
+    margin_buffer_pct: float = 5.0
+    maintenance_rate: float = 0.30
 
     @classmethod
     def from_env(cls) -> "RiskLimits":
@@ -86,6 +91,8 @@ class RiskLimits:
             reentry_cooldown_stops_only=_env_bool("REENTRY_COOLDOWN_STOPS_ONLY", cls.reentry_cooldown_stops_only),
             max_portfolio_heat_pct=_env_float("MAX_PORTFOLIO_HEAT_PCT", cls.max_portfolio_heat_pct),
             max_open_positions=_env_int("MAX_OPEN_POSITIONS", cls.max_open_positions),
+            margin_buffer_pct=_env_float("MARGIN_BUFFER_PCT", cls.margin_buffer_pct),
+            maintenance_rate=_env_float("MAINTENANCE_MARGIN_RATE", cls.maintenance_rate),
         )
 
 
@@ -151,6 +158,13 @@ def last_exit_fill(orders: Iterable[Dict[str, Any]], symbol: str) -> Optional[Ex
             kind = str(order.get("type", order.get("order_type", ""))).lower()
             latest = ExitFill(filled_at, kind in _STOP_TYPES, _to_float(order.get("filled_avg_price")))
     return latest
+
+
+@dataclass(frozen=True)
+class MarginCapacity:
+    max_value: float              # $ of new long exposure allowed
+    block: Optional[str] = None   # hard block reason
+    detail: str = ""
 
 
 @dataclass(frozen=True)
@@ -333,14 +347,19 @@ class RiskManager:
         if stop_loss is None:
             return RiskDecision(False, reason="No valid stop-loss below the entry price")
 
+        margin = self._margin_capacity(account, equity)
+        if margin.block:
+            return RiskDecision(False, reason=margin.block)
+
         # Cap the total position (existing + new) at max_position_pct of equity.
         held_value = abs(_to_float((position or {}).get("market_value")))
         room = equity * limits.max_position_pct - held_value
         buying_power = _to_float(account.get("buying_power"))
-        affordable = min(room, buying_power if buying_power > 0 else 0.0)
-        max_qty = int(affordable // price)
+        max_qty = int(max(0.0, min(room, margin.max_value)) // price)
         approved_qty = min(quantity, max_qty)
         if approved_qty <= 0:
+            if margin.max_value < price <= min(room, buying_power):
+                return RiskDecision(False, reason=f"Intraday margin: {margin.detail}; not enough for one {symbol} share")
             return RiskDecision(
                 False,
                 reason=(
@@ -381,6 +400,48 @@ class RiskManager:
             stop_loss=stop_loss,
             take_profit=take_profit,
         )
+
+    def _margin_capacity(self, account: Dict[str, Any], equity: float) -> "MarginCapacity":
+        """How much new long exposure the account can take without an intraday
+        margin deficit, a margin call, or trading while restricted.
+
+        Uses what Alpaca's account API reports: status, trade_suspended_by_user,
+        buying_power, daytrading_buying_power (day-trading mode), equity and
+        maintenance_margin. If the account also reports intraday-margin fields
+        (intraday_margin_deficit / intraday_margin_excess / intraday_buying_power,
+        e.g. under newer intraday margin rules) they are honoured too; fields that
+        aren't reported are simply skipped.
+        """
+        limits = self.limits
+        buffer = max(0.0, limits.margin_buffer_pct) / 100
+        status = str(account.get("status") or "ACTIVE").upper()
+        if status != "ACTIVE":
+            return MarginCapacity(0.0, f"Account status is {status}; new positions blocked")
+        if account.get("trade_suspended_by_user"):
+            return MarginCapacity(0.0, "Trading is suspended on this account (by the account owner)")
+        deficit = _to_float(account.get("intraday_margin_deficit"))
+        if deficit > 0:
+            return MarginCapacity(0.0, f"Intraday margin deficit of ${deficit:,.2f}; no new positions until it's cleared")
+
+        # A fixed cushion (buffer % of equity) stays unused: successive orders
+        # can't nibble it away the way a % of *remaining* buying power would.
+        cushion = max(0.0, equity) * buffer
+        caps = {}
+        caps["buying power"] = max(0.0, _to_float(account.get("buying_power")) - cushion)
+        if limits.day_trading and "daytrading_buying_power" in account:
+            caps["day-trading buying power"] = max(0.0, _to_float(account.get("daytrading_buying_power")) - cushion)
+        if "intraday_buying_power" in account:
+            caps["intraday buying power"] = max(0.0, _to_float(account.get("intraday_buying_power")) - cushion)
+        rate = max(limits.maintenance_rate, 0.01)
+        if "maintenance_margin" in account:
+            excess = equity - _to_float(account.get("maintenance_margin"))
+            caps["maintenance margin excess"] = max(0.0, excess - cushion) / rate
+        if "intraday_margin_excess" in account:
+            excess = _to_float(account.get("intraday_margin_excess"))
+            caps["intraday margin excess"] = max(0.0, excess - cushion) / rate
+        name, value = min(caps.items(), key=lambda kv: kv[1])
+        return MarginCapacity(value, None, f"{name} allows ${value:,.2f} of new exposure "
+                                           f"(keeping a {limits.margin_buffer_pct:g}% of equity cushion)")
 
     def _cooldown_block(self, symbol: str, last_exit: Optional["ExitFill"], now: Optional[datetime]) -> Optional[str]:
         minutes = self.limits.reentry_cooldown_minutes
