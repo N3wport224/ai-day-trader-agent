@@ -194,8 +194,9 @@ def _fills(orders: Iterable[Dict[str, Any]]) -> list:
         if not isinstance(order, dict):
             continue
         stack.extend(order.get("legs") or [])
-        filled_at = _parse_ts(order.get("filled_at"))
         qty, price = _to_float(order.get("filled_qty")), _to_float(order.get("filled_avg_price"))
+        # A partially filled order that was then cancelled has no filled_at.
+        filled_at = _parse_ts(order.get("filled_at") or (order.get("updated_at") if qty > 0 else None))
         if filled_at is None or qty <= 0 or price <= 0:
             continue
         fills.append((filled_at, str(order.get("symbol") or ""), str(order.get("side", "")).lower(), qty, price))

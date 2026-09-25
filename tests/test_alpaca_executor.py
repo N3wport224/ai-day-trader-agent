@@ -129,6 +129,19 @@ def test_alpaca_executor_rejects_non_paper_endpoint(monkeypatch):
         AlpacaExecutor()
 
 
+@pytest.mark.parametrize("url", [
+    "https://paper-api.alpaca.markets.attacker.example/v2",   # lookalike host
+    "http://paper-api.alpaca.markets/v2",                      # keys would travel unencrypted
+])
+def test_alpaca_executor_rejects_lookalike_or_plain_http_paper_urls(monkeypatch, url):
+    monkeypatch.setenv("ALPACA_API_KEY", "key")
+    monkeypatch.setenv("ALPACA_SECRET_KEY", "secret")
+    monkeypatch.setenv("ALPACA_TRADING_BASE_URL", url)
+
+    with pytest.raises(ValueError, match="Paper trading requires"):
+        AlpacaExecutor()
+
+
 def test_alpaca_executor_accepts_legacy_root_paper_url(monkeypatch):
     monkeypatch.setenv("ALPACA_API_KEY", "key")
     monkeypatch.setenv("ALPACA_SECRET_KEY", "secret")

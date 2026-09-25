@@ -50,7 +50,6 @@ DEFAULT_EVENTS = (
     "not_flat",
     "flat_confirmed",
     "streak_lockout_active",
-    "slippage_timeout",
     "unprotected_position",
 )
 

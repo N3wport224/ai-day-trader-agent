@@ -102,7 +102,6 @@ class ChaseBroker(Protocol):
     def quote(self, symbol: str) -> Optional[Dict[str, float]]: ...
     def replace_stop_price(self, order_id: str, stop_price: float) -> Dict: ...
     def place_exit_oco(self, symbol: str, qty: int, stop: float, target: float) -> Dict: ...
-    def open_exit_orders(self, symbol: str) -> List[Dict]: ...
 
 
 @dataclass
@@ -293,28 +292,27 @@ class SmartLimitChaser:
         result.fill_price = fill or None
         if fill > 0 and stop_distance > 0 and target_distance > 0:
             result.stop, result.target = _cents(fill - stop_distance), _cents(fill + target_distance)
-            legs = self._legs(result.order_id, symbol)
+            legs = self._legs(result.order_id)
+            if legs is None:
+                # Couldn't read the order: don't guess (a second stop could
+                # oversell). Reconciliation flags it if it really is unprotected.
+                self._record("protection_unverified", logging.WARNING, symbol=symbol,
+                             order_id=result.order_id, stop=result.stop, target=result.target)
+                return result
             self._reanchor(result, symbol, legs)
             self._ensure_protected(result, symbol, legs)
         return result
 
-    def _legs(self, order_id: Optional[str], symbol: str) -> List[Dict[str, Any]]:
-        """The entry's working exit orders: its bracket legs, or, if the order
-        (e.g. a replacement) carries none, the symbol's open sell orders."""
+    def _legs(self, order_id: Optional[str]) -> Optional[List[Dict[str, Any]]]:
+        """This entry's own working bracket legs ([] if it has none, None if the
+        order couldn't be read). Other orders for the symbol are never touched:
+        they may protect a position that was already held."""
         try:
             legs = list(self.broker.get_order(order_id, nested=True).get("legs") or [])
         except (requests.exceptions.RequestException, ValueError) as exc:
             logger.warning(f"Could not read bracket legs of {order_id}: {exc}")
-            legs = []
-        live = [leg for leg in legs if str(leg.get("status", "")).lower() not in DONE_STATES]
-        if live:
-            return live
-        try:
-            return [o for o in self.broker.open_exit_orders(symbol)
-                    if str(o.get("status", "")).lower() not in DONE_STATES]
-        except (requests.exceptions.RequestException, ValueError) as exc:
-            logger.warning(f"Could not read open {symbol} orders: {exc}")
-            return []
+            return None
+        return [leg for leg in legs if str(leg.get("status", "")).lower() not in DONE_STATES]
 
     def _reanchor(self, result: ChaseResult, symbol: str, legs: List[Dict[str, Any]]) -> None:
         """Move the bracket legs to the planned distances from the real fill."""
@@ -338,8 +336,9 @@ class SmartLimitChaser:
                          moved={k: {"from": v[0], "to": v[1]} for k, v in moved.items()})
 
     def _ensure_protected(self, result: ChaseResult, symbol: str, legs: List[Dict[str, Any]]) -> None:
-        """Filled shares must always have a working stop at the broker (the
-        bracket's, or a new OCO if a partial fill or a replace left none)."""
+        """The filled shares must have a working stop at the broker: this entry's
+        own bracket stop, or a new OCO for them if a partial fill or a replace
+        left the order without one."""
         open_stop = any(str(leg.get("type") or leg.get("order_type") or "").lower() in _STOP_TYPES
                         for leg in legs)
         if open_stop or result.stop is None or result.filled_qty <= 0:

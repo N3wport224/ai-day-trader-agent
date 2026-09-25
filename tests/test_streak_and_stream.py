@@ -51,6 +51,13 @@ def test_winning_close_resets_and_breakeven_is_neutral():
     assert loss_streak(flat).count == 2
 
 
+def test_partially_filled_then_cancelled_entry_still_prices_the_exit():
+    partial = {"symbol": "AAPL", "side": "buy", "type": "limit", "status": "canceled", "filled_qty": "4",
+               "filled_avg_price": "100", "filled_at": None, "updated_at": T0.isoformat(),
+               "legs": [_fill("sell", 98, 10, qty=4, kind="stop")]}
+    assert loss_streak([partial, _round_trip(100, 99, 20)]).count == 2
+
+
 def test_positions_bought_on_earlier_days_do_not_count():
     assert loss_streak([_fill("sell", 90, 5)]).count == 0
 
@@ -144,7 +151,8 @@ def test_bot_blocks_entries_and_alerts_once_per_lockout(portfolio_manager):
 def test_streak_alert_is_formatted_for_phone_alerts():
     from core.alerts import DEFAULT_EVENTS, format_alert
 
-    assert "streak_lockout_active" in DEFAULT_EVENTS and "slippage_timeout" in DEFAULT_EVENTS
+    assert "streak_lockout_active" in DEFAULT_EVENTS and "unprotected_position" in DEFAULT_EVENTS
+    assert "slippage_timeout" not in DEFAULT_EVENTS   # logged and shown on the dashboard, not pushed
     text = format_alert({"event": "streak_lockout_active", "losses": 2, "symbols": ["AAPL", "MSFT"],
                          "until_et": "10:45"})
     assert "2 losing trades in a row" in text and "10:45" in text

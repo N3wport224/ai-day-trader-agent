@@ -33,7 +33,6 @@ class FakeBroker:
             {"id": "tp-leg", "type": "limit", "status": "new", "limit_price": "104.00"},
         ]
         self.replace_fails = replace_fails
-        self.open_exits = []   # the account's other open sell orders for the symbol
         self.placed, self.replaced, self.cancelled, self.stop_moves, self.ocos = [], [], [], [], []
         self.next_id = 1
 
@@ -78,9 +77,6 @@ class FakeBroker:
     def place_exit_oco(self, symbol, qty, stop, target):
         self.ocos.append({"symbol": symbol, "qty": qty, "stop": stop, "target": target})
         return {"id": "oco1"}
-
-    def open_exit_orders(self, symbol):
-        return list(self.open_exits)
 
 
 class Clock:
@@ -327,18 +323,30 @@ def test_executor_reports_slippage_abort_as_skipped(chasing_executor):
     assert broker.cancelled == ["o1"]
 
 
-def test_fill_without_bracket_legs_gets_an_oco_unless_a_stop_already_exists():
-    # E.g. a replaced bracket parent whose legs didn't carry over.
+def test_fill_without_own_bracket_legs_gets_an_oco():
+    # E.g. a replaced bracket parent whose legs didn't carry over. Stops that
+    # belong to an earlier position in the same symbol are never moved or relied on.
     broker = FakeBroker(states={"o1": [_filled("o1", 100.02)]}, legs=[])
     chaser, _, _ = _chaser(broker)
     chaser.enter("AAPL", 10, 98.00, 104.00, arrival_ask=100.00)
     assert broker.ocos == [{"symbol": "AAPL", "qty": 10, "stop": 98.02, "target": 104.02}]
+    assert not broker.stop_moves
 
-    covered = FakeBroker(states={"o1": [_filled("o1", 100.02)]}, legs=[])
-    covered.open_exits = [{"id": "s9", "type": "stop", "status": "new", "stop_price": "97.50"}]
-    chaser, _, _ = _chaser(covered)
-    chaser.enter("AAPL", 10, 98.00, 104.00, arrival_ask=100.00)
-    assert not covered.ocos and covered.stop_moves == [("s9", 98.02)]   # found and re-anchored instead
+
+def test_unreadable_legs_are_flagged_not_guessed():
+    broker = FakeBroker(states={"o1": [_filled("o1", 100.02)]})
+    original = broker.get_order
+
+    def flaky(order_id, nested=False):
+        if nested:
+            raise requests.exceptions.ConnectionError("timeout")
+        return original(order_id)
+
+    broker.get_order = flaky
+    chaser, log, _ = _chaser(broker)
+    result = chaser.enter("AAPL", 10, 98.00, 104.00, arrival_ask=100.00)
+    assert result.status == "filled" and not broker.ocos and not broker.stop_moves
+    assert _events(log, "protection_unverified")[0]["stop"] == 98.02
 
 
 def test_network_error_while_repegging_cancels_cleanly():

@@ -16,6 +16,7 @@ import time as _time
 from dataclasses import dataclass, field
 from datetime import datetime, time, timezone
 from typing import Any, Callable, Dict, List, Optional
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 import requests
@@ -217,7 +218,9 @@ class AlpacaExecutor:
                 raise ValueError(
                     "ALPACA_API_KEY and ALPACA_SECRET_KEY must be set in your .env file"
                 )
-            if "paper-api.alpaca.markets" not in self.base_url:
+            parsed = urlparse(self.base_url)
+            # Exact host over HTTPS: the keys (and the order stream) go here.
+            if parsed.scheme != "https" or parsed.hostname != "paper-api.alpaca.markets":
                 raise ValueError(
                     "Paper trading requires ALPACA_TRADING_BASE_URL=https://paper-api.alpaca.markets/v2"
                 )
@@ -962,7 +965,3 @@ class _ChaseBroker:
 
     def place_exit_oco(self, symbol: str, qty: int, stop: float, target: float) -> Dict:
         return self.executor.place_exit_oco(symbol, qty, stop, target)
-
-    def open_exit_orders(self, symbol: str) -> List[Dict]:
-        return [o for o in self.executor.get_open_orders()
-                if o.get("symbol") == symbol and str(o.get("side", "")).lower() == "sell"]
