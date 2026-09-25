@@ -302,3 +302,4 @@ svg.equity .hit { cursor: crosshair; }
 .check-row.fail { border-color: rgba(248,81,73,.45); }
 .check-row .fix { font-size: 13px; margin-top: 4px; color: var(--text-primary); }
 .check-row .fix::before { content: "Fix: "; font-weight: 600; }
+.changes { margin: 4px 0 10px 18px; font-size: 13px; display: flex; flex-direction: column; gap: 2px; }

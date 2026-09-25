@@ -74,6 +74,16 @@ The bot runs as its own background process (`bot.py --mode paper|live`), with se
 logs and state per mode under `logs/<mode>/` and `data/<mode>/`. It keeps running if you
 close the browser. Stop it from the dashboard.
 
+**Updating.** Open **System check → Software updates**; the sidebar shows **NEW** when
+there's a newer version on GitHub.
+1. Click **Update now**, then **Restart dashboard**.
+2. The update never touches your `.env` keys, `data`, `logs`, `models` or `reports`.
+3. Files it replaces are backed up in `backups/`, and **Undo last update** puts them back.
+4. Packages are reinstalled only when `requirements.txt` changed.
+5. For safety it won't run while a bot or validation is running; stop them first.
+
+Git checkouts update with `git pull --ff-only`. It refuses if you've edited tracked files.
+
 **Tracking results.** The Paper and Live tabs each have a **Performance** card with:
 - the account's equity curve (1 day to 1 year);
 - the bot's closed trades, with win rate, average R and profit factor shown next to what
