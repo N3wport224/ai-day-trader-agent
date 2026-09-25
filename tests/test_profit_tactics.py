@@ -6,6 +6,7 @@ import pytest
 
 from core.alpaca_executor import AlpacaExecutor, BrokerSnapshot, ExecutionConfig, spread_bps
 from core.backtester import Backtester, BacktestConfig
+from core.execution_router import ChaseConfig
 from core.execution_telemetry import EventLog
 from core.risk_manager import PortfolioRisk, RiskLimits, RiskManager, portfolio_risk
 from tests.test_backtester import DAY, _flat_bars, _strategy
@@ -114,13 +115,14 @@ def make_executor(monkeypatch):
     monkeypatch.setattr(AlpacaExecutor, "get_orders_today", lambda self: [])
     monkeypatch.setattr(AlpacaExecutor, "get_account", lambda self: ACCOUNT)
 
-    def build(quote=None, execution=None, **limit_kw):
+    def build(quote=None, execution=None, chase=None, **limit_kw):
         ex = AlpacaExecutor(
             risk_manager=RiskManager(RiskLimits(min_price=1.0, max_position_pct=1.0, **limit_kw)),
             price_lookup=lambda symbol: 100.0,
             quote_lookup=lambda symbol: quote,
             telemetry=EventLog(None),
             execution=execution or ExecutionConfig(),
+            chase=chase or ChaseConfig(enabled=False),  # chaser covered in test_execution_router.py
         )
         ex.placed = []
 

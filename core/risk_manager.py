@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, Optional
 from zoneinfo import ZoneInfo
 
@@ -70,6 +70,10 @@ class RiskLimits:
     # (the Reg T / FINRA minimum is 25%).
     margin_buffer_pct: float = 5.0
     maintenance_rate: float = 0.30
+    # Tilt protection: after this many losing closes in a row today, no new
+    # entries for streak_cooldown_minutes (0 disables). A winning close resets it.
+    max_consecutive_losses: int = 2
+    streak_cooldown_minutes: float = 45.0
 
     @classmethod
     def from_env(cls) -> "RiskLimits":
@@ -93,6 +97,9 @@ class RiskLimits:
             max_open_positions=_env_int("MAX_OPEN_POSITIONS", cls.max_open_positions),
             margin_buffer_pct=_env_float("MARGIN_BUFFER_PCT", cls.margin_buffer_pct),
             maintenance_rate=_env_float("MAINTENANCE_MARGIN_RATE", cls.maintenance_rate),
+            max_consecutive_losses=_env_int("MAX_CONSECUTIVE_LOSSES", cls.max_consecutive_losses),
+            streak_cooldown_minutes=_env_float(
+                "STREAK_COOLDOWN_MINUTES", _env_float("COOLDOWN_MINUTES", cls.streak_cooldown_minutes)),
         )
 
 
@@ -163,6 +170,67 @@ def last_exit_fill(orders: Iterable[Dict[str, Any]], symbol: str) -> Optional[Ex
             kind = str(order.get("type", order.get("order_type", ""))).lower()
             latest = ExitFill(filled_at, kind in _STOP_TYPES, _to_float(order.get("filled_avg_price")))
     return latest
+
+
+@dataclass(frozen=True)
+class LossStreak:
+    """Consecutive losing closes today, newest first."""
+
+    count: int = 0
+    last_loss_at: Optional[datetime] = None
+    losses: tuple = ()   # (symbol, pnl) of the losing closes in the streak
+
+    def cooldown_until(self, minutes: float) -> Optional[datetime]:
+        if self.last_loss_at is None:
+            return None
+        return self.last_loss_at + timedelta(minutes=minutes)
+
+
+def _fills(orders: Iterable[Dict[str, Any]]) -> list:
+    """Every filled order (bracket legs included), oldest first."""
+    fills, stack = [], list(orders or [])
+    while stack:
+        order = stack.pop()
+        if not isinstance(order, dict):
+            continue
+        stack.extend(order.get("legs") or [])
+        filled_at = _parse_ts(order.get("filled_at"))
+        qty, price = _to_float(order.get("filled_qty")), _to_float(order.get("filled_avg_price"))
+        if filled_at is None or qty <= 0 or price <= 0:
+            continue
+        fills.append((filled_at, str(order.get("symbol") or ""), str(order.get("side", "")).lower(), qty, price))
+    return sorted(fills)
+
+
+def loss_streak(orders_today: Iterable[Dict[str, Any]]) -> LossStreak:
+    """Consecutive losing closes, from today's broker orders.
+
+    Each filled sell is priced against the average cost of that symbol's buys
+    filled earlier today (shares bought on earlier days aren't counted, so a
+    swing position closed today neither starts nor resets a streak). A
+    profitable close resets the streak; a break-even close leaves it as is.
+    """
+    held: Dict[str, list] = {}   # symbol -> [qty, avg cost] bought today
+    closes = []                  # (filled_at, symbol, pnl)
+    for filled_at, symbol, side, qty, price in _fills(orders_today):
+        book = held.setdefault(symbol, [0.0, 0.0])
+        if side == "buy":
+            total = book[0] + qty
+            book[1] = (book[0] * book[1] + qty * price) / total
+            book[0] = total
+        elif side == "sell" and book[0] > 0:
+            matched = min(qty, book[0])
+            closes.append((filled_at, symbol, (price - book[1]) * matched))
+            book[0] -= matched
+    count, last, losses = 0, None, []
+    for filled_at, symbol, pnl in reversed(closes):
+        if pnl > 0:
+            break
+        if pnl < 0:
+            count += 1
+            last = last or filled_at
+            losses.append((symbol, round(pnl, 2)))
+    return LossStreak(count, last, tuple(losses))
 
 
 @dataclass(frozen=True)
@@ -281,9 +349,11 @@ class RiskManager:
         last_exit: Optional["ExitFill"] = None,
         now: Optional[datetime] = None,
         portfolio: Optional["PortfolioRisk"] = None,
+        streak: Optional[LossStreak] = None,
     ) -> RiskDecision:
         limits = self.limits
         side = side.lower()
+        orders_today = list(orders_today or [])
 
         if not limits.trading_enabled:
             return RiskDecision(False, reason="Trading disabled (TRADING_ENABLED=false)")
@@ -338,6 +408,9 @@ class RiskManager:
         cooldown = self._cooldown_block(symbol, last_exit, now)
         if cooldown:
             return RiskDecision(False, reason=cooldown)
+        tilt = self.streak_block(loss_streak(orders_today) if streak is None else streak, now)
+        if tilt:
+            return RiskDecision(False, reason=tilt)
 
         entries_today = sum(
             1 for order in orders_today if str(order.get("side", "")).lower() == "buy"
@@ -450,6 +523,19 @@ class RiskManager:
         name, value = min(caps.items(), key=lambda kv: kv[1])
         return MarginCapacity(value, None, f"{name} allows ${value:,.2f} of new exposure "
                                            f"(keeping a {limits.margin_buffer_pct:g}% of equity cushion)")
+
+    def streak_block(self, streak: LossStreak, now: Optional[datetime] = None) -> Optional[str]:
+        """Why new entries are paused after a losing streak, or None."""
+        limit, minutes = self.limits.max_consecutive_losses, self.limits.streak_cooldown_minutes
+        if limit <= 0 or minutes <= 0 or streak.count < limit or streak.last_loss_at is None:
+            return None
+        until = streak.cooldown_until(minutes)
+        now = now or datetime.now(timezone.utc)
+        if now >= until:
+            return None
+        return (f"Loss streak: {streak.count} losing trades in a row; new entries paused until "
+                f"{until.astimezone(MARKET_TZ):%H:%M} ET (MAX_CONSECUTIVE_LOSSES={limit}, "
+                f"STREAK_COOLDOWN_MINUTES={minutes:g})")
 
     def _cooldown_block(self, symbol: str, last_exit: Optional["ExitFill"], now: Optional[datetime]) -> Optional[str]:
         minutes = self.limits.reentry_cooldown_minutes

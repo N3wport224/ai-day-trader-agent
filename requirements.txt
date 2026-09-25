@@ -30,6 +30,8 @@ pytz==2025.1
 # API Server dependencies (updated to latest stable versions)
 fastapi==0.141.1
 uvicorn[standard]==0.34.0
+# Real-time order updates (core/stream_listener.py); also pulled in by uvicorn[standard]
+websockets==17.1
 pydantic==2.10.5
 pydantic-settings==2.7.1
 passlib[bcrypt]==1.7.4

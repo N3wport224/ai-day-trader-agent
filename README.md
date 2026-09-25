@@ -457,6 +457,25 @@ python bot.py --timeframe 1h --overnight                                        
   from Alpaca's orders (restart-safe); the backtester applies the same rule
   (`--reentry-cooldown-minutes`). `REENTRY_COOLDOWN_STOPS_ONLY=false` applies
   it after every exit.
+- **Losing-streak lockout (tilt protection)**: after `MAX_CONSECUTIVE_LOSSES`
+  (2) losing trades in a row today, in any symbols, new entries are paused
+  for `STREAK_COOLDOWN_MINUTES` (45) from the last loss. You get a
+  `streak_lockout_active` alert. A winning close resets the count, and every
+  session starts at zero. If the next trade after the pause also loses, a new
+  pause starts. The streak is rebuilt from today's Alpaca fills each cycle, so
+  a restart doesn't forget it. Exits are never blocked. The backtester applies
+  the same rule (`--max-consecutive-losses`, `--streak-cooldown-minutes`).
+- **Real-time fills** (`core/stream_listener.py`): the bot listens to
+  Alpaca's `trade_updates` WebSocket. When a stop-loss or take-profit leg
+  fills, it re-syncs within a second instead of at the next bar: local book,
+  fill quality, streak check and trailing-stop anchors. Fills are logged as
+  `stream_fill` (`stop_hit`, `target_hit`, `entry_fill`, `exit_fill`).
+  - If the connection drops, it reconnects with backoff (1 to 60 s), logging
+    one `stream_disconnected` per outage.
+  - The regular REST checks each cycle never stop, so an outage only costs
+    speed.
+  - `order_stream` in `logs/heartbeat.json` shows the stream's state.
+  - `STREAM_TRADE_UPDATES=false` turns it off.
 
 Backtest the intraday rules (opening lockout, cutoff, 15:50 forced close,
 2 bps spread on top of slippage, simulated PDT day-trade count):
@@ -541,12 +560,37 @@ when there isn't one.
      a headwind.
    - Test both with `--compare` before relying on them.
 4. **Lower execution costs**.
-   - Entries are marketable limits 10 bps through the ask
-     (`ENTRY_ORDER_TYPE`, `ENTRY_LIMIT_OFFSET_BPS`). They cap what a gap or a
-     thin book can cost, and the backtester simulates the missed fills.
+   - **Smart limit entries** (`core/execution_router.py`): a BUY is a
+     bracket order limited at the ask + 0.05% (`ENTRY_LIMIT_BUFFER_BPS`, at
+     least `ENTRY_LIMIT_MIN_BUFFER` = $0.01), never a raw market order.
+     - If it hasn't filled in 10 s (`ENTRY_FILL_TIMEOUT_SECONDS`), the bot
+       checks the quote and re-pegs the limit to the new ask
+       (`PATCH /v2/orders/{id}`, or cancel + resubmit if Alpaca refuses).
+       It does this only while the ask is within 0.15% of the ask when the
+       trade was decided (`ENTRY_MAX_SLIPPAGE_BPS`). The limit is never
+       raised past that cap.
+     - If the price runs further, the entry is cancelled and logged as
+       `slippage_timeout`. It also gives up after 3 re-pegs
+       (`ENTRY_MAX_REPEGS`).
+     - On the fill, the stop-loss and take-profit legs are moved to the
+       planned distances from the actual fill price (`bracket_reanchored`).
+     - On a partial fill, the unfilled rest is cancelled, and the filled
+       shares keep a broker-side stop. If Alpaca dropped the bracket legs,
+       an OCO stop/target is placed; if even that fails, you get an
+       `unprotected_position` alert.
+     - Each chase holds up the bot for at most about 40 s.
+     - The backtester models the same thing (`--entry-chase`,
+       `--entry-max-slippage-bps`): it fills at the next open's ask when that
+       is within the cap, and otherwise cancels the entry as a
+       `slippage_timeout`. A later dip doesn't count, because the live order
+       is already gone by then.
+     - `ENTRY_CHASE=false` goes back to a resting marketable limit
+       `ENTRY_LIMIT_OFFSET_BPS` (10) through the ask, as it does whenever
+       there's no live quote.
    - Entries are skipped when the bid/ask spread is wider than 20 bps
      (`MAX_SPREAD_BPS`).
-   - Unfilled entries are cancelled after 120 s (`ENTRY_ORDER_TTL_SECONDS`).
+   - Any entry still unfilled after 120 s is cancelled as a backstop
+     (`ENTRY_ORDER_TTL_SECONDS`).
    - Slippage is measured on every fill, so you can check the backtest's
      cost assumptions (see Running unattended).
    - With the free IEX feed, quotes are IEX-only and often wider than the

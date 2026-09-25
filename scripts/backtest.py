@@ -183,6 +183,8 @@ def _config(args, variant, bar_len) -> BacktestConfig:
         session=args.session,
         spread_bps=args.spread_bps,
         entry_limit_bps=args.entry_limit_offset_bps if args.entry_order_type == "limit" else None,
+        entry_chase_slippage_bps=(args.entry_max_slippage_bps
+                                  if args.entry_order_type == "limit" and args.entry_chase else None),
     )
 
 
@@ -196,6 +198,10 @@ def _run_variant(args, variant, bars, macro, sentiment, scored, bar_len, market=
         limits = replace(limits, reentry_cooldown_minutes=args.reentry_cooldown_minutes)
     if args.max_heat_pct is not None:
         limits = replace(limits, max_portfolio_heat_pct=args.max_heat_pct)
+    if args.max_consecutive_losses is not None:
+        limits = replace(limits, max_consecutive_losses=args.max_consecutive_losses)
+    if args.streak_cooldown_minutes is not None:
+        limits = replace(limits, streak_cooldown_minutes=args.streak_cooldown_minutes)
     if args.max_open_positions is not None:
         limits = replace(limits, max_open_positions=args.max_open_positions)
     config = _config(args, variant, bar_len)
@@ -474,7 +480,20 @@ def main(argv: list[str] | None = None) -> int:
                            default=os.getenv("ENTRY_ORDER_TYPE", "limit"),
                            help="limit (default, as live): marketable limit that can miss on a gap; market: always fills")
     execution.add_argument("--entry-limit-offset-bps", type=float,
-                           default=float(os.getenv("ENTRY_LIMIT_OFFSET_BPS", "10")))
+                           default=float(os.getenv("ENTRY_LIMIT_OFFSET_BPS", "10")),
+                           help="Limit offset when the smart limit chaser is off (--no-entry-chase)")
+    execution.add_argument("--entry-chase", action=argparse.BooleanOptionalAction,
+                           default=os.getenv("ENTRY_CHASE", "true").strip().lower() not in {"0", "false", "no", "off"},
+                           help="Smart limit entries as live (default on): re-peg to the ask, cancel past "
+                                "--entry-max-slippage-bps")
+    execution.add_argument("--entry-max-slippage-bps", type=float,
+                           default=float(os.getenv("ENTRY_MAX_SLIPPAGE_BPS", "15")),
+                           help="Chaser cancels the entry when the ask runs this far past the arrival ask")
+    execution.add_argument("--max-consecutive-losses", type=int, default=None,
+                           help="Pause entries after this many losing trades in a row today "
+                                "(default MAX_CONSECUTIVE_LOSSES or 2; 0 disables)")
+    execution.add_argument("--streak-cooldown-minutes", type=float, default=None,
+                           help="Length of that pause (default STREAK_COOLDOWN_MINUTES or 45)")
     execution.add_argument("--max-heat-pct", type=float, default=None,
                            help="Max total $ at risk to stops, %% of equity (default MAX_PORTFOLIO_HEAT_PCT or 4)")
     execution.add_argument("--max-open-positions", type=int, default=None,
