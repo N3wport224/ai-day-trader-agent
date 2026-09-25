@@ -674,6 +674,15 @@ const Control = (() => {
       case 'bot_restarted': return ['🔁', 'Bot restarted automatically'];
       case 'flatten_fill': return e.status === 'filled' ? ['🌙', `Closed ${e.filled_qty} ${e.symbol} at ${e.fill_price} (${e.filled_at ? new Date(e.filled_at).toLocaleTimeString() : ''})`] : ['⚠️', `${e.symbol} close order ${e.status}`];
       case 'flat_confirmed': return ['✅', `Flat for the day at ${e.at_et} ET`];
+      case 'streak_lockout_active': return ['🧊', `${e.losses} losing trades in a row: new entries paused until ${e.until_et} ET`];
+      case 'slippage_timeout': return ['💨', `${e.symbol} entry cancelled: ${e.reason}`];
+      case 'entry_unfilled': return ['⌛', `${e.symbol} entry not filled: ${e.reason}`];
+      case 'entry_repegged': return ['🎯', `${e.symbol} entry limit moved to ${e.limit_price}`];
+      case 'bracket_reanchored': return ['📐', `${e.symbol} filled at ${e.fill_price}: stop ${e.stop}, target ${e.target}`];
+      case 'partial_fill_protected': return ['🛡️', `${e.symbol} partial fill (${e.qty}) protected: stop ${e.stop}`];
+      case 'unprotected_position': return ['🚨', `${e.symbol}: ${e.qty} shares have NO stop-loss`];
+      case 'stream_fill': return e.kind === 'stop_hit' ? ['🛑', `${e.symbol} stop hit at ${e.price}`] : e.kind === 'target_hit' ? ['🎯', `${e.symbol} target hit at ${e.price}`] : null;
+      case 'stream_disconnected': return ['📡', 'Live order stream lost; using regular checks until it reconnects'];
       case 'not_flat': return ['🚨', `NOT FLAT ${e.minutes_to_close} min before the close: ${(e.positions || []).map((p) => p.symbol).join(', ') || 'open orders'}`];
       case 'edge_gate': return e.passed ? ['✅', 'Validation passes again; new trades allowed'] : ['🚧', `New trades blocked: ${e.reason}`];
       case 'bot_restart_blocked': return ['⚠️', `Bot is down and was not restarted: ${e.reason}`];

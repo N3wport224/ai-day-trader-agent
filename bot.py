@@ -330,10 +330,25 @@ def main(argv: list[str] | None = None) -> int:
         if keep_awake():
             log.info("Keeping this computer awake while the bot runs (KEEP_AWAKE=false to disable)")
 
+    stream = None
+    if args.execute and not args.once:
+        from core.stream_listener import TradeUpdateStream, stream_enabled
+
+        if stream_enabled():
+            # Real-time fills (stop/target hits) wake the bot between cycles;
+            # the REST checks each cycle stay in place if the stream drops.
+            stream = TradeUpdateStream.for_executor(broker, telemetry=bot.telemetry)
+            bot.attach_stream(stream)
+            broker.order_updates = stream.order_update
+            stream.start()
+
     try:
         bot.run(max_cycles=1 if args.once else None)
     except KeyboardInterrupt:
         logging.getLogger(__name__).info("Bot stopped")
+    finally:
+        if stream is not None:
+            stream.stop()
     return 0
 
 

@@ -16,10 +16,12 @@ import threading
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from pathlib import Path
+from time import monotonic
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from core.execution_telemetry import EventLog
 from core.portfolio_manager import PortfolioManager
+from core.risk_manager import loss_streak
 from core.session_clock import SessionClock, SessionPhase, to_market_time
 from core.trading_workflow import TradingWorkflow, WorkflowResult
 
@@ -112,9 +114,14 @@ class TradingBot:
         self.market_clock = market_clock
         self._stop_event = threading.Event()
         self._stop_reason: Optional[str] = None
+        # Set by the trade_updates stream on a fill: the idle wait wakes up and
+        # re-syncs with the broker at once (see attach_stream).
+        self._wake = threading.Event()
+        self.stream: Optional[Any] = None
+        self._fast_syncs = 0
         # Default sleep is interruptible, so stop() takes effect between cycles
         # without waiting out the interval (and never interrupts an order).
-        self.sleep = sleep or (lambda seconds: self._stop_event.wait(seconds))
+        self.sleep = sleep or self._wait
         self.telemetry = telemetry or EventLog.from_env()
         self.heartbeat_path = Path(heartbeat_path or os.getenv("HEARTBEAT_PATH", "logs/heartbeat.json"))
         self.timeframe = timeframe
@@ -123,6 +130,7 @@ class TradingBot:
         self._breaker_alerted: Optional[date] = None
         self._flat_confirmed: Optional[date] = None
         self._not_flat_alerted: Optional[date] = None
+        self._streak_alerted: Optional[datetime] = None
         self.broker = broker
         self.trailing_manager = trailing_manager
         self.fill_tracker = fill_tracker
@@ -285,7 +293,9 @@ class TradingBot:
                 f"Reconciliation clean: {recon.positions} positions, {recon.open_orders} open orders match local book"
             )
 
-        self._track_fills(self._market_date())
+        orders_today = self._orders_today()
+        self._track_fills(self._market_date(), orders_today)
+        self._check_streak(report, orders_today)
 
         if self.execute and hasattr(self.broker, "cancel_stale_entries"):
             try:
@@ -301,6 +311,36 @@ class TradingBot:
                 status = "raised" if adj.ok else "FAILED to raise"
                 logger.info(f"{adj.symbol}: stop {status} {adj.old_stop} -> {adj.new_stop} ({adj.detail})")
         return True
+
+    def _orders_today(self) -> Optional[List[Dict[str, Any]]]:
+        if not hasattr(self.broker, "get_orders_today"):
+            return None
+        try:
+            return self.broker.get_orders_today()
+        except Exception as exc:
+            logger.warning(f"Could not read today's orders: {exc}")
+            return None
+
+    def _check_streak(self, report: CycleReport, orders: Optional[List[Dict[str, Any]]]) -> None:
+        """Losing-streak lockout: block entries this cycle and alert once per lockout.
+        The executor's risk check enforces the same rule on every order."""
+        risk = getattr(self.broker, "risk_manager", None)
+        if orders is None or risk is None or not hasattr(risk, "streak_block"):
+            return
+        streak = loss_streak(orders)
+        reason = risk.streak_block(streak, self.now_fn())
+        if not reason:
+            return
+        report.entry_block = report.entry_block or reason
+        if self._streak_alerted != streak.last_loss_at:
+            self._streak_alerted = streak.last_loss_at
+            until = streak.cooldown_until(risk.limits.streak_cooldown_minutes)
+            self.telemetry.record(
+                "streak_lockout_active", logging.WARNING, losses=streak.count,
+                symbols=[symbol for symbol, _ in streak.losses], pnl=[pnl for _, pnl in streak.losses],
+                until_et=to_market_time(until).strftime("%H:%M"), minutes=risk.limits.streak_cooldown_minutes,
+            )
+            logger.warning(reason)
 
     def _track_fills(self, session_date: date, orders: Optional[List[Dict[str, Any]]] = None) -> None:
         if self.fill_tracker is None or not hasattr(self.broker, "get_orders_today"):
@@ -439,6 +479,7 @@ class TradingBot:
             "broker_error": report.broker_error,
             "positions": len(snapshot.positions) if snapshot is not None else None,
             "next_cycle_in_seconds": None if self._stop_event.is_set() else round(self._next_sleep(), 1),
+            "order_stream": self.stream.status if self.stream is not None else "off",
         }
         try:
             self.heartbeat_path.parent.mkdir(parents=True, exist_ok=True)
@@ -452,6 +493,47 @@ class TradingBot:
         """Finish the current cycle, then exit ``run`` (safe from signal handlers)."""
         self._stop_reason = reason
         self._stop_event.set()
+        self._wake.set()
+
+    # -- real-time order stream -----------------------------------------------
+
+    def attach_stream(self, stream: Any) -> None:
+        """Wake up on every fill pushed by core.stream_listener.TradeUpdateStream.
+        The REST cycle is unchanged, so a dropped stream only costs latency."""
+        self.stream = stream
+        stream.listeners.append(self._on_stream_update)
+
+    def _on_stream_update(self, update: Dict[str, Any]) -> None:
+        # Runs on the stream's thread: only signal; the bot thread does the work.
+        if str(update.get("event", "")).lower() in {"fill", "partial_fill"}:
+            self._wake.set()
+
+    def _wait(self, seconds: float) -> None:
+        """Idle until the next cycle, handling stream wake-ups in between."""
+        deadline = monotonic() + seconds
+        while not self.stopped:
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                return
+            if self._wake.wait(remaining):
+                self._wake.clear()
+                if not self.stopped:
+                    self.sync_now()
+
+    def sync_now(self) -> Optional[CycleReport]:
+        """Immediate broker sync after a streamed fill: local book, fill quality,
+        losing-streak lockout and trailing-stop anchors, without scanning."""
+        if self.broker is None:
+            return None
+        report = CycleReport(started_at=datetime.now(timezone.utc), market_open=True, phase="STREAM_SYNC")
+        try:
+            self._sync_with_broker(report)
+        except Exception as exc:  # the next regular cycle retries
+            logger.warning(f"Stream-triggered sync failed: {exc}")
+            return None
+        self._fast_syncs += 1
+        logger.info("Order stream: fill received, broker state re-synced")
+        return report
 
     @property
     def stopped(self) -> bool:

@@ -49,6 +49,8 @@ DEFAULT_EVENTS = (
     "revalidation",
     "not_flat",
     "flat_confirmed",
+    "streak_lockout_active",
+    "unprotected_position",
 )
 
 
@@ -108,6 +110,14 @@ def format_alert(event: Dict[str, Any]) -> Optional[str]:
         held = ", ".join(f"{p.get('symbol')} {p.get('qty')}" for p in event.get("positions") or []) or "open orders"
         return (f"🚨 NOT FLAT {event.get('minutes_to_close')} min before the close: {held}. "
                 "Close them in the dashboard (Close everything) or at alpaca.markets.")
+    if name == "streak_lockout_active":
+        return (f"🧊 {event.get('losses')} losing trades in a row ({', '.join(event.get('symbols') or [])}): "
+                f"new entries paused until {event.get('until_et')} ET")
+    if name == "slippage_timeout":
+        return f"💨 {sym} entry cancelled: {event.get('reason')}"
+    if name == "unprotected_position":
+        return (f"🚨 {sym}: {event.get('qty')} shares have NO stop-loss ({event.get('error')}). "
+                "Set one or close it at alpaca.markets.")
     if name == "flat_confirmed":
         return f"✅ Flat for the day at {event.get('at_et')} ET"
     if name == "revalidation":

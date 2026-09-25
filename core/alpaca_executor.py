@@ -16,11 +16,13 @@ import time as _time
 from dataclasses import dataclass, field
 from datetime import datetime, time, timezone
 from typing import Any, Callable, Dict, List, Optional
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 import requests
 from dotenv import load_dotenv
 
+from core.execution_router import ChaseConfig, ChaseResult, SmartLimitChaser
 from core.execution_telemetry import EventLog, Rejection, classify_rejection
 from core.risk_manager import RiskManager, last_exit_fill, portfolio_risk
 from core.session_clock import SessionClock, SessionPhase
@@ -47,6 +49,7 @@ class ExecutionResult:
     skipped_reason: Optional[str] = None
     rejection: Optional[Rejection] = None   # set when the broker refused the order
     recovered: bool = False                 # True when a retry after a rejection succeeded
+    chase: Optional[ChaseResult] = None     # smart limit entry outcome (fill, re-pegs, abort)
 
 
 @dataclass
@@ -166,8 +169,12 @@ class AlpacaExecutor:
         quote_lookup: Optional[Callable[[str], Optional[Dict[str, float]]]] = None,
         mode: str = "paper",
         require_armed: bool = True,
+        chase: Optional[ChaseConfig] = None,
     ):
         self.execution = execution or ExecutionConfig.from_env()
+        self.chase = chase or ChaseConfig.from_env()
+        # Optional order-update cache from the trade_updates stream (core.stream_listener).
+        self.order_updates: Optional[Callable[[str], Optional[Dict[str, Any]]]] = None
         self.quote_lookup = quote_lookup
         self.risk_manager = risk_manager or RiskManager()
         # Optional intraday session rules (opening lockout / EOD cutoff) for entries.
@@ -211,7 +218,9 @@ class AlpacaExecutor:
                 raise ValueError(
                     "ALPACA_API_KEY and ALPACA_SECRET_KEY must be set in your .env file"
                 )
-            if "paper-api.alpaca.markets" not in self.base_url:
+            parsed = urlparse(self.base_url)
+            # Exact host over HTTPS: the keys (and the order stream) go here.
+            if parsed.scheme != "https" or parsed.hostname != "paper-api.alpaca.markets":
                 raise ValueError(
                     "Paper trading requires ALPACA_TRADING_BASE_URL=https://paper-api.alpaca.markets/v2"
                 )
@@ -348,6 +357,7 @@ class AlpacaExecutor:
         risk = signal.get("risk_parameters") or {}
         position = self.get_position(symbol)
         price = float(signal.get("price") or 0)
+        arrival_ask = 0.0  # the ask when the entry was decided (smart limit reference)
         if action == "BUY":
             # Analysis prices can be an hour old; size and set stops off a
             # live quote when one is available.
@@ -370,6 +380,7 @@ class AlpacaExecutor:
                     )
                 if quote["ask"] > 0:
                     price = quote["ask"]  # a buy pays the ask: size and place stops from it
+                    arrival_ask = quote["ask"]
 
         stop_loss, take_profit = risk.get("stop_loss"), risk.get("take_profit")
         stop_distance = float(risk.get("stop_distance") or 0)
@@ -409,14 +420,48 @@ class AlpacaExecutor:
                 self._record_submitted(order, symbol, "sell", decision.quantity, expected_price=price)
                 return ExecutionResult(order=order)
 
+            chasing = self._chasing(arrival_ask)
+            limit_kwargs = ({"limit_price": self.chase.limit_price(arrival_ask)} if chasing
+                            else self._entry_kwargs(price))
             order = self._place_bracket_order(
-                symbol, decision.quantity, decision.stop_loss, decision.take_profit, **self._entry_kwargs(price)
+                symbol, decision.quantity, decision.stop_loss, decision.take_profit, **limit_kwargs
             )
             self._record_submitted(order, symbol, "buy", decision.quantity, decision.stop_loss,
                                    decision.take_profit, expected_price=price)
-            return ExecutionResult(order=order)
+            if not chasing:
+                return ExecutionResult(order=order)
         except requests.exceptions.HTTPError as exc:
             return self._recover_from_rejection(exc, action, symbol, decision.quantity, price)
+        try:
+            return self._chase_entry(order, symbol, decision.quantity, decision.stop_loss,
+                                     decision.take_profit, arrival_ask)
+        except Exception as exc:
+            # The order is live with its bracket; the TTL sweep still cancels it if unfilled.
+            logger.error(f"Entry chase for {symbol} failed ({exc}); order left working with its bracket")
+            self.telemetry.record("entry_chase_error", logging.ERROR, symbol=symbol,
+                                  order_id=order.get("id"), error=str(exc))
+            return ExecutionResult(order=order)
+
+    def _chasing(self, arrival_ask: float) -> bool:
+        """Smart limit entries need a live ask to price and re-peg against."""
+        return self.chase.enabled and self.execution.entry_order_type == "limit" and arrival_ask > 0
+
+    def _chase_entry(self, order: Dict, symbol: str, qty: int, stop: float, target: float,
+                     arrival_ask: float) -> ExecutionResult:
+        chaser = SmartLimitChaser(self._chase_broker(), self.chase, telemetry=self.telemetry,
+                                  sleep=self.sleep, fill_cache=self.order_updates)
+        result = chaser.enter(symbol, qty, stop, target, arrival_ask, order=order)
+        if result.order_id and result.order_id != order.get("id"):
+            # Re-pegged: measure slippage of the final order against the arrival ask.
+            self.expected_prices[result.order_id] = arrival_ask
+        if result.filled:
+            logger.info(f"Entry {symbol}: {result.status} {result.filled_qty:g} @ {result.fill_price} "
+                        f"after {result.repegs} re-peg(s); stop {result.stop}, target {result.target}")
+            return ExecutionResult(order=result.order, chase=result)
+        return ExecutionResult(skipped_reason=f"Entry not filled ({result.status}): {result.detail}", chase=result)
+
+    def _chase_broker(self) -> "_ChaseBroker":
+        return _ChaseBroker(self)
 
     def _record_submitted(self, order: Dict, symbol: str, side: str, qty: int,
                           stop_loss: Optional[float] = None, take_profit: Optional[float] = None,
@@ -686,8 +731,28 @@ class AlpacaExecutor:
         )
         return report
 
-    def get_order(self, order_id: str) -> Dict:
-        resp = requests.get(f"{self.base_url}/orders/{order_id}", headers=self.headers, timeout=10)
+    def get_order(self, order_id: str, nested: bool = False) -> Dict:
+        resp = requests.get(f"{self.base_url}/orders/{order_id}", headers=self.headers,
+                            params={"nested": "true"} if nested else None, timeout=10)
+        resp.raise_for_status()
+        return resp.json()
+
+    def replace_order(self, order_id: str, **fields: Any) -> Dict:
+        """PATCH /v2/orders/{id}: Alpaca replaces the order and returns the new
+        one (a new id); the old one ends as "replaced"."""
+        resp = requests.patch(f"{self.base_url}/orders/{order_id}", headers=self.headers,
+                              json={k: str(v) for k, v in fields.items()}, timeout=10)
+        resp.raise_for_status()
+        return resp.json()
+
+    def place_exit_oco(self, symbol: str, qty: int, stop: float, target: float) -> Dict:
+        """Broker-side stop-loss + take-profit (one cancels the other) for shares
+        already held, e.g. a partial entry fill whose bracket legs were dropped."""
+        resp = requests.post(f"{self.base_url}/orders", headers=self.headers, timeout=10, json={
+            "symbol": symbol, "qty": str(qty), "side": "sell", "type": "limit", "time_in_force": "gtc",
+            "order_class": "oco", "take_profit": {"limit_price": str(target)},
+            "stop_loss": {"stop_price": str(stop)},
+        })
         resp.raise_for_status()
         return resp.json()
 
@@ -872,3 +937,31 @@ if __name__ == "__main__":
         print("  No open positions")
 
     print("\nConnection OK ✓")
+
+
+class _ChaseBroker:
+    """The executor's order calls in the shape SmartLimitChaser expects."""
+
+    def __init__(self, executor: AlpacaExecutor):
+        self.executor = executor
+
+    def place_entry(self, symbol: str, qty: int, stop: float, target: float, limit_price: float) -> Dict:
+        return self.executor._place_bracket_order(symbol, qty, stop, target, limit_price=limit_price)
+
+    def get_order(self, order_id: str, nested: bool = False) -> Dict:
+        return self.executor.get_order(order_id, nested=nested)
+
+    def replace_order(self, order_id: str, **fields: Any) -> Dict:
+        return self.executor.replace_order(order_id, **fields)
+
+    def cancel_order(self, order_id: str) -> bool:
+        return self.executor.cancel_order(order_id)
+
+    def quote(self, symbol: str) -> Optional[Dict[str, float]]:
+        return self.executor._quote(symbol)
+
+    def replace_stop_price(self, order_id: str, stop_price: float) -> Dict:
+        return self.executor.replace_stop_price(order_id, stop_price)
+
+    def place_exit_oco(self, symbol: str, qty: int, stop: float, target: float) -> Dict:
+        return self.executor.place_exit_oco(symbol, qty, stop, target)

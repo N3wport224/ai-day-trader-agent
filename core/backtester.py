@@ -31,7 +31,7 @@ import math
 import re
 from dataclasses import dataclass, field
 from datetime import time, timedelta
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -45,6 +45,7 @@ from core.news_sentiment import SENTIMENT_FEATURES
 from core.session_clock import SessionClock, SessionConfig, SessionPhase
 from core.risk_manager import (
     ExitFill,
+    LossStreak,
     PortfolioRisk,
     RiskManager,
     SizingConfig,
@@ -76,6 +77,11 @@ class BacktestConfig:
     # the decision price. A next bar that opens above it fills at the limit only
     # if it trades back below it; otherwise the entry is missed. None = market.
     entry_limit_bps: Optional[float] = None
+    # Smart limit chaser (live default): the entry limit is re-pegged to the ask
+    # while it stays within entry_chase_slippage_bps of the arrival ask; past
+    # that it is cancelled (slippage_timeout). Takes precedence over
+    # entry_limit_bps. None = off.
+    entry_chase_slippage_bps: Optional[float] = None
 
     @property
     def intraday_rules(self) -> bool:
@@ -168,6 +174,42 @@ class BacktestResult:
                 for t in self.trades
             ]
         )
+
+
+def _chase_fill(decision_price: float, o: float, low: float, cfg: BacktestConfig, slip: float) -> Optional[float]:
+    """Entry fill under the smart limit chaser, or None if it's cancelled.
+
+    Arrival ask = decision close + half the spread. The order works from the
+    next bar's open, and the live limit (ask + buffer, re-pegged to the ask) is
+    never raised past the slippage cap. The chase takes about
+    (re-pegs + 1) x fill timeout seconds, well inside one bar, so the open
+    decides the outcome. If the open ask (with slippage) is within the cap, the
+    order fills there. Above the cap it is cancelled (slippage_timeout); a later
+    dip back under the cap doesn't count, because the live order is gone by
+    then. A fill also needs the bar to have traded at or below the price paid.
+    """
+    half_spread = cfg.spread_bps / 2 / 10_000
+    cap = decision_price * (1 + half_spread) * (1 + cfg.entry_chase_slippage_bps / 10_000)
+    open_ask = o * (1 + slip)
+    if open_ask > cap or low * (1 + half_spread) > open_ask:
+        return None
+    return open_ask
+
+
+def _loss_streak(trades: List["Trade"], day: Any, bar_length: timedelta) -> LossStreak:
+    """Consecutive losing closes on ``day`` (same rule as risk_manager.loss_streak).
+    A close is known when its bar completes."""
+    today = sorted((t for t in trades if t.exit_time is not None and _day_key(t.exit_time) == day),
+                   key=lambda t: t.exit_time)
+    count, last, losses = 0, None, []
+    for t in reversed(today):
+        if t.pnl > 0:
+            break
+        if t.pnl < 0:
+            count += 1
+            last = last or (t.exit_time + bar_length).to_pydatetime()
+            losses.append((t.symbol, round(t.pnl, 2)))
+    return LossStreak(count, last, tuple(losses))
 
 
 def _is_regular_bar(ts: pd.Timestamp, config: BacktestConfig) -> bool:
@@ -348,7 +390,12 @@ class Backtester:
                         order = None
                     if order and symbol not in positions:
                         fill = o * (1 + slip)
-                        if cfg.entry_limit_bps is not None:
+                        if cfg.entry_chase_slippage_bps is not None:
+                            fill = _chase_fill(order["price"], o, l, cfg, slip)
+                            if fill is None:
+                                session_blocked["slippage_timeout"] = session_blocked.get("slippage_timeout", 0) + 1
+                                order = None
+                        elif cfg.entry_limit_bps is not None:
                             limit = order["price"] * (1 + cfg.entry_limit_bps / 10_000)
                             if fill > limit:
                                 if l < limit:
@@ -463,6 +510,7 @@ class Backtester:
                         session_date=day,
                         last_exit=last_exits.get(symbol),
                         now=ts + cfg.bar_length,
+                        streak=_loss_streak(trades, day, cfg.bar_length),
                         portfolio=PortfolioRisk(
                             len(positions) + len(pending_entries),
                             sum(max(0.0, last_close.get(s, p.entry_price) - p.stop) * p.quantity
@@ -606,6 +654,13 @@ def format_report(result: BacktestResult, title: str = "Backtest") -> str:
         if cfg.trailing.enabled else "off"
     )
     lines.append(f"Sizing: {cfg.sizing_method} ({cfg.risk_per_trade_pct}% base risk); trailing stops: {trailing}")
+    if cfg.entry_chase_slippage_bps is not None:
+        entries = f"smart limit (re-pegged to the ask, cancelled past {cfg.entry_chase_slippage_bps:g} bps)"
+    elif cfg.entry_limit_bps is not None:
+        entries = f"marketable limit {cfg.entry_limit_bps:g} bps through the decision price"
+    else:
+        entries = "market orders"
+    lines.append(f"Entries: {entries}")
     if cfg.intraday_rules:
         sess = cfg.session
         lines.append(
