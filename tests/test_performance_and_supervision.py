@@ -220,3 +220,88 @@ def test_autostart_endpoint_is_local_only(client, monkeypatch, tmp_path) -> None
     assert remote(client).put("/api/settings/autostart", json={"enabled": True}).status_code == 403
     body = client.put("/api/settings/autostart", json={"enabled": True}).json()
     assert body["enabled"] and calls == ["on"] and body["auto_resume"] is True
+
+
+# ---------------------------------------------------------------------------
+# Audit fixes: no double launches, single supervisor, escaping
+# ---------------------------------------------------------------------------
+
+def test_concurrent_starts_launch_exactly_one_bot(tmp_path, monkeypatch) -> None:
+    import threading
+    import time
+
+    import core.bot_manager as bm
+
+    monkeypatch.setattr(bm, "_pid_is_ours", lambda pid, script: True)  # the stand-in isn't literally bot.py
+
+    launched = []
+
+    def slow_popen(command, **kwargs):
+        time.sleep(0.3)  # widen the check-then-launch window
+        proc = subprocess.Popen(["sleep", "30"], **kwargs)
+        launched.append(proc)
+        return proc
+
+    # Two managers = the supervisor and a manual Start (or two server processes).
+    a, b = BotManager(root=tmp_path, popen=slow_popen), BotManager(root=tmp_path, popen=slow_popen)
+    results = []
+
+    def start(mgr):
+        try:
+            mgr.start_bot("live", ["AAPL"], "5m", execute=True)
+            results.append("started")
+        except RuntimeError as exc:
+            results.append(str(exc))
+
+    threads = [threading.Thread(target=start, args=(m,)) for m in (a, b)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    try:
+        assert len(launched) == 1
+        assert sorted(results) == ["live is already running", "started"]
+    finally:
+        for p in launched:
+            p.kill()
+            p.wait()
+
+
+def test_running_check_sees_a_bot_started_elsewhere(sup, tmp_path) -> None:
+    mgr, clock, procs = sup
+    mgr.start_bot("paper", ["AAPL"], "5m", execute=False)
+    procs[0].kill(); procs[0].wait()                 # our bot died...
+    other = subprocess.Popen(["sleep", "30"])        # ...and another process started a new one
+    procs.append(other)
+    mgr.bots["paper"].pid_path.write_text(str(other.pid))
+    import core.bot_manager as bm
+    original = bm._pid_is_ours
+    bm._pid_is_ours = lambda pid, script: True       # the stand-in isn't literally bot.py
+    try:
+        assert mgr.bots["paper"].running()
+        assert mgr.supervise(lambda mode, want: None) == []  # so no duplicate restart
+    finally:
+        bm._pid_is_ours = original
+
+
+def test_only_one_supervisor_lock(tmp_path) -> None:
+    from core.bot_manager import try_singleton_lock
+
+    first = try_singleton_lock(tmp_path / "supervisor.lock")
+    assert first is not None
+    assert try_singleton_lock(tmp_path / "supervisor.lock") is None
+    first.close()
+    again = try_singleton_lock(tmp_path / "supervisor.lock")
+    assert again is not None
+    again.close()
+
+
+def test_autostart_escapes_percent(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("APPDATA", str(tmp_path / "AppData"))
+    root = tmp_path / "100% bots"
+    autostart.enable(platform="win32", home=tmp_path, python="C:/py/python.exe", root=root)
+    text = autostart.entry_path(platform="win32", home=tmp_path).read_text(encoding="utf-8")
+    assert "100%% bots" in text and "100% bots" not in text.replace("%%", "")
+    autostart.enable(platform="linux", home=tmp_path, python="/usr/bin/python3", root=root)
+    desktop = autostart.entry_path(platform="linux", home=tmp_path).read_text(encoding="utf-8")
+    assert 'Exec=env NO_BROWSER=1 "/usr/bin/python3" "' in desktop and "100%% bots/start_dashboard.py" in desktop

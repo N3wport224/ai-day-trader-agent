@@ -664,6 +664,7 @@ const Control = (() => {
 
   async function downloadCsv(mode) {
     try {
+      await API.getMe();  // refreshes an expired login token first (plain fetch doesn't)
       const token = localStorage.getItem('adt_access_token');
       const resp = await fetch(`/api/control/${mode}/trades.csv`, { headers: { Authorization: `Bearer ${token}` } });
       if (!resp.ok) throw new Error(`Download failed (${resp.status})`);

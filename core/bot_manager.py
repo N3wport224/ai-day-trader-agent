@@ -19,7 +19,9 @@ import re
 import signal
 import subprocess
 import sys
+import time
 from collections import deque
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -64,6 +66,69 @@ def tail(path: Path, lines: int = 80) -> List[str]:
             return [line.rstrip("\n") for line in deque(fh, maxlen=lines)]
     except OSError:
         return []
+
+
+@contextmanager
+def file_lock(path: Path, timeout: float = 15.0):
+    """Exclusive lock across threads and processes (flock / msvcrt)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(path, "a+b")
+    try:
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                _lock_fd(fh.fileno(), blocking=False)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(f"Timed out waiting for {path.name}; try again")
+                time.sleep(0.05)
+        try:
+            yield
+        finally:
+            _unlock_fd(fh.fileno())
+    finally:
+        fh.close()
+
+
+def _lock_fd(fd: int, blocking: bool) -> None:
+    if os.name == "nt":  # the real platform (IS_WINDOWS can be simulated in tests)
+        import msvcrt
+
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(fd, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+
+
+def _unlock_fd(fd: int) -> None:
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+
+
+def try_singleton_lock(path: Path):
+    """Hold an exclusive lock for the life of this process, or return None if
+    another process already holds it (released automatically when we exit)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(path, "a+b")
+    try:
+        _lock_fd(fh.fileno(), blocking=False)
+    except OSError:
+        fh.close()
+        return None
+    return fh
 
 
 def _win_pid_alive(pid: int) -> bool:
@@ -136,8 +201,9 @@ class ProcessSlot:
         self.tracked: Optional[_Tracked] = None
 
     def pid(self) -> Optional[int]:
-        if self.tracked is not None:
-            return self.tracked.proc.pid if self.tracked.proc.poll() is None else None
+        if self.tracked is not None and self.tracked.proc.poll() is None:
+            return self.tracked.proc.pid
+        # Not ours (or ours exited): another dashboard process may have started one.
         try:
             pid = int(self.pid_path.read_text().strip())
         except (OSError, ValueError):
@@ -153,9 +219,17 @@ class ProcessSlot:
         return None
 
     def start(self, args: List[str], env: Dict[str, str], settings: Dict[str, Any]) -> Dict[str, Any]:
+        """Start the process unless it is already running. The check and the
+        launch happen under an OS file lock, so a manual Start and an automatic
+        restart (other thread or other server process) can never both launch a
+        bot; two live bots would double every order."""
+        self.dir.mkdir(parents=True, exist_ok=True)
+        with file_lock(self.dir / "start.lock"):
+            return self._start_locked(args, env, settings)
+
+    def _start_locked(self, args: List[str], env: Dict[str, str], settings: Dict[str, Any]) -> Dict[str, Any]:
         if self.running():
             raise RuntimeError(f"{self.name} is already running")
-        self.dir.mkdir(parents=True, exist_ok=True)
         command = [sys.executable, str(self.root / self.script), *args]
         self.stop_path.unlink(missing_ok=True)  # a stale request must not stop the new run
         log = self.log_path.open("a", encoding="utf-8")
@@ -232,10 +306,8 @@ class BotManager:
 
     def __init__(self, root: Path = PROJECT_ROOT, popen: Callable = subprocess.Popen,
                  clock: Callable[[], float] = None) -> None:
-        import time as _time
-
         self.root = root
-        self.clock = clock or _time.monotonic
+        self.clock = clock or time.monotonic
         self._restarts: Dict[str, List[float]] = {mode: [] for mode in MODES}
         self.bots = {mode: ProcessSlot(mode, "bot.py", root, popen) for mode in MODES}
         # The validation job places no orders, so a hard stop is fine everywhere.

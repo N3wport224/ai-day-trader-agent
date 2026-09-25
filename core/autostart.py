@@ -46,11 +46,13 @@ def entry_path(platform: Optional[str] = None, home: Optional[Path] = None) -> P
 def _content(kind: str, python: str, root: Path) -> str:
     script = root / "start_dashboard.py"
     if kind == "windows":
+        # In a .cmd, "%" starts a variable even inside quotes: double it.
+        q = lambda value: str(value).replace("%", "%%")  # noqa: E731
         return (
             "@echo off\r\n"
-            f'cd /d "{root}"\r\n'
+            f'cd /d "{q(root)}"\r\n'
             "set NO_BROWSER=1\r\n"
-            f'start "AI Day Trader" /min "{python}" "{script}"\r\n'
+            f'start "AI Day Trader" /min "{q(python)}" "{q(script)}"\r\n'
         )
     if kind == "mac":
         log = root / "logs" / "dashboard.log"
@@ -69,11 +71,13 @@ def _content(kind: str, python: str, root: Path) -> str:
 </dict>
 </plist>
 """
+    # Desktop-entry Exec: "%" is a field code and must be written "%%".
+    exec_python, exec_script = (str(v).replace("%", "%%") for v in (python, script))
     return (
         "[Desktop Entry]\n"
         "Type=Application\n"
         "Name=AI Day Trader dashboard\n"
-        f'Exec=env NO_BROWSER=1 "{python}" "{script}"\n'
+        f'Exec=env NO_BROWSER=1 "{exec_python}" "{exec_script}"\n'
         f"Path={root}\n"
         "X-GNOME-Autostart-enabled=true\n"
     )

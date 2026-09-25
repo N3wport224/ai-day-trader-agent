@@ -57,11 +57,21 @@ async def _supervisor_loop() -> None:
 async def lifespan(app: FastAPI):
     import asyncio
 
-    task = asyncio.create_task(_supervisor_loop())
+    from config.api.control import get_bot_manager
+    from core.bot_manager import try_singleton_lock
+
+    # With several server workers only one may supervise, or two could restart the same bot.
+    lock = try_singleton_lock(get_bot_manager().root / "logs" / "supervisor.lock")
+    task = asyncio.create_task(_supervisor_loop()) if lock else None
+    if lock is None:
+        logger.info("Another dashboard process is supervising the bots")
     try:
         yield
     finally:
-        task.cancel()
+        if task:
+            task.cancel()
+        if lock:
+            lock.close()
 
 
 app = FastAPI(
