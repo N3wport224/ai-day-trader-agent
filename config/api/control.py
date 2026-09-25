@@ -130,7 +130,8 @@ async def start_validation(body: ValidateRequest, current_user: User = Depends(g
 @router.get("/validate")
 async def validation_status(current_user: User = Depends(get_admin_user),
                             manager: BotManager = Depends(get_bot_manager)):
-    return {**manager.validation.status(log_lines=120), "edge": edge_report_summary()}
+    return {**manager.validation.status(log_lines=120), "edge": edge_report_summary(),
+            "schedule": get_revalidator(manager).status()}
 
 
 @router.post("/validate/stop")
@@ -160,6 +161,55 @@ async def validation_report(current_user: User = Depends(get_admin_user),
         "by_entry_hour": _read_csv_rows(folder / "by_entry_hour.csv"),
         "by_regime": _read_csv_rows(folder / "by_regime.csv"),
     }
+
+
+def _latest_spy_bar():
+    from datetime import timedelta
+
+    from core.market_history import bar_length, fetch_alpaca_bars, fetch_yahoo_bars
+
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=5)
+    for source, fetch in (("Alpaca", fetch_alpaca_bars), ("Yahoo (delayed backup)", fetch_yahoo_bars)):
+        try:
+            bars = fetch("SPY", "5Min", start, end)
+        except Exception:
+            continue
+        if bars is not None and len(bars):
+            return bars.index[-1].to_pydatetime() + bar_length("5Min"), source
+    return None, "none"
+
+
+def _run_health(manager: BotManager) -> Dict[str, Any]:
+    from config.api.settings import check_connection
+    from core import autostart
+    from core.health import run_checks
+    from core.ml_strategy import DEFAULT_MODEL_PATH, load_artifact
+
+    def broker_clock():
+        for mode in ("paper", "live"):
+            if _keys_configured(mode):
+                return _read_only_executor(mode).get_clock()
+        return None
+
+    model_path = Path(os.getenv("ML_MODEL_PATH", DEFAULT_MODEL_PATH))
+    if not model_path.is_absolute():
+        model_path = manager.root / model_path
+    return run_checks(
+        manager=manager,
+        connection=check_connection,
+        broker_clock=broker_clock,
+        latest_bar=_latest_spy_bar,
+        load_model=lambda: load_artifact(model_path),
+        report_file=report_path(),
+        autostart_enabled=bool(autostart.status()["enabled"]),
+    )
+
+
+@router.get("/health")
+async def health(current_user: User = Depends(get_admin_user), manager: BotManager = Depends(get_bot_manager)):
+    """System check: keys, data, clock, validation, model, disk, bots, alerts (with fixes)."""
+    return await run_in_threadpool(_run_health, manager)
 
 
 # Per-mode routes come after the fixed paths above so /validate/... isn't taken as a mode.
@@ -275,8 +325,25 @@ def auto_resume_enabled() -> bool:
 _last_supervisor_note: Dict[str, Any] = {}
 
 
+_revalidators: Dict[int, Any] = {}
+
+
+def get_revalidator(manager: BotManager):
+    from core.revalidation import Revalidator
+
+    if id(manager) not in _revalidators:
+        _revalidators[id(manager)] = Revalidator(manager)
+    return _revalidators[id(manager)]
+
+
 def supervise_once(manager: BotManager) -> List[Dict[str, Any]]:
-    """One supervisor pass: restart bots that should be running (crash, reboot)."""
+    """One supervisor pass: keep the strategy validated (scheduled re-runs) and
+    restart bots that should be running (crash, reboot, model refresh)."""
+    try:
+        for action in get_revalidator(manager).tick():
+            logger.info(f"Scheduler: {action}")
+    except Exception as exc:  # scheduling must never stop bot supervision
+        logger.error(f"Re-validation scheduler error: {exc}")
     if not auto_resume_enabled():
         return []
     actions = manager.supervise(lambda mode, want: start_block_reason(mode, bool(want.get("execute"))))

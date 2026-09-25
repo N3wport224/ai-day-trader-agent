@@ -82,6 +82,24 @@ close the browser. Stop it from the dashboard.
   to tell* (it needs about 20 trades before judging);
 - a trade journal with CSV download.
 
+**Staying validated.** The validation expires after 30 days. Once it's 7 days old, the
+dashboard re-runs it automatically, with the settings you last used, outside market hours
+(weekends, or before 8 am / after 6 pm ET).
+- If the strategy still passes, the model is retrained and running bots restart to load
+  it (only outside market hours).
+- If it no longer passes, bots stop opening trades until it does. Running bots re-check
+  the validation every few minutes, so this takes effect mid-run.
+- You get an alert either way.
+- Turn it off with the checkbox on Get Started (`AUTO_REVALIDATE=false`).
+
+**System check** (sidebar) checks, in one click:
+- your keys, the market-data feed and your computer's clock (vs Alpaca);
+- the validation and the trained model;
+- disk space and the ML library;
+- whether bots that should be running are, plus keep-awake, start-at-login and alerts.
+
+Each problem comes with the fix. Run it before your first session.
+
 **Get Started → See the test details** shows every walk-forward test period plus
 breakdowns by time of day and market regime. Look for an edge that holds up across
 periods, not one lucky stretch.

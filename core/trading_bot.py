@@ -92,6 +92,7 @@ class TradingBot:
         fill_tracker: Optional[Any] = None,
         standing_entry_block: Optional[str] = None,
         edge_monitor: Optional[Any] = None,
+        entry_gate: Optional[Callable[[], Optional[str]]] = None,
     ) -> None:
         """``broker`` (an AlpacaExecutor) enables the start-of-cycle broker
         snapshot and reconciliation; ``trailing_manager`` raises stops on
@@ -125,6 +126,9 @@ class TradingBot:
         # Blocks every new entry for the whole run (e.g. the edge gate failed);
         # exits, brackets, trailing stops and the EOD flatten still run.
         self.standing_entry_block = standing_entry_block
+        # Re-evaluated every cycle (e.g. the edge gate: a report can expire or a
+        # re-validation can fail while the bot keeps running).
+        self.entry_gate = entry_gate
         # core.edge_monitor.EdgeMonitor: pauses entries if live results decay.
         self.edge_monitor = edge_monitor
         if reconcile_fn is None and broker is not None:
@@ -182,6 +186,13 @@ class TradingBot:
             return report
         if self.standing_entry_block:
             report.entry_block = report.entry_block or self.standing_entry_block
+        if self.entry_gate is not None:
+            try:
+                gate = self.entry_gate()
+            except Exception as exc:  # fail closed: no new entries if the gate can't be evaluated
+                gate = f"entry gate check failed: {exc}"
+            if gate:
+                report.entry_block = report.entry_block or gate
         if self.edge_monitor is not None and self.edge_monitor.paused:
             report.entry_block = report.entry_block or f"edge decay: {self.edge_monitor.paused}"
         if phase is SessionPhase.OPENING_LOCKOUT:

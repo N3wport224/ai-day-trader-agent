@@ -46,6 +46,7 @@ DEFAULT_EVENTS = (
     "bot_error",
     "bot_restarted",
     "bot_restart_blocked",
+    "revalidation",
 )
 
 
@@ -101,6 +102,13 @@ def format_alert(event: Dict[str, Any]) -> Optional[str]:
         return f"▶️ Bot started: {event.get('mode')}, {event.get('timeframe')}, {event.get('symbols')}"
     if name == "bot_stopped":
         return f"⏹️ Bot stopped ({event.get('reason')})"
+    if name == "revalidation":
+        result = event.get("result")
+        if result == "validated":
+            return "✅ Weekly re-validation passed: the strategy still shows an edge; model retrained."
+        if result == "no_edge":
+            return "🚧 Re-validation found NO edge any more: bots will stop opening new trades. Review on Get Started."
+        return "⚠️ Re-validation could not run (see the dashboard log)."
     if name == "bot_restarted":
         return f"🔁 Bot restarted automatically ({event.get('reason')})"
     if name == "bot_restart_blocked":

@@ -280,3 +280,15 @@ async def put_autostart(body: AutostartRequest, request: Request, current_user: 
 
 def _auto_resume() -> bool:
     return os.getenv("AUTO_RESUME_BOTS", "true").strip().lower() not in {"0", "false", "no", "off"}
+
+
+class ToggleRequest(BaseModel):
+    enabled: bool
+
+
+@router.put("/auto-revalidate")
+async def put_auto_revalidate(body: ToggleRequest, request: Request, current_user: User = Depends(get_admin_user)):
+    """Turn the weekly automatic re-validation on or off (saved to .env)."""
+    require_local(request)
+    await run_in_threadpool(update_env, {"AUTO_REVALIDATE": "true" if body.enabled else "false"})
+    return {"enabled": body.enabled}

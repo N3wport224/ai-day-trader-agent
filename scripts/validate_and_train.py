@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -38,8 +39,27 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--folds", type=int, default=4)
     parser.add_argument("--market", action="store_true")
     parser.add_argument("--out", default="reports/validation")
+    parser.add_argument("--trigger", choices=("manual", "scheduled"), default="manual")
     args = parser.parse_args(argv)
+    started = datetime.now(timezone.utc).isoformat()
+    code = _run(args)
+    result = {0: "validated", 2: "no_edge"}.get(code, "error")
+    summary = {
+        "result": result,
+        "exit_code": code,
+        "trigger": args.trigger,
+        "started_at": started,
+        "finished_at": datetime.now(timezone.utc).isoformat(),
+        "settings": {"symbols": args.symbols.split(","), "timeframe": args.timeframe, "days": args.days,
+                     "market": args.market},
+    }
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "last_run.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    return code
 
+
+def _run(args) -> int:
     import scripts.backtest as backtest
     import scripts.train_model as train_model
 
