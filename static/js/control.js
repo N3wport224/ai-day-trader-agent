@@ -82,6 +82,7 @@ const Control = (() => {
     loadOverview();
     loadKeys();
     loadAutostart();
+    setTimeout(() => checkUpdates(true), 4000);  // quiet background check: badge only
     stopTimers();
     state.timers.push(setInterval(loadOverview, 15000));
     state.timers.push(setInterval(refreshActive, 5000));
@@ -95,7 +96,87 @@ const Control = (() => {
   function refreshActive() {
     if (state.view === 'paper' || state.view === 'live') loadMode(state.view);
     if (state.view === 'start') loadValidation();
-    if (state.view === 'health' && !state.healthAt) runHealth();
+    if (state.view === 'health' && !state.healthAt) { runHealth(); checkUpdates(); }
+  }
+
+  /* ── Updates ── */
+  const shortSha = (sha) => (sha ? String(sha).slice(0, 7) : 'unknown');
+
+  async function checkUpdates(quiet = false) {
+    const body = $('update-body');
+    if (!quiet) body.innerHTML = 'Checking GitHub…';
+    try {
+      const u = await api('GET', '/updates/check');
+      state.update = u;
+      renderUpdate(u);
+      if (u.update_available) badge('badge-health', 'NEW', 'ok');
+    } catch (ex) { if (!quiet) body.innerHTML = `<div class="notice bad">${esc(ex.message)}</div>`; }
+  }
+
+  function renderUpdate(u) {
+    const body = $('update-body');
+    if (!u.ok) { body.innerHTML = `<div class="notice warn">${esc(u.message)}</div>`; return; }
+    const date = u.latest_date ? new Date(u.latest_date).toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' }) : '';
+    if (!u.update_available) {
+      body.innerHTML = `<div class="notice ok">You have the latest version (${esc(shortSha(u.current))}, ${esc(date)}).</div>
+        <button class="btn btn-outline btn-sm" id="update-undo">Undo last update</button>`;
+    } else {
+      body.innerHTML = `
+        <div class="notice ok"><b>An update is available</b> (${esc(shortSha(u.latest))}, ${esc(date)}). You have ${esc(shortSha(u.current))}.
+          ${u.message ? `<div class="small">${esc(u.message)}</div>` : ''}</div>
+        ${(u.changes || []).length ? `<p class="small muted">What's new:</p><ul class="changes">${u.changes.map((c) => `<li>${esc(c)}</li>`).join('')}</ul>` : ''}
+        ${u.busy ? `<div class="notice warn">${esc(u.busy)}</div>` : ''}
+        <p class="small muted">Your keys (.env), trade data, logs, models and reports are never touched. Files it replaces are backed up so you can undo.</p>
+        <div class="btn-row"><button class="btn btn-primary" id="update-apply" ${u.busy ? 'disabled' : ''}>Update now</button>
+          <button class="btn btn-outline btn-sm" id="update-undo">Undo last update</button></div>`;
+    }
+    const apply = $('update-apply');
+    if (apply) apply.addEventListener('click', applyUpdate);
+    $('update-undo').addEventListener('click', undoUpdate);
+  }
+
+  function restartPrompt(message) {
+    $('update-body').innerHTML = `<div class="notice ok">${esc(message)}</div>
+      <button class="btn btn-primary" id="update-restart">Restart dashboard now</button>`;
+    $('update-restart').addEventListener('click', restartDashboard);
+  }
+
+  function applyUpdate() {
+    modal('<h3>Install the update?</h3><p>Downloads the new version from GitHub and installs it. Takes a minute (longer if packages changed). Your keys and data are kept.</p>',
+      async () => {
+        $('update-body').innerHTML = '<div class="notice">Updating… don\'t close this window.</div>';
+        try {
+          const r = await api('POST', '/updates/apply', { confirm: true });
+          if (!r.updated) { checkUpdates(); toast(r.message, 'info'); return; }
+          const pkg = r.packages && !r.packages.ok ? ` ${r.packages.message}` : '';
+          restartPrompt(`Updated to ${shortSha(r.version)}${r.files_changed != null ? ` (${r.files_changed} files)` : ''}.${pkg} Restart the dashboard to use it.`);
+        } catch (ex) { $('update-body').innerHTML = `<div class="notice bad">${esc(ex.message)}</div>`; }
+      }, { confirmText: 'Update now' });
+  }
+
+  function undoUpdate() {
+    modal('<h3>Undo the last update?</h3><p>Puts back the files the last update replaced.</p>', async () => {
+      try {
+        const r = await api('POST', '/updates/rollback', { confirm: true });
+        restartPrompt(`${r.message} (${r.restored} files restored.)`);
+      } catch (ex) { toast(ex.message, 'error'); }
+    }, { confirmText: 'Undo update' });
+  }
+
+  async function restartDashboard() {
+    try { await api('POST', '/updates/restart'); } catch (ex) { toast(ex.message, 'error'); return; }
+    $('update-body').innerHTML = '<div class="notice">Restarting… this page reloads when the dashboard is back.</div>';
+    const started = Date.now();
+    await new Promise((r) => setTimeout(r, 3000));
+    const poll = async () => {
+      try {
+        const resp = await fetch('/api/health', { cache: 'no-store' });
+        if (resp.ok) { window.location.reload(); return; }
+      } catch {}
+      if (Date.now() - started < 90000) setTimeout(poll, 1500);
+      else $('update-body').innerHTML = '<div class="notice bad">The dashboard didn\'t come back. Start it again with the launcher.</div>';
+    };
+    poll();
   }
 
   /* ── System check ── */
@@ -132,6 +213,7 @@ const Control = (() => {
         </li>`).join('')}</ul>
       <p class="muted small">Checked ${esc(new Date(h.checked_at).toLocaleString())}.</p>`;
     badge('badge-health', h.overall === 'fail' ? '!' : h.overall === 'warn' ? '!' : '✓', h.overall === 'ok' ? 'ok' : h.overall === 'fail' ? 'live' : 'warn');
+    if (state.update && state.update.update_available && h.overall !== 'fail') badge('badge-health', 'NEW', 'ok');
   }
 
   /* ── Overview: checklist + sidebar badges ── */
@@ -862,6 +944,7 @@ const Control = (() => {
     });
     $('val-start').addEventListener('click', startValidation);
     $('health-run').addEventListener('click', runHealth);
+    $('update-check').addEventListener('click', () => checkUpdates());
     $('val-stop').addEventListener('click', async () => { await api('POST', '/control/validate/stop'); loadValidation(); });
   }
 

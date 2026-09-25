@@ -48,6 +48,14 @@ def main() -> int:
         if os.getenv("NO_BROWSER", "").lower() not in {"1", "true", "yes"}:
             webbrowser.open(url)
 
+    if os.getenv("WAIT_FOR_PORT"):  # restarted after an update: the old dashboard is still exiting
+        import socket
+
+        for _ in range(60):
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                if probe.connect_ex(("127.0.0.1", port)) != 0:
+                    break
+            time.sleep(0.5)
     threading.Thread(target=open_browser, daemon=True).start()
     from core.keep_awake import keep_awake
 

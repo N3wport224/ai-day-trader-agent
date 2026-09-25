@@ -30,6 +30,7 @@ from config.api.analysis import router as analysis_router
 from config.api.trading import router as trading_router
 from config.api.settings import router as settings_router
 from config.api.control import router as control_router
+from config.api.updates import router as updates_router
 from config.api.websockets import websocket_endpoint
 
 # Configure logging
@@ -110,6 +111,7 @@ app.include_router(analysis_router, prefix="/api/analysis", tags=["analysis"])
 app.include_router(trading_router, prefix="/api/trading", tags=["trading"])
 app.include_router(settings_router, prefix="/api/settings", tags=["settings"])
 app.include_router(control_router, prefix="/api/control", tags=["control"])
+app.include_router(updates_router, prefix="/api/updates", tags=["updates"])
 
 # Global error handler
 @app.exception_handler(Exception)

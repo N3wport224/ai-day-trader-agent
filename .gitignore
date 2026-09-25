@@ -166,3 +166,5 @@ data/edge_monitor.json
 data/paper/
 data/live/
 reports/
+backups/
+.installed_version
