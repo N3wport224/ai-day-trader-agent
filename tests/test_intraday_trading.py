@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import date, datetime, timezone
+from datetime import date
 
 import numpy as np
 import pandas as pd
@@ -157,11 +157,19 @@ def test_flatten_all_cancels_orders_then_closes_every_position(monkeypatch, exec
 
     monkeypatch.setattr("core.alpaca_executor.requests.delete", fake_delete)
 
+    monkeypatch.setattr(AlpacaExecutor, "get_order", lambda self, oid: {
+        "id": oid, "status": "filled", "filled_avg_price": "99.95", "filled_qty": "10",
+        "submitted_at": "2026-03-02T20:50:00.1Z", "filled_at": "2026-03-02T20:50:00.4Z"})
+
     report = executor.flatten_all()
 
     assert calls == ["/orders", "/positions/AAPL", "/positions/MSFT"]  # orders cancelled first
     assert report.cancelled == 2
-    assert report.closed == [{"symbol": "AAPL", "qty": 10.0, "order_id": "close-AAPL"}]
+    assert report.closed == [{"symbol": "AAPL", "qty": 10.0, "order_id": "close-AAPL", "status": "filled",
+                              "filled_at": "2026-03-02T20:50:00.4Z", "fill_price": 99.95, "filled_qty": 10.0,
+                              "submitted_at": "2026-03-02T20:50:00.1Z"}]
+    fill = [e for e in executor.telemetry.events if e["event"] == "flatten_fill"][0]
+    assert fill["fill_price"] == 99.95 and fill["filled_at"] == "2026-03-02T20:50:00.4Z"
     assert report.failures[0]["symbol"] == "MSFT" and report.failures[0]["category"] == "margin_or_pdt"
     assert executor.telemetry.events[-1]["event"] == "flatten"
 

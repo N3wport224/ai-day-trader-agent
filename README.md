@@ -333,7 +333,7 @@ news (Alpaca News)  -> core/news_sentiment.py ─┤-> core/ml_strategy.py -> co
 Train a model (writes `models/ml_signal.joblib`):
 
 ```bash
-python scripts/train_model.py --symbols AAPL,MSFT,NVDA,AMD,SPY --days 365
+python scripts/train_model.py --symbols AAPL,MSFT,NVDA,AMD,SPY   # 5-minute bars, 120 days (defaults)
 python scripts/train_model.py --no-news --timeframe 1Day --days 1500   # technicals only
 python scripts/train_model.py --synthetic                              # offline demo
 ```
@@ -394,13 +394,21 @@ python bot.py --timeframe 1h --overnight                                        
   position (`FLATTEN_ORDER_TYPE=market` or a marketable limit). Cutoff and
   flatten are relative to the actual close from Alpaca's clock, so 13:00
   half-days work. The bot wakes up exactly at flatten time; if a close fails
-  it retries every cycle until the market closes. The executor enforces the
-  same entry windows, so manual orders can't bypass them.
+  it retries every cycle until the market closes. Each closing order's fill
+  price and fill time are logged (`flatten_fill`; waits up to
+  `FLATTEN_CONFIRM_SECONDS`). While the flatten phase lasts, the bot checks
+  the account at least every 2 minutes. It logs `flat_confirmed` (with the
+  time) once nothing is open. If positions or orders remain within
+  `FLAT_ALERT_MINUTES` (5) of the close, it sends a `not_flat` alert so you
+  can close them by hand. The executor enforces the same entry windows, so
+  manual orders can't bypass them.
 - **Intraday features** (`features.add_intraday_features`): session VWAP
   anchored at 9:30 with 1/2-sigma bands, VWAP distance and z-score, relative
-  volume vs the same time-of-day bucket over prior sessions, 15-minute
-  opening-range high/low (hidden until the range has formed) and minutes
-  since the open. All causal and tested for lookahead on 1m and 5m bars.
+  volume vs the same time-of-day bucket over prior sessions, 15- and
+  30-minute opening-range high/low and breakout distance (each hidden until
+  its range has formed; ORB30 needs bars of 30 minutes or less), a VWAP
+  band label for attribution, and minutes since the open. The VWAP distance
+  is the ratio (close - VWAP) / VWAP. All causal and tested for lookahead on 1m and 5m bars.
   Models trained with `--timeframe 5m` use them automatically, and their
   labels end at the session close (a day trader is flat overnight).
   A model trained on a different bar size is ignored with an error.
@@ -410,11 +418,29 @@ python bot.py --timeframe 1h --overnight                                        
   earlier). Exits are never blocked by it (Alpaca's own PDT protection may
   still reject a same-day close for a flagged account; the flatten failure
   is logged and retried).
+- **Margin guard**: before every entry the risk manager reads the account.
+  It blocks new positions when the account isn't ACTIVE, when trading is
+  suspended, or when the account reports an intraday margin deficit. It also
+  sizes each order so it stays inside all of these, keeping a cushion of
+  `MARGIN_BUFFER_PCT` (5%) of equity unused:
+  - buying power;
+  - day-trading buying power (in day-trading mode, for accounts flagged as
+    pattern day traders; unflagged accounts report it as 0);
+  - maintenance-margin headroom, assuming `MAINTENANCE_MARGIN_RATE` (30%) for
+    the new position.
+
+  If not even one share fits, the order is rejected rather than risking a
+  margin call. Alpaca documents buying power, day-trading buying power,
+  maintenance margin, status and the trade-suspended flag. Intraday-margin
+  fields (`intraday_margin_deficit`, `intraday_margin_excess`,
+  `intraday_buying_power`) are applied only when the account reports them.
 - **Intraday drawdown breaker**: once equity is down
   `MAX_INTRADAY_DRAWDOWN_PCT` (2%) from the start of the day (realized +
   unrealized), new entries stop for the rest of the session even if equity
   recovers. It is checked every cycle, not only when a buy is attempted.
-- **Data**: 1Min and 5Min bars from Alpaca (paginated) with Yahoo fallback
+- **Data**: `--timeframe` defaults to 5m for `bot.py`, `train_model.py` and
+  `backtest.py` (`ML_TIMEFRAME` overrides; the history defaults are 30 days
+  for 1m, 120 for 5m and 180 for 15m). 1Min and 5Min bars from Alpaca (paginated) with Yahoo fallback
   (Yahoo keeps ~7 days of 1m and ~60 days of 5m history). Default lookback is
   30 days for 1m and 45 for 5m so EMA200 and RVOL are warmed up. The live bot
   caches history per symbol and fetches only the newest bars each cycle
@@ -583,9 +609,11 @@ Use `--folds N` for a rolling walk-forward: the unseen period is split into
 N consecutive blocks and a fresh model is trained before each one on all
 earlier data. The report shows each fold, pooled out-of-sample stats and how
 many folds had positive average R; an edge that shows up in only one period
-is flagged. Every report also breaks trades down **by entry regime** and
-(intraday) **by entry hour**, so you can see whether losses cluster in
-CHOPPY/bear regimes or at the open (`by_regime.csv`, `by_entry_hour.csv`).
+is flagged. Every report also breaks trades down **by entry regime**, and
+for intraday runs **by entry hour** and **by VWAP location** at entry (below
+-2σ ... above +2σ). This shows whether losses cluster in CHOPPY/bear
+regimes, at the open, or in stretched entries far from VWAP
+(`by_regime.csv`, `by_entry_hour.csv`, `by_vwap_zone.csv`).
 
 ```bash
 python scripts/backtest.py --timeframe 5m --days 120 --folds 4 --compare --out reports/wf

@@ -57,6 +57,7 @@ class CycleReport:
     entry_block: Optional[str] = None              # why BUYs were vetoed this cycle
     flatten: Optional[Any] = None                  # core.alpaca_executor.FlattenReport
     session_report: Optional[Dict[str, Any]] = None  # end-of-session summary (first closed cycle)
+    flat: Optional[bool] = None                    # FLATTEN phase: account verified flat?
 
     @property
     def orders(self) -> List[WorkflowResult]:
@@ -120,6 +121,8 @@ class TradingBot:
         self._session_seen: Optional[date] = None
         self._session_reported: Optional[date] = None
         self._breaker_alerted: Optional[date] = None
+        self._flat_confirmed: Optional[date] = None
+        self._not_flat_alerted: Optional[date] = None
         self.broker = broker
         self.trailing_manager = trailing_manager
         self.fill_tracker = fill_tracker
@@ -183,6 +186,7 @@ class TradingBot:
 
         if phase is SessionPhase.FLATTEN:
             self._flatten(report)
+            self._verify_flat(report, clock)
             return report
         if self.standing_entry_block:
             report.entry_block = report.entry_block or self.standing_entry_block
@@ -331,11 +335,53 @@ class TradingBot:
             f"{len(report.flatten.failures)} failure(s)" + (" (will retry next cycle)" if report.flatten.failures else "")
         )
 
+    def _verify_flat(self, report: CycleReport, clock: Optional[Dict[str, Any]]) -> None:
+        """Confirm the account is 100% flat before the close; alert (once a
+        day) if anything is still open in the last FLAT_ALERT_MINUTES."""
+        if not (self.execute and self.broker is not None):
+            return
+        try:
+            snapshot = self.broker.get_snapshot()
+        except Exception as exc:
+            logger.error(f"Could not verify the account is flat: {exc}")
+            return
+        today = self._market_date()
+        open_positions = [p for p in snapshot.positions if float(p.get("qty") or 0) != 0]
+        report.flat = not open_positions and not snapshot.open_orders
+        now_et = to_market_time(self.now_fn())
+        if report.flat:
+            if self._flat_confirmed != today:
+                self._flat_confirmed = today
+                self.telemetry.record("flat_confirmed", at_et=now_et.strftime("%H:%M:%S"))
+                logger.info(f"Account confirmed flat at {now_et:%H:%M:%S} ET")
+            return
+        close = None
+        try:
+            close = to_market_time(datetime.fromisoformat(str((clock or {}).get("next_close"))))
+        except (TypeError, ValueError):
+            pass
+        minutes_left = (close - now_et).total_seconds() / 60 if close else 0.0
+        alert_window = float(os.getenv("FLAT_ALERT_MINUTES", "5"))
+        if minutes_left <= alert_window and self._not_flat_alerted != today:
+            self._not_flat_alerted = today
+            self.telemetry.record(
+                "not_flat", logging.ERROR, at_et=now_et.strftime("%H:%M:%S"),
+                minutes_to_close=round(minutes_left, 1),
+                positions=[{"symbol": p.get("symbol"), "qty": p.get("qty")} for p in open_positions],
+                open_orders=len(snapshot.open_orders),
+            )
+            logger.error(f"NOT FLAT {minutes_left:.1f} min before the close: "
+                         f"{', '.join(str(p.get('symbol')) for p in open_positions) or 'open orders remain'}")
+
     def _next_sleep(self) -> float:
-        """Normal interval, but wake exactly at the flatten time if it comes sooner."""
+        """Normal interval, but wake exactly at the flatten time if it comes sooner,
+        and re-check every 2 minutes during the flatten window so the account is
+        verified flat (and retried) before the close."""
         clock = self._last_clock
         if self.session_clock is None or not clock or not clock.get("is_open"):
             return self.interval_seconds
+        if self.session_clock.phase_from_alpaca_clock(clock) is SessionPhase.FLATTEN:
+            return min(self.interval_seconds, 120)
         now = self.now_fn()
         until = self.session_clock.seconds_until_flatten(now, clock.get("next_close"))
         if until is not None and 0 < until < self.interval_seconds:

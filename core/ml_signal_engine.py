@@ -24,6 +24,7 @@ import pandas as pd
 from core.feature_pipeline import build_feature_frame, macro_from_primary, macro_timeframe
 from core.market_history import (
     DEFAULT_LOOKBACK_DAYS,
+    DEFAULT_TIMEFRAME,
     MARKET_TZ,
     BarCache,
     bar_length,
@@ -70,7 +71,7 @@ class MLSignalEngine:
         self.portfolio_manager = portfolio_manager
         self.strategy = strategy or MLStrategy()
         model_timeframe = (self.strategy.artifact or {}).get("timeframe")
-        self.timeframe = normalize_timeframe(timeframe or model_timeframe or os.getenv("ML_TIMEFRAME", "1Hour"))
+        self.timeframe = normalize_timeframe(timeframe or model_timeframe or os.getenv("ML_TIMEFRAME", DEFAULT_TIMEFRAME))
         if model_timeframe and normalize_timeframe(model_timeframe) != self.timeframe:
             # A model trained on hourly bars says nothing about 5-minute bars.
             logger.error(

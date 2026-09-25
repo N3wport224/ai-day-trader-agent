@@ -48,7 +48,8 @@ def _flat_bars(n=40, price=100.0, rng=1.0):
 
 def _run(bars, schedule, *, limits=None, slippage_bps=0.0, **strategy_kwargs):
     config = BacktestConfig(initial_capital=10_000, risk_per_trade_pct=1.0, slippage_bps=slippage_bps, bar_length=DAY)
-    manager = RiskManager(limits or RiskLimits(min_price=1.0, max_position_pct=1.0))
+    # margin_buffer_pct=0: these tests are about fill mechanics, not the margin cushion
+    manager = RiskManager(limits or RiskLimits(min_price=1.0, max_position_pct=1.0, margin_buffer_pct=0))
     return Backtester(_strategy(schedule, **strategy_kwargs), manager, config).run({"AAA": bars})
 
 
@@ -113,7 +114,7 @@ def test_queued_orders_reserve_buying_power() -> None:
     bars = {f"S{i}": _flat_bars() for i in range(3)}
     day = bars["S0"].index[30]
     config = BacktestConfig(initial_capital=10_000, bar_length=DAY, slippage_bps=0)
-    manager = RiskManager(RiskLimits(max_daily_trades=10, min_price=1.0, max_position_pct=0.6))
+    manager = RiskManager(RiskLimits(max_daily_trades=10, min_price=1.0, max_position_pct=0.6, margin_buffer_pct=0))
 
     result = Backtester(_strategy({day: 0.9}), manager, config).run(bars)
 

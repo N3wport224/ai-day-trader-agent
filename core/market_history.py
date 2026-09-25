@@ -45,6 +45,15 @@ MARKET_TZ = ZoneInfo("America/New_York")
 INTRADAY_TIMEFRAMES = ("1Min", "5Min", "15Min")
 # History needed per timeframe: EMA200 warm-up plus ~20 sessions for relative volume.
 DEFAULT_LOOKBACK_DAYS = {"1Min": 30, "5Min": 45, "15Min": 60, "1Hour": 60, "1Day": 400}
+# History for training/backtesting when --days isn't given: enough sessions for a
+# walk-forward test without asking for years of minute bars.
+TRAINING_HISTORY_DAYS = {"1Min": 30, "5Min": 120, "15Min": 180}
+DEFAULT_TIMEFRAME = "5Min"  # day-trading default for the CLIs (ML_TIMEFRAME overrides)
+
+
+def default_history_days(timeframe: str, fallback: int) -> int:
+    """Days of history for a training/backtest run on ``timeframe``."""
+    return TRAINING_HISTORY_DAYS.get(normalize_timeframe(timeframe), fallback)
 
 
 def normalize_timeframe(timeframe: str) -> str:

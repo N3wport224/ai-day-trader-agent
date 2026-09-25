@@ -51,6 +51,14 @@ def _isolate_runtime_files(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(AlpacaExecutor, "get_snapshot", lambda self: BrokerSnapshot(positions=[], open_orders=[]))
     monkeypatch.setattr(AlpacaExecutor, "get_quote", lambda self, symbol: None)  # no quote: spread filter skipped
 
+    def _no_network_get_order(self, order_id):
+        import requests
+
+        raise requests.exceptions.ConnectionError("tests never reach Alpaca")
+
+    monkeypatch.setattr(AlpacaExecutor, "get_order", _no_network_get_order)
+    monkeypatch.setenv("FLATTEN_CONFIRM_SECONDS", "0")
+
 
 # ---------------------------------------------------------------------------
 # Dashboard API fixtures (tests/test_dashboard_control.py and friends)

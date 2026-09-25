@@ -38,6 +38,7 @@ import numpy as np
 import pandas as pd
 
 from core.feature_pipeline import build_feature_frame, macro_from_primary
+from core.features import VWAP_ZONES, vwap_zone
 from core.market_history import timeframe_from_length
 from core.ml_strategy import MLStrategy, _snapshot_from_row
 from core.news_sentiment import SENTIMENT_FEATURES
@@ -107,6 +108,7 @@ class Trade:
     initial_stop: Optional[float] = None
     high_water: Optional[float] = None
     regime: Optional[str] = None   # market regime when the entry signal fired
+    vwap_zone: Optional[str] = None  # VWAP band at the entry decision (intraday)
 
     @property
     def entry_hour_et(self) -> int:
@@ -159,6 +161,7 @@ class BacktestResult:
                     "initial_stop": t.initial_stop,
                     "regime": t.regime,
                     "entry_hour_et": t.entry_hour_et,
+                    "vwap_zone": t.vwap_zone,
                     "pnl": round(t.pnl, 2),
                     "r_multiple": round(t.r_multiple, 3),
                 }
@@ -368,6 +371,7 @@ class Backtester:
                                 probability_up=order["p_up"],
                                 costs=cfg.commission_per_share * qty,
                                 regime=order.get("regime"),
+                                vwap_zone=order.get("vwap_zone"),
                             )
 
                     # 2. Bracket legs (the entry bar included).
@@ -475,6 +479,7 @@ class Backtester:
                             "price": c,
                             "day": day,
                             "regime": signal.regime,
+                            "vwap_zone": vwap_zone(row.get("vwap_z")),
                         }
                         entries_by_day[day] = entries_by_day.get(day, 0) + 1
                     else:
@@ -541,7 +546,7 @@ def compute_metrics(result: BacktestResult) -> Dict[str, float]:
 
 
 def attribution(trades: List[Trade], by: str) -> pd.DataFrame:
-    """Per-group trade stats; ``by`` is "regime" or "entry_hour_et".
+    """Per-group trade stats; ``by`` is "regime", "entry_hour_et" or "vwap_zone".
 
     Answers "where does the strategy make or lose money?" — e.g. whether
     losses cluster in CHOPPY regimes or in the first hour of the session.
@@ -568,6 +573,9 @@ def attribution(trades: List[Trade], by: str) -> pd.DataFrame:
             "share_of_pnl_pct": (grouped["pnl"].sum() / total * 100).round(1) if total else np.nan,
         }
     ).reset_index()
+    if by == "vwap_zone":  # low-to-high band order, not alphabetical
+        order = {zone: i for i, zone in enumerate(VWAP_ZONES)}
+        table = table.sort_values(by, key=lambda s: s.map(lambda z: order.get(z, len(order))))
     return table[columns]
 
 
@@ -619,4 +627,7 @@ def format_report(result: BacktestResult, title: str = "Backtest") -> str:
         if result.config.bar_length < timedelta(days=1):
             lines.append("\nBy entry hour (ET):")
             lines.append(attribution(result.trades, "entry_hour_et").to_string(index=False))
+            if any(t.vwap_zone for t in result.trades):
+                lines.append("\nBy VWAP location at entry:")
+                lines.append(attribution(result.trades, "vwap_zone").to_string(index=False))
     return "\n".join(lines)

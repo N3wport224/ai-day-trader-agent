@@ -38,7 +38,9 @@ from dotenv import load_dotenv  # noqa: E402
 load_dotenv()
 
 from core.market_context import market_symbol  # noqa: E402
-from core.market_history import bar_length, get_history, is_intraday, normalize_timeframe  # noqa: E402
+from core.market_history import (  # noqa: E402
+    DEFAULT_TIMEFRAME, bar_length, default_history_days, get_history, is_intraday, normalize_timeframe,
+)
 from core.ml_strategy import DEFAULT_MODEL_PATH  # noqa: E402
 from core.ml_training import (  # noqa: E402
     LabelParams,
@@ -60,10 +62,12 @@ logger = logging.getLogger("train_model")
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--symbols", default=os.getenv("WATCHLIST", "AAPL,MSFT,NVDA,AMD,SPY"))
-    parser.add_argument("--timeframe", default=os.getenv("ML_TIMEFRAME", "1Hour"),
-                        help="1m, 5m, 15m, 1h (default) or 1d; intraday timeframes add VWAP/RVOL/ORB "
+    parser.add_argument("--timeframe", default=os.getenv("ML_TIMEFRAME", DEFAULT_TIMEFRAME),
+                        help="1m, 5m (default), 15m, 1h or 1d; intraday timeframes add VWAP/RVOL/ORB "
                              "features and end labels at the session close")
-    parser.add_argument("--days", type=int, default=365, help="Days of history per symbol")
+    parser.add_argument("--days", type=int, default=None,
+                        help="Days of history per symbol (default: 30 for 1m, 120 for 5m, 180 for 15m, "
+                             "365 otherwise)")
     parser.add_argument("--horizon", type=int, default=12, help="Bars to wait for target/stop")
     parser.add_argument("--stop-atr", type=float, default=float(os.getenv("ATR_STOP_MULT", "1.5")))
     parser.add_argument("--target-atr", type=float, default=float(os.getenv("ATR_TARGET_MULT", "3.0")))
@@ -87,6 +91,8 @@ def main(argv: list[str] | None = None) -> int:
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
     args.timeframe = normalize_timeframe(args.timeframe)
+    if args.days is None:
+        args.days = default_history_days(args.timeframe, 365)
     params = LabelParams(horizon=args.horizon, stop_atr_mult=args.stop_atr, target_atr_mult=args.target_atr)
     bar_len = bar_length(args.timeframe)
     symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
