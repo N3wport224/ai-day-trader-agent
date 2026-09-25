@@ -44,6 +44,8 @@ DEFAULT_EVENTS = (
     "bot_started",
     "bot_stopped",
     "bot_error",
+    "bot_restarted",
+    "bot_restart_blocked",
 )
 
 
@@ -99,6 +101,10 @@ def format_alert(event: Dict[str, Any]) -> Optional[str]:
         return f"▶️ Bot started: {event.get('mode')}, {event.get('timeframe')}, {event.get('symbols')}"
     if name == "bot_stopped":
         return f"⏹️ Bot stopped ({event.get('reason')})"
+    if name == "bot_restarted":
+        return f"🔁 Bot restarted automatically ({event.get('reason')})"
+    if name == "bot_restart_blocked":
+        return f"⚠️ Bot is down and was NOT restarted: {event.get('reason')}"
     if name == "bot_error":
         return f"❗ Bot error: {event.get('message')}"
     return None

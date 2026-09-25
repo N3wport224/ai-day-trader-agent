@@ -19,6 +19,7 @@ from starlette.requests import Request
 import logging
 import os
 import pathlib
+from contextlib import asynccontextmanager
 
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
@@ -35,7 +36,46 @@ from config.api.websockets import websocket_endpoint
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ai_day_trader_api")
 
+async def _supervisor_loop() -> None:
+    """Keep bots that should be running alive (after crashes or a reboot)."""
+    import asyncio
+
+    from fastapi.concurrency import run_in_threadpool
+
+    from config.api.control import get_bot_manager, supervise_once
+
+    interval = float(os.getenv("SUPERVISOR_INTERVAL_SECONDS", "30"))
+    while True:
+        try:
+            await run_in_threadpool(supervise_once, get_bot_manager())
+        except Exception as exc:  # never let supervision take the server down
+            logger.error(f"Bot supervisor error: {exc}")
+        await asyncio.sleep(interval)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    import asyncio
+
+    from config.api.control import get_bot_manager
+    from core.bot_manager import try_singleton_lock
+
+    # With several server workers only one may supervise, or two could restart the same bot.
+    lock = try_singleton_lock(get_bot_manager().root / "logs" / "supervisor.lock")
+    task = asyncio.create_task(_supervisor_loop()) if lock else None
+    if lock is None:
+        logger.info("Another dashboard process is supervising the bots")
+    try:
+        yield
+    finally:
+        if task:
+            task.cancel()
+        if lock:
+            lock.close()
+
+
 app = FastAPI(
+    lifespan=lifespan,
     title="AI Day Trader Agent API",
     description="Secure REST API for portfolio management, trading, and analysis.",
     version="1.0.0",

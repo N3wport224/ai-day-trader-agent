@@ -277,6 +277,17 @@ class AlpacaExecutor:
         resp.raise_for_status()
         return resp.json()
 
+    def get_portfolio_history(self, period: str = "1M", timeframe: str = "1D") -> Dict:
+        """Account equity over time (GET /v2/account/portfolio/history)."""
+        resp = requests.get(
+            f"{self.base_url}/account/portfolio/history",
+            headers=self.headers,
+            params={"period": period, "timeframe": timeframe, "intraday_reporting": "market_hours"},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
     def get_clock(self) -> Dict:
         """Return Alpaca's market clock (is_open, next_open, next_close)."""
         resp = requests.get(

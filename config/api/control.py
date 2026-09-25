@@ -15,14 +15,17 @@ Live-money interlocks, all enforced server-side:
 
 from __future__ import annotations
 
+import csv
 import json
 import logging
 import os
+from datetime import datetime, timezone
+from pathlib import Path
 from functools import lru_cache
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import requests
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 
@@ -31,10 +34,11 @@ from config.api.dependencies import get_portfolio_manager
 from config.api.settings import KEY_GROUPS, require_local
 from core.alpaca_executor import AlpacaExecutor, live_trading_armed
 from core.alpaca_executor_provider import clear_alpaca_executor_cache
-from core.bot_manager import MODES, BotManager, mode_env
+from core.bot_manager import MODES, PROJECT_ROOT, BotManager, mode_env
+from core.performance import PERIODS, compare_with_backtest, equity_series, load_live_trades, summarize, trades_csv
 from core.edge_gate import report_path
 from core.env_store import update_env
-from core.execution_telemetry import EventLog
+from core.execution_telemetry import EventLog, default_alert_sink
 from core.portfolio_manager import PortfolioManager
 
 logger = logging.getLogger(__name__)
@@ -135,6 +139,29 @@ async def stop_validation(current_user: User = Depends(get_admin_user),
     return {"stopping": manager.validation.stop()}
 
 
+VALIDATION_REPORT_DIR = Path("reports") / "validation"  # relative to the bot manager's root
+
+
+def _read_csv_rows(path: Path, limit: int = 60) -> List[Dict[str, Any]]:
+    try:
+        with path.open(encoding="utf-8", newline="") as fh:
+            return [row for _, row in zip(range(limit), csv.DictReader(fh))]
+    except OSError:
+        return []
+
+
+@router.get("/validate/report")
+async def validation_report(current_user: User = Depends(get_admin_user),
+                            manager: BotManager = Depends(get_bot_manager)):
+    """Detail tables from the last validation run (per test period, per entry hour, per regime)."""
+    folder = manager.root / VALIDATION_REPORT_DIR
+    return {
+        "folds": _read_csv_rows(folder / "folds.csv"),
+        "by_entry_hour": _read_csv_rows(folder / "by_entry_hour.csv"),
+        "by_regime": _read_csv_rows(folder / "by_regime.csv"),
+    }
+
+
 # Per-mode routes come after the fixed paths above so /validate/... isn't taken as a mode.
 @router.get("/{mode}/status")
 async def bot_status(mode: str, current_user: User = Depends(get_admin_user),
@@ -226,28 +253,61 @@ def _ensure_portfolio(db: PortfolioManager, mode: str) -> None:
         db.create_portfolio(name, equity if equity > 0 else 10_000.0)
 
 
+def start_block_reason(mode: str, execute: bool) -> Optional[str]:
+    """Safety conditions shared by manual starts and automatic restarts."""
+    if not _keys_configured(mode):
+        return f"Add your {mode} API keys on the API Keys tab first."
+    if mode == "live":
+        if not live_trading_armed():
+            return "Live trading is not armed. Arm it on this tab first."
+        if execute:
+            edge = edge_report_summary()
+            if not edge["passed"]:
+                return ("The strategy has not passed validation, so it can't trade real money. "
+                        + (edge.get("message") or "; ".join(edge.get("failures") or [])))
+    return None
+
+
+def auto_resume_enabled() -> bool:
+    return os.getenv("AUTO_RESUME_BOTS", "true").strip().lower() not in {"0", "false", "no", "off"}
+
+
+_last_supervisor_note: Dict[str, Any] = {}
+
+
+def supervise_once(manager: BotManager) -> List[Dict[str, Any]]:
+    """One supervisor pass: restart bots that should be running (crash, reboot)."""
+    if not auto_resume_enabled():
+        return []
+    actions = manager.supervise(lambda mode, want: start_block_reason(mode, bool(want.get("execute"))))
+    for action in actions:
+        mode = action["mode"]
+        key = (action["action"], action.get("reason"))
+        if action["action"] != "restarted" and _last_supervisor_note.get(mode) == key:
+            continue  # don't repeat the same "skipped"/"gave up" note every pass
+        _last_supervisor_note[mode] = key
+        level = logging.WARNING if action["action"] == "restarted" else logging.ERROR
+        EventLog(mode_env(mode, manager.root)["EXECUTION_LOG_PATH"], alerts=default_alert_sink()).record(
+            "bot_restarted" if action["action"] == "restarted" else "bot_restart_blocked",
+            level, reason=action.get("reason") or "bot was not running (crash or computer restart)",
+        )
+        logger.log(level, f"Supervisor: {mode} bot {action['action']} ({action.get('reason') or 'ok'})")
+    return actions
+
+
 @router.post("/{mode}/start")
 async def start_bot(mode: str, body: StartRequest, request: Request,
                     current_user: User = Depends(get_admin_user),
                     manager: BotManager = Depends(get_bot_manager),
                     db: PortfolioManager = Depends(get_portfolio_manager)):
     _check_mode(mode)
-    if not _keys_configured(mode):
-        raise HTTPException(status_code=400, detail=f"Add your {mode} API keys on the API Keys tab first.")
     if mode == "live":
         require_local(request)
-        if not live_trading_armed():
-            raise HTTPException(status_code=400, detail="Live trading is not armed. Arm it on this tab first.")
-        if body.execute:
-            if not body.confirm_live:
-                raise HTTPException(status_code=400, detail="Confirm that the live bot will trade real money.")
-            edge = edge_report_summary()
-            if not edge["passed"]:
-                raise HTTPException(
-                    status_code=400,
-                    detail="The strategy has not passed validation, so it can't trade real money. "
-                           + (edge.get("message") or "; ".join(edge.get("failures") or [])),
-                )
+    if mode == "live" and body.execute and _keys_configured(mode) and live_trading_armed() and not body.confirm_live:
+        raise HTTPException(status_code=400, detail="Confirm that the live bot will trade real money.")
+    blocked = start_block_reason(mode, body.execute)
+    if blocked:
+        raise HTTPException(status_code=400, detail=blocked)
     if body.execute:
         await run_in_threadpool(_ensure_portfolio, db, mode)
     try:
@@ -266,6 +326,57 @@ async def stop_bot(mode: str, current_user: User = Depends(get_admin_user),
     stopped = manager.stop_bot(mode)
     return {"stopping": stopped, "message": "Stopping after the current cycle; open positions keep their "
                                             "broker-side stops." if stopped else "The bot was not running."}
+
+
+def _performance(mode: str, period: str, root: Path = PROJECT_ROOT) -> Dict[str, Any]:
+    trades = load_live_trades(Path(mode_env(mode, root)["EDGE_MONITOR_STATE_PATH"]))
+    live = summarize(trades)
+    edge = edge_report_summary()
+    backtest = edge.get("metrics") if edge.get("passed") else None
+    result: Dict[str, Any] = {
+        "mode": mode,
+        "period": period,
+        "live": live,
+        "backtest": backtest,
+        "comparison": compare_with_backtest(live, backtest),
+        "recent_trades": list(reversed(trades[-50:])),
+        "equity": [],
+        "equity_message": None,
+    }
+    if not _keys_configured(mode):
+        result["equity_message"] = f"Add your {mode} API keys to see the account's equity history."
+        return result
+    alpaca_period, timeframe = PERIODS[period]
+    try:
+        history = _read_only_executor(mode).get_portfolio_history(alpaca_period, timeframe)
+        result["equity"] = equity_series(history)
+        if not result["equity"]:
+            result["equity_message"] = "No equity history for this period yet."
+    except requests.RequestException as exc:
+        result["equity_message"] = f"Could not load equity history from Alpaca ({exc.__class__.__name__})."
+    return result
+
+
+@router.get("/{mode}/performance")
+async def performance(mode: str, period: str = "1M", current_user: User = Depends(get_admin_user),
+                      manager: BotManager = Depends(get_bot_manager)):
+    _check_mode(mode)
+    if period not in PERIODS:
+        raise HTTPException(status_code=400, detail=f"period must be one of {', '.join(PERIODS)}")
+    return await run_in_threadpool(_performance, mode, period, manager.root)
+
+
+@router.get("/{mode}/trades.csv")
+async def trades_csv_download(mode: str, current_user: User = Depends(get_admin_user),
+                              manager: BotManager = Depends(get_bot_manager)):
+    _check_mode(mode)
+    trades = load_live_trades(Path(mode_env(mode, manager.root)["EDGE_MONITOR_STATE_PATH"]))
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
+    return Response(
+        content=trades_csv(trades),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{mode}_trades_{stamp}.csv"'},
+    )
 
 
 class FlattenRequest(BaseModel):

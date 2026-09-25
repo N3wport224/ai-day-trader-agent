@@ -74,6 +74,28 @@ The bot runs as its own background process (`bot.py --mode paper|live`), with se
 logs and state per mode under `logs/<mode>/` and `data/<mode>/`. It keeps running if you
 close the browser. Stop it from the dashboard.
 
+**Tracking results.** The Paper and Live tabs each have a **Performance** card with:
+- the account's equity curve (1 day to 1 year);
+- the bot's closed trades, with win rate, average R and profit factor shown next to what
+  the validation test predicted;
+- a plain-language verdict: *on track*, *keep watching*, *behind the test* or *too early
+  to tell* (it needs about 20 trades before judging);
+- a trade journal with CSV download.
+
+**Get Started → See the test details** shows every walk-forward test period plus
+breakdowns by time of day and market regime. Look for an edge that holds up across
+periods, not one lucky stretch.
+
+**Running unattended.** The dashboard remembers which bots you started. If a bot
+crashes, or the computer restarts, it is started again with the same settings:
+- at most 3 times an hour;
+- only if the same safety checks pass (for live: keys, arming, validation);
+- never for a bot you stopped yourself.
+
+Turn on **API Keys → Run automatically → Start the dashboard when I log in** and it
+comes back by itself after a reboot. On Windows this adds a Startup-folder item; on a
+Mac, a login LaunchAgent. Set `AUTO_RESUME_BOTS=false` to turn auto-restart off.
+
 ### Running it on your own computer (Windows or Mac)
 
 **One-time setup**

@@ -81,6 +81,7 @@ const Control = (() => {
     show(saved && $(`view-${saved}`) ? saved : 'start');
     loadOverview();
     loadKeys();
+    loadAutostart();
     stopTimers();
     state.timers.push(setInterval(loadOverview, 15000));
     state.timers.push(setInterval(refreshActive, 5000));
@@ -128,9 +129,43 @@ const Control = (() => {
     el.className = `nav-badge ${text ? cls : ''}`;
   }
 
+  let reportFor = null;
+
+  async function loadReport(edge) {
+    const target = $('val-details');
+    if (!target || !edge || !edge.exists) return;
+    if (reportFor === edge.created_at && target.dataset.filled) return;
+    target.innerHTML = '<div class="empty-state">Loading…</div>';
+    reportFor = edge.created_at;
+    try {
+      const r = await api('GET', '/control/validate/report');
+      const table = (rows, cols) => (rows.length
+        ? `<table class="table"><thead><tr>${cols.map(([, h]) => `<th>${esc(h)}</th>`).join('')}</tr></thead><tbody>
+            ${rows.map((row) => `<tr>${cols.map(([k, , f]) => `<td>${esc(f ? f(row[k]) : row[k])}</td>`).join('')}</tr>`).join('')}</tbody></table>`
+        : '<div class="empty-state">No data.</div>');
+      const day = (v) => (v ? new Date(v).toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' }) : '');
+      const hour = (v) => (v === 'n/a' ? v : `${v}:00 ET`);
+      target.innerHTML = `
+        <h4>Each test period (the model never saw these days before trading them)</h4>
+        ${table(r.folds, [['fold', 'Period'], ['start', 'From', day], ['end', 'To', day], ['trades', 'Trades'],
+          ['win_rate_pct', 'Win %'], ['avg_r', 'Avg R'], ['return_pct', 'Return %'], ['buy_hold_pct', 'Buy & hold %'], ['max_dd_pct', 'Max drawdown %']])}
+        <h4>By time of day</h4>
+        ${table(r.by_entry_hour, [['entry_hour_et', 'Entry hour', hour], ['trades', 'Trades'], ['win_rate_pct', 'Win %'],
+          ['avg_r', 'Avg R'], ['total_pnl', 'P&L $'], ['share_of_pnl_pct', 'Share of P&L %']])}
+        <h4>By market regime</h4>
+        ${table(r.by_regime, [['regime', 'Regime'], ['trades', 'Trades'], ['win_rate_pct', 'Win %'], ['avg_r', 'Avg R'],
+          ['total_pnl', 'P&L $']])}
+        <p class="muted small">Look for an edge that shows up in most periods and hours, not one lucky stretch.</p>`;
+      target.dataset.filled = '1';
+    } catch { reportFor = null; }
+  }
+
   function renderEdge(edge) {
     const box = $('val-result');
     if (!box) return;
+    const key = edge && edge.exists ? `${edge.created_at}|${edge.passed}` : '';
+    if (box.dataset.key === key) return;  // unchanged: keep the open details panel as it is
+    box.dataset.key = key;
     if (!edge || !edge.exists) { box.innerHTML = ''; return; }
     const m = edge.metrics || {};
     const when = edge.created_at ? new Date(edge.created_at).toLocaleString() : '';
@@ -141,6 +176,10 @@ const Control = (() => {
       : `<div class="notice bad"><b>✗ No reliable edge found</b> (${esc(when)}). The bot will not open trades with this setup.
           <ul>${(edge.failures || []).map((f) => `<li>${esc(f)}</li>`).join('')}</ul>
           <span class="muted">Try other liquid stocks or more history, but don't keep tweaking until something passes: that finds luck, not an edge.</span></div>`;
+    if (!box.querySelector('#val-details-box')) {
+      box.insertAdjacentHTML('beforeend', '<details class="journal" id="val-details-box"><summary>See the test details</summary><div id="val-details"></div></details>');
+    }
+    loadReport(edge);
   }
 
   /* ── Validation job ── */
@@ -221,6 +260,24 @@ const Control = (() => {
     catch (ex) { toast(ex.message, 'error'); }
   }
 
+  async function loadAutostart() {
+    try { renderAutostart(await api('GET', '/settings/autostart')); } catch {}
+  }
+
+  function renderAutostart(a) {
+    $('autostart-toggle').checked = !!a.enabled;
+    $('autostart-status').textContent = a.enabled ? 'starts at login' : 'manual start';
+    $('autostart-status').className = `pill ${a.enabled ? 'ok' : ''}`;
+    $('autostart-path').textContent = a.enabled ? `Login item: ${a.path}` : '';
+  }
+
+  async function toggleAutostart(e) {
+    try {
+      renderAutostart(await api('PUT', '/settings/autostart', { enabled: e.target.checked }));
+      toast(e.target.checked ? 'The dashboard will start when you log in.' : 'Login start turned off.', 'success');
+    } catch (ex) { e.target.checked = !e.target.checked; toast(ex.message, 'error'); }
+  }
+
   async function saveAlerts() {
     const url = $('alert-url').value.trim();
     if (!url) return;
@@ -278,6 +335,23 @@ const Control = (() => {
           <div id="${mode}-positions"><div class="empty-state">No positions</div></div>
         </div>
 
+        <div class="card perf-card">
+          <div class="card-head">
+            <h3>Performance</h3>
+            <div class="seg" role="group" aria-label="Time range" id="${mode}-periods">
+              ${['1D', '1W', '1M', '3M', '1Y'].map((p) => `<button type="button" data-period="${p}" class="${p === '1M' ? 'active' : ''}">${p}</button>`).join('')}
+            </div>
+          </div>
+          <div class="chart-wrap" id="${mode}-equity"><div class="empty-state">Loading…</div></div>
+          <div id="${mode}-verdict"></div>
+          <div class="tiles" id="${mode}-tiles"></div>
+          <details class="journal">
+            <summary>Trade journal <span class="muted small" id="${mode}-journal-count"></span></summary>
+            <div id="${mode}-journal"></div>
+            <button type="button" class="btn btn-outline btn-sm" id="${mode}-csv">Download all trades (CSV)</button>
+          </details>
+        </div>
+
         ${live ? '' : `
         <div class="card">
           <h3>Manual paper order</h3>
@@ -311,6 +385,14 @@ const Control = (() => {
     $(`${mode}-start`).addEventListener('click', () => startBot(mode));
     $(`${mode}-stop`).addEventListener('click', () => stopBot(mode));
     $(`${mode}-flatten`).addEventListener('click', () => flatten(mode));
+    $(`${mode}-periods`).addEventListener('click', (e) => {
+      const b = e.target.closest('[data-period]');
+      if (!b) return;
+      perf[mode].period = b.dataset.period;
+      $(`${mode}-periods`).querySelectorAll('button').forEach((x) => x.classList.toggle('active', x === b));
+      loadPerformance(mode, true);
+    });
+    $(`${mode}-csv`).addEventListener('click', () => downloadCsv(mode));
     if (!live) $('paper-order-submit').addEventListener('click', submitPaperOrder);
     try {
       const saved = JSON.parse(localStorage.getItem(`adt_${mode}_settings`) || 'null');
@@ -325,6 +407,7 @@ const Control = (() => {
       const s = await api('GET', `/control/${mode}/status`);
       renderStatus(mode, s);
     } catch (ex) { if (ex.status === 403) return; }
+    loadPerformance(mode);
     if (Date.now() - lastAccountLoad[mode] > 15000) {
       lastAccountLoad[mode] = Date.now();
       try { renderAccount(mode, await api('GET', `/control/${mode}/account`)); } catch {}
@@ -415,7 +498,7 @@ const Control = (() => {
   function renderPositions(mode, positions) {
     const box = $(`${mode}-positions`);
     if (!positions.length) { box.innerHTML = '<div class="empty-state">No open positions</div>'; return; }
-    box.innerHTML = `<table class="table"><thead><tr><th>Symbol</th><th>Shares</th><th>Avg cost</th><th>Price</th><th>Value</th><th>P&amp;L</th></tr></thead><tbody>
+    box.innerHTML = `<table class="table positions-table"><thead><tr><th>Symbol</th><th>Shares</th><th>Avg cost</th><th>Price</th><th>Value</th><th>P&amp;L</th></tr></thead><tbody>
       ${positions.map((p) => `<tr><td class="mono">${esc(p.symbol)}</td><td>${esc(p.qty)}</td><td>${money(p.avg_entry_price)}</td>
         <td>${money(p.current_price)}</td><td>${money(p.market_value)}</td>
         <td class="${signCls(p.unrealized_pl)}">${money(p.unrealized_pl)} <small>${pct(p.unrealized_plpc)}</small></td></tr>`).join('')}
@@ -442,6 +525,8 @@ const Control = (() => {
       case 'bot_started': return ['▶️', 'Bot started'];
       case 'bot_stopped': return ['⏹️', `Bot stopped (${e.reason || 'requested'})`];
       case 'bot_error': return ['❗', `Error: ${e.message}`];
+      case 'bot_restarted': return ['🔁', 'Bot restarted automatically'];
+      case 'bot_restart_blocked': return ['⚠️', `Bot is down and was not restarted: ${e.reason}`];
       default: return null;
     }
   }
@@ -452,6 +537,142 @@ const Control = (() => {
       ? items.map(([e, [icon, text]]) => `<li><span class="ev-icon">${icon}</span><span class="ev-text">${esc(text)}</span>
           <span class="ev-time">${e.ts ? esc(new Date(e.ts).toLocaleTimeString()) : ''}</span></li>`).join('')
       : '<li class="empty-state">Nothing yet. Activity appears here once the bot runs during market hours.</li>';
+  }
+
+  /* ── Performance ── */
+  const perf = { paper: { period: '1M', at: 0 }, live: { period: '1M', at: 0 } };
+
+  async function loadPerformance(mode, force = false) {
+    if (!force && Date.now() - perf[mode].at < 60000) return;
+    perf[mode].at = Date.now();
+    try {
+      const p = await api('GET', `/control/${mode}/performance?period=${perf[mode].period}`);
+      perf[mode].data = p;
+      renderPerformance(mode, p);
+    } catch { perf[mode].at = 0; }
+  }
+
+  function renderPerformance(mode, p) {
+    drawEquity($(`${mode}-equity`), p.equity || [], p.equity_message);
+    const c = p.comparison || {};
+    const cls = { on_track: 'ok', behind: 'bad', watch: 'warn' }[c.status] || '';
+    $(`${mode}-verdict`).innerHTML = c.message
+      ? `<div class="notice ${cls}"><b>${esc({ on_track: 'On track', behind: 'Behind the test', watch: 'Keep watching',
+          too_early: 'Too early to tell', no_backtest: 'No test to compare' }[c.status] || 'Live vs test')}:</b> ${esc(c.message)}</div>` : '';
+    const l = p.live || {};
+    const b = p.backtest || {};
+    const tile = (label, value, sub) => `<div class="tile"><span>${esc(label)}</span><b>${value}</b>${sub ? `<small>${sub}</small>` : ''}</div>`;
+    const num = (v, d = 2) => (v == null ? '—' : Number(v).toFixed(d));
+    $(`${mode}-tiles`).innerHTML = [
+      tile('Bot trades closed', esc(l.trades ?? 0)),
+      tile('Bot P&L', `<span class="${signCls(l.total_pnl)}">${money(l.total_pnl)}</span>`),
+      tile('Win rate', l.win_rate_pct == null ? '—' : `${esc(l.win_rate_pct)}%`, b.win_rate_pct != null ? `test ${esc(b.win_rate_pct)}%` : ''),
+      tile('Avg per trade', l.avg_r == null ? '—' : `${l.avg_r >= 0 ? '+' : ''}${num(l.avg_r)}R`, b.avg_r != null ? `test ${b.avg_r >= 0 ? '+' : ''}${num(b.avg_r)}R` : ''),
+      tile('Profit factor', l.profit_factor == null ? (l.trades && !l.losing_trades ? 'no losses yet' : '—') : num(l.profit_factor),
+        b.profit_factor != null ? `test ${num(b.profit_factor)}` : ''),
+    ].join('');
+    const trades = p.recent_trades || [];
+    $(`${mode}-journal-count`).textContent = trades.length ? `(latest ${trades.length})` : '(none yet)';
+    $(`${mode}-journal`).innerHTML = trades.length
+      ? `<table class="table journal-table"><thead><tr><th>Symbol</th><th>Shares</th><th>Entry</th><th>Exit</th><th>P&amp;L</th><th>R</th><th>Closed</th></tr></thead><tbody>
+        ${trades.map((t) => `<tr><td class="mono">${esc(t.symbol)}</td><td>${esc(t.qty)}</td><td>${money(t.entry_price)}</td>
+          <td>${money(t.exit_price)}</td><td class="${signCls(t.pnl)}">${money(t.pnl)}</td>
+          <td>${t.r_multiple == null ? '—' : (t.r_multiple >= 0 ? '+' : '') + Number(t.r_multiple).toFixed(2)}</td>
+          <td>${t.exit_at ? esc(new Date(t.exit_at).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })) : ''}</td></tr>`).join('')}
+        </tbody></table>`
+      : '<div class="empty-state">Closed trades appear here. R = profit measured in units of the risk taken (1R = the stop distance).</div>';
+  }
+
+  function niceTicks(min, max, count = 4) {
+    if (min === max) { min -= 1; max += 1; }
+    const raw = (max - min) / count;
+    const mag = 10 ** Math.floor(Math.log10(raw));
+    const step = [1, 2, 2.5, 5, 10].map((m) => m * mag).find((s) => s >= raw);
+    const lo = Math.floor(min / step) * step;
+    const ticks = [];
+    for (let v = lo; v <= max + step * 0.5; v += step) ticks.push(Number(v.toFixed(10)));
+    return ticks;
+  }
+
+  function drawEquity(box, points, message) {
+    if (!points.length) {
+      box.innerHTML = `<div class="empty-state">${esc(message || 'No equity history yet.')}</div>`;
+      return;
+    }
+    const W = Math.max(280, box.clientWidth || 600);
+    const H = 220;
+    const m = { l: 64, r: 16, t: 14, b: 26 };
+    const vals = points.map((p) => p.equity);
+    const ticks = niceTicks(Math.min(...vals), Math.max(...vals));
+    const yMin = ticks[0];
+    const yMax = ticks[ticks.length - 1];
+    const x = (i) => m.l + (points.length === 1 ? (W - m.l - m.r) / 2 : (i / (points.length - 1)) * (W - m.l - m.r));
+    const y = (v) => m.t + (1 - (v - yMin) / (yMax - yMin || 1)) * (H - m.t - m.b);
+    const line = points.map((p, i) => `${i ? 'L' : 'M'}${x(i).toFixed(1)},${y(p.equity).toFixed(1)}`).join('');
+    const area = `${line}L${x(points.length - 1).toFixed(1)},${y(yMin).toFixed(1)}L${x(0).toFixed(1)},${y(yMin).toFixed(1)}Z`;
+    const fmtT = (t) => new Date(t).toLocaleDateString([], { month: 'short', day: 'numeric' });
+    const intraday = points.length > 1 && (new Date(points[points.length - 1].t) - new Date(points[0].t)) < 2 * 86400000;
+    const fmtX = (t) => (intraday ? new Date(t).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : fmtT(t));
+    const xl = [0, Math.floor((points.length - 1) / 2), points.length - 1].filter((v, i, a) => a.indexOf(v) === i);
+    const last = points[points.length - 1];
+    const first = points[0];
+    const change = last.equity - first.equity;
+    // One format for the whole axis (never "$102K" next to "$99,000").
+    const big = Math.max(...ticks.map(Math.abs)) >= 100000;
+    const axisFmt = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD',
+      notation: big ? 'compact' : 'standard', maximumFractionDigits: big ? 1 : 0 });
+    const compact = (v) => axisFmt.format(v);
+    box.innerHTML = `
+      <div class="chart-head"><span class="muted small">Account equity</span>
+        <b>${money(last.equity)}</b> <span class="small ${signCls(change)}">${change >= 0 ? '+' : ''}${money(change)} this period</span></div>
+      <svg class="equity" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" role="img"
+           aria-label="Account equity from ${esc(fmtT(first.t))} (${esc(money(first.equity))}) to ${esc(fmtT(last.t))} (${esc(money(last.equity))})">
+        ${ticks.map((v) => `<line class="grid" x1="${m.l}" x2="${W - m.r}" y1="${y(v)}" y2="${y(v)}"/>
+          <text class="axis" x="${m.l - 8}" y="${y(v) + 4}" text-anchor="end">${esc(compact(v))}</text>`).join('')}
+        ${xl.map((i) => `<text class="axis" x="${x(i)}" y="${H - 6}" text-anchor="${i === 0 ? 'start' : i === points.length - 1 ? 'end' : 'middle'}">${esc(fmtX(points[i].t))}</text>`).join('')}
+        <path class="area" d="${area}"/>
+        <path class="line" d="${line}"/>
+        <circle class="end" cx="${x(points.length - 1)}" cy="${y(last.equity)}" r="4"/>
+        <g class="hover" visibility="hidden"><line class="cross" y1="${m.t}" y2="${H - m.b}"/><circle class="dot" r="4"/></g>
+        <rect class="hit" x="${m.l}" y="0" width="${W - m.l - m.r}" height="${H}" fill="transparent"/>
+      </svg>
+      <div class="chart-tip" hidden></div>`;
+    const svg = box.querySelector('svg');
+    const hover = svg.querySelector('.hover');
+    const tip = box.querySelector('.chart-tip');
+    const move = (ev) => {
+      const rect = svg.getBoundingClientRect();
+      const px = (ev.clientX - rect.left) * (W / rect.width);
+      const i = Math.max(0, Math.min(points.length - 1, Math.round(((px - m.l) / (W - m.l - m.r)) * (points.length - 1))));
+      const p = points[i];
+      hover.setAttribute('visibility', 'visible');
+      hover.querySelector('.cross').setAttribute('x1', x(i));
+      hover.querySelector('.cross').setAttribute('x2', x(i));
+      hover.querySelector('.dot').setAttribute('cx', x(i));
+      hover.querySelector('.dot').setAttribute('cy', y(p.equity));
+      tip.hidden = false;
+      tip.innerHTML = `<div class="muted small">${esc(new Date(p.t).toLocaleString([], { dateStyle: 'medium', ...(intraday ? { timeStyle: 'short' } : {}) }))}</div>
+        <div><span class="key"></span>Equity <b>${money(p.equity)}</b></div>
+        ${p.pnl != null ? `<div class="small">P&amp;L <span class="${signCls(p.pnl)}">${money(p.pnl)}${p.pnl_pct != null ? ` (${pct(p.pnl_pct)})` : ''}</span></div>` : ''}`;
+      const left = (x(i) / W) * rect.width;
+      tip.style.left = `${Math.min(Math.max(left + 12, 0), rect.width - tip.offsetWidth - 4)}px`;
+      tip.style.top = `${(y(p.equity) / H) * rect.height - 10}px`;
+    };
+    svg.querySelector('.hit').addEventListener('mousemove', move);
+    svg.querySelector('.hit').addEventListener('mouseleave', () => { hover.setAttribute('visibility', 'hidden'); tip.hidden = true; });
+  }
+
+  async function downloadCsv(mode) {
+    try {
+      await API.getMe();  // refreshes an expired login token first (plain fetch doesn't)
+      const token = localStorage.getItem('adt_access_token');
+      const resp = await fetch(`/api/control/${mode}/trades.csv`, { headers: { Authorization: `Bearer ${token}` } });
+      if (!resp.ok) throw new Error(`Download failed (${resp.status})`);
+      const url = URL.createObjectURL(await resp.blob());
+      const a = Object.assign(document.createElement('a'), { href: url, download: `${mode}_trades.csv` });
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (ex) { toast(ex.message, 'error'); }
   }
 
   /* ── Actions ── */
@@ -563,6 +784,17 @@ const Control = (() => {
       if (remove) removeKeys(remove.dataset.remove);
     });
     $('alerts-save').addEventListener('click', saveAlerts);
+    $('autostart-toggle').addEventListener('change', toggleAutostart);
+    let resizeTimer = null;
+    window.addEventListener('resize', () => {  // redraw at the new width so text stays readable
+      clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(() => {
+        ['paper', 'live'].forEach((mode) => {
+          const data = perf[mode].data;
+          if (data && $(`${mode}-equity`)) drawEquity($(`${mode}-equity`), data.equity || [], data.equity_message);
+        });
+      }, 200);
+    });
     $('val-start').addEventListener('click', startValidation);
     $('val-stop').addEventListener('click', async () => { await api('POST', '/control/validate/stop'); loadValidation(); });
   }
