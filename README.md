@@ -424,7 +424,8 @@ python bot.py --timeframe 1h --overnight                                        
   sizes each order so it stays inside all of these, keeping a cushion of
   `MARGIN_BUFFER_PCT` (5%) of equity unused:
   - buying power;
-  - day-trading buying power (in day-trading mode);
+  - day-trading buying power (in day-trading mode, for accounts flagged as
+    pattern day traders; unflagged accounts report it as 0);
   - maintenance-margin headroom, assuming `MAINTENANCE_MARGIN_RATE` (30%) for
     the new position.
 

@@ -236,6 +236,8 @@ def vwap_zone(z: Any) -> Optional[str]:
         if z < edge:
             return label
     return VWAP_ZONES[-1]
+
+
 _SESSION_OPEN_MIN = 9 * 60 + 30
 _SESSION_CLOSE_MIN = 16 * 60
 

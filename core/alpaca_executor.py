@@ -138,6 +138,13 @@ def spread_bps(bid: float, ask: float) -> Optional[float]:
     return (ask - bid) / ((ask + bid) / 2) * 10_000
 
 
+def _optional_float(value: Any) -> Optional[float]:
+    try:
+        return float(value) if value not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+
+
 class AlpacaExecutor:
     """
     Sends orders to Alpaca and returns results.
@@ -663,7 +670,12 @@ class AlpacaExecutor:
                 rejection = self._rejection(exc, symbol=symbol, side="close", qty=qty, attempt=1)
                 report.failures.append({"symbol": symbol, **rejection.as_dict()})
 
-        self._confirm_flatten_fills(report)
+        try:
+            self._confirm_flatten_fills(report)
+        except Exception as exc:  # the closes are already sent; never lose the report over logging
+            logger.warning(f"Could not confirm flatten fills: {exc}")
+            for entry in report.closed:
+                entry.setdefault("status", "unconfirmed")
         self.telemetry.record(
             "flatten",
             logging.WARNING if report.failures else logging.INFO,
@@ -689,13 +701,13 @@ class AlpacaExecutor:
             for order_id, entry in list(pending.items()):
                 try:
                     order = self.get_order(order_id)
-                except requests.exceptions.RequestException:
+                except (requests.exceptions.RequestException, ValueError):
                     continue
                 status = str(order.get("status", "")).lower()
                 if status in {"filled", "canceled", "expired", "rejected", "done_for_day"}:
                     entry.update(status=status, filled_at=order.get("filled_at"),
-                                 fill_price=float(order["filled_avg_price"]) if order.get("filled_avg_price") else None,
-                                 filled_qty=float(order.get("filled_qty") or 0),
+                                 fill_price=_optional_float(order.get("filled_avg_price")),
+                                 filled_qty=_optional_float(order.get("filled_qty")) or 0.0,
                                  submitted_at=order.get("submitted_at"))
                     self.telemetry.record(
                         "flatten_fill", logging.INFO if status == "filled" else logging.WARNING,

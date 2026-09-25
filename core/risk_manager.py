@@ -105,6 +105,11 @@ class RiskDecision:
     take_profit: Optional[float] = None
 
 
+def _flag(value: Any) -> bool:
+    """A broker boolean that may arrive as a string ("false" must stay False)."""
+    return value is True or str(value).strip().lower() in {"true", "1"}
+
+
 def _to_float(value: Any) -> float:
     try:
         return float(value)
@@ -246,7 +251,7 @@ class RiskManager:
         limits = self.limits
         if not limits.day_trading or equity >= limits.pdt_min_equity:
             return None
-        if account.get("pattern_day_trader") in (True, "true", "True", 1):
+        if _flag(account.get("pattern_day_trader")):
             return (
                 f"PDT: account is flagged as a pattern day trader with equity ${equity:,.2f} "
                 f"< ${limits.pdt_min_equity:,.0f}; day trading is restricted"
@@ -406,8 +411,8 @@ class RiskManager:
         margin deficit, a margin call, or trading while restricted.
 
         Uses what Alpaca's account API reports: status, trade_suspended_by_user,
-        buying_power, daytrading_buying_power (day-trading mode), equity and
-        maintenance_margin. If the account also reports intraday-margin fields
+        buying_power, daytrading_buying_power (day-trading mode, pattern day
+        trader accounts), equity and maintenance_margin. If the account also reports intraday-margin fields
         (intraday_margin_deficit / intraday_margin_excess / intraday_buying_power,
         e.g. under newer intraday margin rules) they are honoured too; fields that
         aren't reported are simply skipped.
@@ -417,7 +422,7 @@ class RiskManager:
         status = str(account.get("status") or "ACTIVE").upper()
         if status != "ACTIVE":
             return MarginCapacity(0.0, f"Account status is {status}; new positions blocked")
-        if account.get("trade_suspended_by_user"):
+        if _flag(account.get("trade_suspended_by_user")):
             return MarginCapacity(0.0, "Trading is suspended on this account (by the account owner)")
         deficit = _to_float(account.get("intraday_margin_deficit"))
         if deficit > 0:
@@ -428,7 +433,10 @@ class RiskManager:
         cushion = max(0.0, equity) * buffer
         caps = {}
         caps["buying power"] = max(0.0, _to_float(account.get("buying_power")) - cushion)
-        if limits.day_trading and "daytrading_buying_power" in account:
+        # Day-trading buying power (and its DT margin calls) applies to accounts
+        # flagged as pattern day traders; others report it as 0, which would
+        # wrongly block the few day trades the PDT rule does allow them.
+        if limits.day_trading and _flag(account.get("pattern_day_trader")) and "daytrading_buying_power" in account:
             caps["day-trading buying power"] = max(0.0, _to_float(account.get("daytrading_buying_power")) - cushion)
         if "intraday_buying_power" in account:
             caps["intraday buying power"] = max(0.0, _to_float(account.get("intraday_buying_power")) - cushion)

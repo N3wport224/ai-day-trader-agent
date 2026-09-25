@@ -1,14 +1,19 @@
 """Intraday architecture gaps: flat confirmation, ORB30, margin guard, VWAP attribution, 5m defaults."""
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 import pytest
 
 from core.alpaca_executor import BrokerSnapshot, FlattenReport
+from core.backtester import attribution, format_report, Trade
 from core.execution_telemetry import EventLog
+from core.features import add_intraday_features, compute_features, vwap_zone, VWAP_ZONES
+from core.ml_training import synthetic_intraday_bars
+from core.risk_manager import RiskLimits, RiskManager
 from core.session_clock import SessionClock, SessionConfig
 from core.trading_bot import TradingBot
-from tests.test_intraday_trading import RecordingWorkflow, _clock
+from tests.test_intraday_trading import _clock, _day_bars, _et, _intraday_backtest, RecordingWorkflow
 
 
 # ---------------------------------------------------------------------------
@@ -115,11 +120,6 @@ def test_flatten_fill_confirmation_polls_until_filled(monkeypatch) -> None:
 # Microstructure features: VWAP (+bands, ratio, zone), ORB15/30, zero lookahead
 # ---------------------------------------------------------------------------
 
-import numpy as np  # noqa: E402
-
-from core.features import VWAP_ZONES, add_intraday_features, compute_features  # noqa: E402
-from core.ml_training import synthetic_intraday_bars  # noqa: E402
-
 
 def _session(freq="5min", day="2026-03-02"):
     idx = pd.date_range(f"{day} 09:30", f"{day} 15:55" if freq == "5min" else f"{day} 15:59", freq=freq,
@@ -193,7 +193,6 @@ def test_new_intraday_features_have_zero_lookahead(freq, minutes) -> None:
 # Intraday margin & regulatory guard
 # ---------------------------------------------------------------------------
 
-from core.risk_manager import RiskLimits, RiskManager  # noqa: E402
 
 MARGIN_ACCOUNT = {"equity": "30000", "last_equity": "30000", "buying_power": "60000", "status": "ACTIVE"}
 
@@ -224,9 +223,23 @@ def test_margin_cushion_is_a_fixed_share_of_equity():
 
 
 def test_day_trading_buying_power_caps_intraday_entries():
-    account = {**MARGIN_ACCOUNT, "daytrading_buying_power": "5000"}
+    account = {**MARGIN_ACCOUNT, "pattern_day_trader": True, "daytrading_buying_power": "5000"}
     assert _margin_buy(account, day_trading=True).quantity == 35      # ($5,000 - $1,500) / $100
     assert _margin_buy(account, day_trading=False).quantity == 100    # DTBP only binds in day-trading mode
+
+
+def test_zero_dtbp_on_non_pdt_account_does_not_block_allowed_day_trades():
+    # Under $25k and not flagged, Alpaca reports daytrading_buying_power 0; the
+    # PDT rule still allows up to 3 day trades, so the margin guard mustn't block them.
+    small = {"equity": "20000", "last_equity": "20000", "buying_power": "20000", "status": "ACTIVE",
+             "pattern_day_trader": False, "daytrade_count": 1, "daytrading_buying_power": "0"}
+    decision = _margin_buy(small, quantity=10, day_trading=True)
+    assert decision.approved and decision.quantity == 10
+
+
+def test_string_false_flags_are_not_treated_as_true():
+    decision = _margin_buy({**MARGIN_ACCOUNT, "trade_suspended_by_user": "false"}, quantity=10)
+    assert decision.approved
 
 
 def test_maintenance_margin_headroom_caps_exposure():
@@ -269,12 +282,6 @@ def test_margin_limits_read_from_environment(monkeypatch):
 # ---------------------------------------------------------------------------
 # VWAP-location attribution and 5-minute CLI defaults
 # ---------------------------------------------------------------------------
-
-import numpy as np  # noqa: E402
-
-from core.backtester import Trade, attribution, format_report  # noqa: E402
-from core.features import VWAP_ZONES, vwap_zone  # noqa: E402
-from tests.test_intraday_trading import _day_bars, _et, _intraday_backtest  # noqa: E402
 
 
 @pytest.mark.parametrize("z, zone", [(-2.5, "below -2σ"), (-1.5, "-2σ to -1σ"), (-0.1, "-1σ to VWAP"),
@@ -336,3 +343,29 @@ def test_cli_defaults_to_5_minute_bars(monkeypatch):
         assert defaults["timeframe"] == "5Min" and defaults["days"] is None
     assert default_history_days("5m", 730) == 120 and default_history_days("1m", 730) == 30
     assert default_history_days("1h", 730) == 730 and default_history_days("1d", 365) == 365
+
+
+def test_malformed_fill_data_never_breaks_the_flatten_report(monkeypatch) -> None:
+    from core.alpaca_executor import AlpacaExecutor
+    from tests.test_intraday_trading import _Resp
+
+    monkeypatch.setenv("ALPACA_API_KEY", "k")
+    monkeypatch.setenv("ALPACA_SECRET_KEY", "s")
+    ex = AlpacaExecutor(telemetry=EventLog(None), price_lookup=lambda s: 0.0)
+    report = FlattenReport(reason="eod", closed=[{"symbol": "AAPL", "qty": 10, "order_id": "o1"}])
+
+    monkeypatch.setattr(AlpacaExecutor, "get_order", lambda self, oid: {
+        "id": oid, "status": "filled", "filled_avg_price": "n/a", "filled_qty": None})
+    ex._confirm_flatten_fills(report)
+    assert report.closed[0]["status"] == "filled" and report.closed[0]["fill_price"] is None
+
+    # Anything unexpected while confirming: the closes were already sent, so
+    # flatten_all still returns its report instead of raising.
+    monkeypatch.setattr(AlpacaExecutor, "get_positions", lambda self: [{"symbol": "MSFT", "qty": "5"}])
+    monkeypatch.setattr(AlpacaExecutor, "cancel_all_orders", lambda self: [])
+    monkeypatch.setattr(AlpacaExecutor, "_confirm_flatten_fills",
+                        lambda self, r: (_ for _ in ()).throw(RuntimeError("boom")))
+    monkeypatch.setattr("core.alpaca_executor.requests.delete",
+                        lambda url, headers, timeout: _Resp(200, {"id": "c1"}))
+    flat = ex.flatten_all("manual_dashboard")
+    assert flat.closed and flat.closed[0]["status"] == "unconfirmed"
