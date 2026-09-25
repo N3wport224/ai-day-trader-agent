@@ -248,3 +248,35 @@ async def post_test_connection(mode: str, request: Request, current_user: User =
         raise HTTPException(status_code=404, detail="Unknown mode")
     require_local(request)
     return await run_in_threadpool(check_connection, mode)
+
+
+# ---------------------------------------------------------------------------
+# Start with the computer
+# ---------------------------------------------------------------------------
+
+class AutostartRequest(BaseModel):
+    enabled: bool
+
+
+@router.get("/autostart")
+async def get_autostart(current_user: User = Depends(get_admin_user)):
+    from core import autostart
+
+    return {**autostart.status(), "auto_resume": _auto_resume()}
+
+
+@router.put("/autostart")
+async def put_autostart(body: AutostartRequest, request: Request, current_user: User = Depends(get_admin_user)):
+    """Start the dashboard (and so any bots that should be running) when you log in."""
+    require_local(request)
+    from core import autostart
+
+    try:
+        result = await run_in_threadpool(autostart.enable if body.enabled else autostart.disable)
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Could not change the login item: {exc}") from exc
+    return {**result, "auto_resume": _auto_resume()}
+
+
+def _auto_resume() -> bool:
+    return os.getenv("AUTO_RESUME_BOTS", "true").strip().lower() not in {"0", "false", "no", "off"}

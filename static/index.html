@@ -286,6 +286,17 @@
                 <button class="btn btn-outline btn-sm push-right" data-remove="alerts">Remove</button>
               </div>
             </div>
+            <div class="card">
+              <div class="card-head">
+                <h3>⚙️ Run automatically</h3>
+                <span class="pill" id="autostart-status">…</span>
+              </div>
+              <p class="muted">Bots you start are remembered. If one crashes, or the computer restarts, the dashboard starts it
+                again with the same settings (at most 3 times an hour, and only if the same safety checks pass). Stopping a
+                bot yourself turns this off for that bot.</p>
+              <label class="check"><input type="checkbox" id="autostart-toggle"> Start the dashboard when I log in to this computer</label>
+              <p class="muted small" id="autostart-path"></p>
+            </div>
             <p class="muted small" id="env-file-note"></p>
           </div>
         </section>

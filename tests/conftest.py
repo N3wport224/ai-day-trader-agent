@@ -50,3 +50,57 @@ def _isolate_runtime_files(tmp_path: Path, monkeypatch) -> None:
 
     monkeypatch.setattr(AlpacaExecutor, "get_snapshot", lambda self: BrokerSnapshot(positions=[], open_orders=[]))
     monkeypatch.setattr(AlpacaExecutor, "get_quote", lambda self, symbol: None)  # no quote: spread filter skipped
+
+
+# ---------------------------------------------------------------------------
+# Dashboard API fixtures (tests/test_dashboard_control.py and friends)
+# ---------------------------------------------------------------------------
+
+import os  # noqa: E402
+import subprocess  # noqa: E402
+
+from fastapi import FastAPI  # noqa: E402
+from fastapi.testclient import TestClient  # noqa: E402
+
+import config.api.control as control  # noqa: E402
+import config.api.settings as settings  # noqa: E402
+from config.api.auth import get_admin_user  # noqa: E402
+from config.api.dependencies import get_portfolio_manager  # noqa: E402
+from core.bot_manager import BotManager  # noqa: E402
+from tests.dashboard_helpers import ADMIN  # noqa: E402
+
+@pytest.fixture
+def env_file(tmp_path, monkeypatch):
+    path = tmp_path / ".env"
+    path.write_text("# my settings\nWATCHLIST=AAPL,MSFT\nALPACA_API_KEY=old\n")
+    monkeypatch.setenv("DOTENV_PATH", str(path))
+    for name in ("ALPACA_API_KEY", "ALPACA_SECRET_KEY", "ALPACA_LIVE_API_KEY", "ALPACA_LIVE_SECRET_KEY",
+                 "LIVE_TRADING_ENABLED", "ALERT_WEBHOOK_URL", "SETTINGS_ALLOW_REMOTE", "JWT_SECRET_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    yield path
+    # update_env writes os.environ directly; undo so other tests are unaffected
+    for name in ("ALPACA_API_KEY", "ALPACA_SECRET_KEY", "ALPACA_LIVE_API_KEY", "ALPACA_LIVE_SECRET_KEY",
+                 "LIVE_TRADING_ENABLED", "ALERT_WEBHOOK_URL", "ALPACA_TRADING_BASE_URL", "JWT_SECRET_KEY"):
+        os.environ.pop(name, None)
+
+
+@pytest.fixture
+def manager(tmp_path):
+    def popen(command, **kwargs):  # a harmless stand-in for bot.py
+        return subprocess.Popen(["sleep", "30"], **kwargs)
+
+    mgr = BotManager(root=tmp_path, popen=popen)
+    yield mgr
+    for slot in [*mgr.bots.values(), mgr.validation]:
+        slot.stop()
+
+
+@pytest.fixture
+def client(env_file, manager, portfolio_manager):
+    app = FastAPI()
+    app.include_router(settings.router, prefix="/api/settings")
+    app.include_router(control.router, prefix="/api/control")
+    app.dependency_overrides[get_admin_user] = lambda: ADMIN
+    app.dependency_overrides[get_portfolio_manager] = lambda: portfolio_manager
+    app.dependency_overrides[control.get_bot_manager] = lambda: manager
+    return TestClient(app, client=("127.0.0.1", 50000))

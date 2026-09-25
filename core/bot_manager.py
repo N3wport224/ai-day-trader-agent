@@ -219,8 +219,24 @@ class ProcessSlot:
 
 
 class BotManager:
-    def __init__(self, root: Path = PROJECT_ROOT, popen: Callable = subprocess.Popen) -> None:
+    """Runs the bots and, via ``supervise``, keeps them running.
+
+    The *desired* state of each bot (running or not, and with which settings)
+    is saved in logs/<mode>/desired.json whenever you start or stop it. If a bot
+    that should be running isn't (it crashed, or the computer restarted), the
+    supervisor restarts it with the same settings, at most MAX_RESTARTS_PER_HOUR
+    times an hour, and only if the same safety checks as a manual start pass.
+    """
+
+    MAX_RESTARTS_PER_HOUR = 3
+
+    def __init__(self, root: Path = PROJECT_ROOT, popen: Callable = subprocess.Popen,
+                 clock: Callable[[], float] = None) -> None:
+        import time as _time
+
         self.root = root
+        self.clock = clock or _time.monotonic
+        self._restarts: Dict[str, List[float]] = {mode: [] for mode in MODES}
         self.bots = {mode: ProcessSlot(mode, "bot.py", root, popen) for mode in MODES}
         # The validation job places no orders, so a hard stop is fine everywhere.
         self.validation = ProcessSlot("validate", "scripts/validate_and_train.py", root, popen,
@@ -239,10 +255,59 @@ class BotManager:
             args.append("--execute")
         settings = {"symbols": cleaned, "timeframe": timeframe, "execute": execute}
         self.bots[mode].start(args, mode_env(mode, self.root), settings)
+        self._save_desired(mode, {"running": True, **settings})
         return self.bot_status(mode)
 
     def stop_bot(self, mode: str) -> bool:
+        """Stop and remember that you want it stopped (no auto-restart)."""
+        self._save_desired(mode, {**self.desired(mode), "running": False})
         return self.bots[mode].stop()
+
+    # -- desired state / supervision --------------------------------------
+
+    def _desired_path(self, mode: str) -> Path:
+        return self.root / "logs" / mode / "desired.json"
+
+    def desired(self, mode: str) -> Dict[str, Any]:
+        try:
+            return json.loads(self._desired_path(mode).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {"running": False}
+
+    def _save_desired(self, mode: str, state: Dict[str, Any]) -> None:
+        path = self._desired_path(mode)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        state = {**state, "updated_at": datetime.now(timezone.utc).isoformat()}
+        path.write_text(json.dumps(state), encoding="utf-8")
+
+    def supervise(self, block_reason: Callable[[str, Dict[str, Any]], Optional[str]]) -> List[Dict[str, Any]]:
+        """Restart bots that should be running but aren't. ``block_reason(mode,
+        settings)`` returns why a restart isn't allowed right now (or None)."""
+        actions = []
+        now = self.clock()
+        for mode in MODES:
+            want = self.desired(mode)
+            if not want.get("running") or self.bots[mode].running():
+                continue
+            recent = [t for t in self._restarts[mode] if now - t < 3600]
+            self._restarts[mode] = recent
+            if len(recent) >= self.MAX_RESTARTS_PER_HOUR:
+                actions.append({"mode": mode, "action": "gave_up",
+                                "reason": f"restarted {len(recent)} times in the last hour; check the log"})
+                continue
+            reason = block_reason(mode, want)
+            if reason:
+                actions.append({"mode": mode, "action": "skipped", "reason": reason})
+                continue
+            try:
+                self.start_bot(mode, want.get("symbols") or [], want.get("timeframe") or "5m",
+                               bool(want.get("execute")))
+            except (ValueError, RuntimeError, OSError) as exc:
+                actions.append({"mode": mode, "action": "failed", "reason": str(exc)})
+                continue
+            self._restarts[mode].append(now)
+            actions.append({"mode": mode, "action": "restarted"})
+        return actions
 
     def heartbeat(self, mode: str) -> Optional[Dict[str, Any]]:
         path = Path(mode_env(mode, self.root)["HEARTBEAT_PATH"])
