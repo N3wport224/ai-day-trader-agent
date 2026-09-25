@@ -413,7 +413,14 @@ class BotManager:
 
     # -- validation job -------------------------------------------------
 
-    def start_validation(self, symbols: Any, timeframe: str, days: int, market: bool) -> Dict[str, Any]:
+    def last_validation_settings(self) -> Dict[str, Any]:
+        try:
+            return json.loads((self.root / "logs" / "validate" / "last_settings.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+
+    def start_validation(self, symbols: Any, timeframe: str, days: int, market: bool,
+                         trigger: str = "manual") -> Dict[str, Any]:
         if timeframe not in TIMEFRAMES:
             raise ValueError(f"timeframe must be one of {', '.join(TIMEFRAMES)}")
         if not 20 <= int(days) <= 3650:
@@ -422,5 +429,11 @@ class BotManager:
         args = ["--symbols", ",".join(cleaned), "--timeframe", timeframe, "--days", str(int(days))]
         if market:
             args.append("--market")
+        if trigger == "scheduled":
+            args += ["--trigger", "scheduled"]
         settings = {"symbols": cleaned, "timeframe": timeframe, "days": int(days), "market": market}
-        return self.validation.start(args, {}, settings)
+        result = self.validation.start(args, {}, {**settings, "trigger": trigger})
+        # Remembered so the scheduler can repeat exactly this validation later.
+        path = self.root / "logs" / "validate" / "last_settings.json"
+        path.write_text(json.dumps(settings), encoding="utf-8")
+        return result

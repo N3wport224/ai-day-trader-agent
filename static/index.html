@@ -117,6 +117,7 @@
         <button class="nav-item nav-paper" data-view="paper"><span class="nav-icon">🧪</span><span>Paper Trading<small>fake money</small></span><span class="nav-badge" id="badge-paper"></span></button>
         <button class="nav-item nav-live" data-view="live"><span class="nav-icon">💵</span><span>Live Trading<small>real money</small></span><span class="nav-badge" id="badge-live"></span></button>
         <div class="nav-divider">Tools</div>
+        <button class="nav-item" data-view="health"><span class="nav-icon">🩺</span><span>System check</span><span class="nav-badge" id="badge-health"></span></button>
         <button class="nav-item" data-view="research"><span class="nav-icon">📊</span><span>Research</span></button>
       </nav>
 
@@ -168,6 +169,7 @@
                     <button class="btn btn-outline" id="val-stop" hidden>Stop</button>
                   </div>
                   <div id="val-result"></div>
+                  <div id="val-schedule" class="schedule-line"></div>
                   <details class="log-box" id="val-log-box">
                     <summary>Progress log</summary>
                     <pre id="val-log" class="log"></pre>
@@ -304,6 +306,19 @@
         <!-- ═══ Paper + Live trading (same layout, filled by control.js) ═══ -->
         <section class="view mode-view mode-paper" id="view-paper" data-mode="paper" hidden></section>
         <section class="view mode-view mode-live" id="view-live" data-mode="live" hidden></section>
+
+        <!-- ═══ System check ═══ -->
+        <section class="view" id="view-health" hidden>
+          <div class="view-inner">
+            <div class="mode-head">
+              <h1 class="view-title">System check</h1>
+              <button class="btn btn-primary" id="health-run">Run check</button>
+            </div>
+            <p class="lead">Everything that has to be right for the bot to trade, with what to do about anything that isn't.
+              Run it before your first session and whenever something looks off.</p>
+            <div id="health-result"><div class="empty-state">Checking…</div></div>
+          </div>
+        </section>
 
         <!-- ═══ Research (the original dashboard) ═══ -->
         <section class="view" id="view-research" hidden>

@@ -25,7 +25,7 @@ const Control = (() => {
     ['1d', '1 day (swing)'],
   ];
 
-  const state = { view: 'start', overview: null, timers: [], user: null, built: {} };
+  const state = { view: 'start', overview: null, timers: [], user: null, built: {}, healthAt: 0 };
 
   /* ── Login screen: first-run account creation ── */
   async function onLogin() {
@@ -95,6 +95,43 @@ const Control = (() => {
   function refreshActive() {
     if (state.view === 'paper' || state.view === 'live') loadMode(state.view);
     if (state.view === 'start') loadValidation();
+    if (state.view === 'health' && !state.healthAt) runHealth();
+  }
+
+  /* ── System check ── */
+  async function runHealth() {
+    state.healthAt = Date.now();
+    const btn = $('health-run');
+    btn.disabled = true;
+    btn.textContent = 'Checking…';
+    try {
+      renderHealth(await api('GET', '/control/health'));
+    } catch (ex) {
+      $('health-result').innerHTML = `<div class="notice bad">${esc(ex.message)}</div>`;
+    } finally {
+      btn.disabled = false;
+      btn.textContent = 'Run check again';
+    }
+  }
+
+  function renderHealth(h) {
+    const icon = { ok: '✓', warn: '!', fail: '✗', info: 'i' };
+    const word = { ok: 'OK', warn: 'Warning', fail: 'Problem', info: 'Note' };
+    const counts = h.checks.reduce((a, c) => ({ ...a, [c.status]: (a[c.status] || 0) + 1 }), {});
+    const headline = h.overall === 'fail'
+      ? `<div class="notice bad"><b>${counts.fail} problem${counts.fail > 1 ? 's' : ''} to fix</b> before trading.</div>`
+      : h.overall === 'warn'
+        ? `<div class="notice warn"><b>Ready, with ${counts.warn} warning${counts.warn > 1 ? 's' : ''}.</b></div>`
+        : '<div class="notice ok"><b>All good.</b> The bot has what it needs.</div>';
+    $('health-result').innerHTML = `${headline}
+      <ul class="checks">${h.checks.map((c) => `
+        <li class="check-row ${esc(c.status)}">
+          <span class="check-icon" aria-label="${esc(word[c.status])}">${icon[c.status]}</span>
+          <div><b>${esc(c.label)}</b> <span class="muted">${esc(c.detail)}</span>
+            ${c.fix && c.status !== 'ok' ? `<div class="fix">${esc(c.fix)}</div>` : ''}</div>
+        </li>`).join('')}</ul>
+      <p class="muted small">Checked ${esc(new Date(h.checked_at).toLocaleString())}.</p>`;
+    badge('badge-health', h.overall === 'fail' ? '!' : h.overall === 'warn' ? '!' : '✓', h.overall === 'ok' ? 'ok' : h.overall === 'fail' ? 'live' : 'warn');
   }
 
   /* ── Overview: checklist + sidebar badges ── */
@@ -206,7 +243,35 @@ const Control = (() => {
       log.textContent = (v.log || []).join('\n') || 'No validation run yet.';
       if (atBottom) log.scrollTop = log.scrollHeight;
       renderEdge(v.edge);
+      renderSchedule(v.schedule);
     } catch { /* ignore */ }
+  }
+
+  function renderSchedule(sc) {
+    const box = $('val-schedule');
+    if (!box || !sc) return;
+    if (!sc.report_created_at) { box.innerHTML = ''; return; }
+    const d = (iso) => new Date(iso).toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' });
+    const age = sc.report_age_days;
+    const expiresIn = Math.round((new Date(sc.expires_at) - Date.now()) / 86400000);
+    const last = sc.last_run;
+    const lastText = last && last.trigger === 'scheduled'
+      ? ` Last automatic check ${esc(d(last.finished_at))}: ${esc({ validated: 'passed', no_edge: 'no edge found', error: 'could not run' }[last.result] || last.result)}.`
+      : '';
+    const html = `
+      <span>Validated ${age < 1 ? 'today' : `${esc(Math.floor(age))} day${Math.floor(age) === 1 ? '' : 's'} ago`} · ${expiresIn > 0 ? `expires in ${expiresIn} days` : '<b class="neg">expired: bots will not open trades</b>'}.
+        ${sc.enabled && sc.has_settings ? `Automatic re-check every ${esc(sc.every_days)} days, next around ${esc(d(sc.next_due_at))} (outside market hours).` : ''}${lastText}</span>
+      <label class="check small"><input type="checkbox" id="auto-revalidate" ${sc.enabled ? 'checked' : ''}> Re-validate automatically every week</label>`;
+    if (box.dataset.html === html) return;
+    box.dataset.html = html;
+    box.innerHTML = html;
+    $('auto-revalidate').addEventListener('change', async (e) => {
+      try {
+        await api('PUT', '/settings/auto-revalidate', { enabled: e.target.checked });
+        toast(e.target.checked ? 'Weekly re-validation on.' : 'Weekly re-validation off: the validation expires after 30 days.', 'success');
+        box.dataset.html = ''; loadValidation();
+      } catch (ex) { e.target.checked = !e.target.checked; toast(ex.message, 'error'); }
+    });
   }
 
   /* ── API keys ── */
@@ -516,7 +581,6 @@ const Control = (() => {
       case 'entry_expired': return ['⌛', `${sym} unfilled entry cancelled`];
       case 'flatten': return ['🌙', `Closed all positions (${e.reason})${(e.failures || []).length ? ' with FAILURES' : ''}`];
       case 'breaker_tripped': return ['🛑', e.reason];
-      case 'edge_gate': return ['🚧', `New trades blocked: ${e.reason}`];
       case 'edge_decay': return ['📉', `Live results fell short of the test; new trades paused: ${e.reason}`];
       case 'session_report': return ['📊', `Day summary: P&L ${money(e.pnl)} (${pct(e.pnl_pct)}), ${e.fills} fills`];
       case 'reconciliation': return (e.discrepancies || []).length ? ['⚠️', 'Broker and local records differed (auto-synced)'] : null;
@@ -526,6 +590,7 @@ const Control = (() => {
       case 'bot_stopped': return ['⏹️', `Bot stopped (${e.reason || 'requested'})`];
       case 'bot_error': return ['❗', `Error: ${e.message}`];
       case 'bot_restarted': return ['🔁', 'Bot restarted automatically'];
+      case 'edge_gate': return e.passed ? ['✅', 'Validation passes again; new trades allowed'] : ['🚧', `New trades blocked: ${e.reason}`];
       case 'bot_restart_blocked': return ['⚠️', `Bot is down and was not restarted: ${e.reason}`];
       default: return null;
     }
@@ -796,6 +861,7 @@ const Control = (() => {
       }, 200);
     });
     $('val-start').addEventListener('click', startValidation);
+    $('health-run').addEventListener('click', runHealth);
     $('val-stop').addEventListener('click', async () => { await api('POST', '/control/validate/stop'); loadValidation(); });
   }
 

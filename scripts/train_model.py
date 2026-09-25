@@ -160,7 +160,11 @@ def main(argv: list[str] | None = None) -> int:
     output.parent.mkdir(parents=True, exist_ok=True)
     import joblib
 
-    joblib.dump(artifact, output)
+    # Write to a temp file and swap it in, so a bot starting mid-save never
+    # loads a half-written model (it would silently fall back to the heuristic).
+    tmp = output.with_name(output.name + ".tmp")
+    joblib.dump(artifact, tmp)
+    os.replace(tmp, output)
     print(f"\nSaved model to {output}")
     print(json.dumps({k: artifact[k] for k in ("symbols", "timeframe", "label_params", "uses_sentiment",
                                                "feature_columns", "metrics")},

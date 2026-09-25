@@ -98,7 +98,9 @@ def apply_mode_paths(mode: str) -> None:
 def _edge_gate(bot, strategy_name: str, timeframe: str, log, mode: str = "paper") -> tuple:
     """(block reason or None, warnings) for opening live positions."""
     if mode != "live" and os.getenv("EDGE_GATE", "true").strip().lower() not in {"1", "true", "yes", "on"}:
-        log.warning("EDGE_GATE=false: trading WITHOUT a validated out-of-sample edge")
+        if not getattr(_edge_gate, "warned", False):  # re-checked every few minutes; warn once
+            log.warning("EDGE_GATE=false: trading WITHOUT a validated out-of-sample edge")
+            _edge_gate.warned = True
         return None, []
     from core.edge_gate import check_live_setup, strategy_fingerprint
 
@@ -107,6 +109,46 @@ def _edge_gate(bot, strategy_name: str, timeframe: str, log, mode: str = "paper"
     if strategy_name != "ml" or strategy is None:
         return "the classic strategy has no walk-forward validation; use --strategy ml", []
     return check_live_setup(strategy_fingerprint(strategy, engine.timeframe), bot.symbols)
+
+
+class EdgeGateWatch:
+    """The edge gate, re-checked while the bot runs (at most every
+    ``interval`` seconds): a report that expires, fails a re-validation or no
+    longer matches blocks new entries mid-run, and a fresh passing report
+    lifts the block, without restarting the bot. Exits are never blocked."""
+
+    def __init__(self, check, telemetry, log, interval: float = 300.0, clock=time.monotonic) -> None:
+        self.check = check
+        self.telemetry = telemetry
+        self.log = log
+        self.interval = interval
+        self.clock = clock
+        self._checked_at = None
+        self._block = None
+        self._state = None  # None (unknown) / "open" / "blocked"
+
+    def __call__(self):
+        now = self.clock()
+        if self._checked_at is not None and now - self._checked_at < self.interval:
+            return self._block
+        self._checked_at = now
+        block, warnings = self.check()
+        self._block = f"edge gate: {block}" if block else None
+        state = "blocked" if block else "open"
+        if state != self._state:
+            for warning in warnings:
+                self.log.warning(f"Edge gate: {warning}")
+            if block:
+                self.log.error(f"EDGE GATE: new entries are BLOCKED: {block}. Exits, stops and the EOD flatten "
+                               "still run. See core/edge_gate.py.")
+                self.telemetry.record("edge_gate", logging.WARNING, passed=False, reason=block)
+            elif self._state == "blocked":
+                self.log.warning("Edge gate: passed again; new entries allowed")
+                self.telemetry.record("edge_gate", logging.INFO, passed=True, reason="validated report passes")
+            else:
+                self.log.info("Edge gate: passed (validated walk-forward report matches this setup)")
+            self._state = state
+        return self._block
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -268,16 +310,9 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     if args.execute:
-        block, warnings = _edge_gate(bot, args.strategy, timeframe, log, mode=args.mode)
-        for warning in warnings:
-            log.warning(f"Edge gate: {warning}")
-        if block:
-            bot.standing_entry_block = f"edge gate: {block}"
-            log.error(f"EDGE GATE: new entries are BLOCKED for this run: {block}. Exits, stops and the EOD "
-                      "flatten still run. See core/edge_gate.py (EDGE_GATE=false overrides at your own risk).")
-            bot.telemetry.record("edge_gate", logging.WARNING, passed=False, reason=block)
-        elif os.getenv("EDGE_GATE", "true").strip().lower() in {"1", "true", "yes", "on"}:
-            log.info("Edge gate: passed (validated walk-forward report matches this setup)")
+        bot.entry_gate = EdgeGateWatch(lambda: _edge_gate(bot, args.strategy, timeframe, log, mode=args.mode),
+                                       bot.telemetry, log)
+        bot.entry_gate()  # evaluate (and log) once at startup
 
     def request_stop(signum, frame):
         if bot.stopped:  # second signal: stop waiting
