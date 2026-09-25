@@ -92,7 +92,8 @@ def test_off_hours() -> None:
 
 
 @pytest.fixture
-def world(tmp_path):
+def world(tmp_path, monkeypatch):
+    monkeypatch.setenv("ALPACA_API_KEY", "PK-test")  # scheduled runs need market-data keys
     procs = []
 
     def popen(command, **kwargs):
@@ -206,3 +207,47 @@ def test_schedule_status_endpoint(client, manager) -> None:
     resp = client.put("/api/settings/auto-revalidate", json={"enabled": False})
     assert resp.json() == {"enabled": False}
     assert client.get("/api/control/validate").json()["schedule"]["enabled"] is False
+
+
+# ---------------------------------------------------------------------------
+# Audit fixes
+# ---------------------------------------------------------------------------
+
+def test_validation_records_outcome_even_when_it_crashes(tmp_path, monkeypatch) -> None:
+    import scripts.validate_and_train as vt
+
+    def boom(args):
+        raise ConnectionError("network down")
+
+    monkeypatch.setattr(vt, "_run", boom)
+    out = tmp_path / "val"
+    assert vt.main(["--symbols", "AAPL", "--out", str(out), "--trigger", "scheduled"]) == 1
+    run = json.loads((out / "last_run.json").read_text())
+    assert run["result"] == "error" and run["trigger"] == "scheduled"
+
+
+def test_no_scheduled_run_without_data_keys(world, monkeypatch) -> None:
+    mgr, reval, now, procs = world
+    _report(SAT_NOON - timedelta(days=8))
+    mgr.start_validation(["AAPL"], "5m", 120, True)
+    _finish(mgr, procs)
+    monkeypatch.delenv("ALPACA_API_KEY", raising=False)
+    monkeypatch.delenv("ALPACA_LIVE_API_KEY", raising=False)
+    assert reval.due() is None
+    monkeypatch.setenv("ALPACA_API_KEY", "PK1")
+    assert reval.due() == "validation is 8 days old"
+
+
+def test_model_is_saved_atomically(monkeypatch, tmp_path) -> None:
+    import os
+
+    import scripts.train_model as tm
+
+    replaced = []
+    real_replace = os.replace
+    monkeypatch.setattr(tm.os, "replace", lambda a, b: (replaced.append((str(a), str(b))), real_replace(a, b)))
+    out = tmp_path / "model.joblib"
+    assert tm.main(["--synthetic", "--symbols", "AAA", "--timeframe", "1d", "--days", "300",
+                    "--output", str(out)]) == 0
+    assert replaced == [(str(out) + ".tmp", str(out))] and out.exists()
+    assert not (tmp_path / "model.joblib.tmp").exists()

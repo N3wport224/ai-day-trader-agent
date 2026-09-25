@@ -118,6 +118,8 @@ class Revalidator:
         created = self.report_created()
         if not settings or created is None:
             return None  # never validated from the dashboard: nothing to repeat
+        if not (os.getenv("ALPACA_API_KEY") or os.getenv("ALPACA_LIVE_API_KEY")):
+            return None  # no market-data keys: a run could only fail
         if self.manager.validation.running():
             return None
         now = self.now_fn()

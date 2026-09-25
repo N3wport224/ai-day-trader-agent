@@ -42,7 +42,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--trigger", choices=("manual", "scheduled"), default="manual")
     args = parser.parse_args(argv)
     started = datetime.now(timezone.utc).isoformat()
-    code = _run(args)
+    try:
+        code = _run(args)
+    except Exception as exc:  # still record the outcome so the dashboard can report it
+        print(f"RESULT: validation failed with an error: {exc}", flush=True)
+        code = 1
     result = {0: "validated", 2: "no_edge"}.get(code, "error")
     summary = {
         "result": result,
