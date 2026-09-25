@@ -63,8 +63,11 @@ def _headers() -> Dict[str, str]:
 
 
 def is_protected(rel: str) -> bool:
-    parts = PurePosixPath(rel).parts
-    return bool(parts) and (parts[0] in PROTECTED or rel.endswith(PROTECTED_SUFFIXES) or "__pycache__" in parts)
+    # Case-insensitive: on Windows and macOS "Data/x.db" or ".ENV" is the same
+    # file as "data/x.db" / ".env", so a case variant must not slip past.
+    lowered = rel.lower()
+    parts = PurePosixPath(lowered).parts
+    return bool(parts) and (parts[0] in PROTECTED or lowered.endswith(PROTECTED_SUFFIXES) or "__pycache__" in parts)
 
 
 # ---------------------------------------------------------------------------

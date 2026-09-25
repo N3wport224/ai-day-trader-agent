@@ -211,3 +211,14 @@ def test_update_api_guards(client, manager, monkeypatch) -> None:
 
     monkeypatch.setattr(updates.updater, "check", lambda root: {"ok": True, "update_available": True})
     assert "Stop the paper bot" in client.get("/api/updates/check").json()["busy"]
+
+
+def test_protection_is_case_insensitive(install) -> None:
+    for rel in (".ENV", "Data/portfolios.db", "LOGS/x.log", "Models/m.joblib", "core/cache.DB", ".Env"):
+        assert updater.is_protected(rel), rel
+    assert not updater.is_protected(".env.example") and not updater.is_protected("core/data_utils.py")
+    remote = {**REMOTE, ".ENV": "ALPACA_API_KEY=REPO", "Data/portfolios.db": "wiped"}
+    updater.apply(install, http_get=_github(_zip(remote)))
+    assert (install / ".env").read_text() == "ALPACA_API_KEY=mine\n"
+    assert (install / "data" / "portfolios.db").read_text() == "my trades"
+    assert not (install / ".ENV").exists() and not (install / "Data").exists()
