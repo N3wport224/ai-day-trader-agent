@@ -464,6 +464,7 @@ const Control = (() => {
             <div id="${mode}-gate-note"></div>
             <label class="field"><span>Stocks to trade</span>
               <input class="form-input mono" id="${mode}-symbols" value="AAPL,MSFT,NVDA,AMD,META,AMZN,GOOGL,TSLA"></label>
+            <div class="muted small" id="${mode}-event-note"></div>
             <label class="field"><span>Bar size</span><select class="form-input" id="${mode}-timeframe">${tfOptions}</select></label>
             <div class="radio-row">
               <label class="check"><input type="radio" name="${mode}-exec" value="1" checked> Place ${live ? 'real' : 'paper'} orders</label>
@@ -577,6 +578,8 @@ const Control = (() => {
       const saved = JSON.parse(localStorage.getItem(`adt_${mode}_settings`) || 'null');
       if (saved) { $(`${mode}-symbols`).value = saved.symbols; $(`${mode}-timeframe`).value = saved.timeframe; }
     } catch {}
+    $(`${mode}-symbols`).addEventListener('change', () => loadEvents(mode));
+    loadEvents(mode);
   }
 
   const lastAccountLoad = { paper: 0, live: 0 };
@@ -706,6 +709,7 @@ const Control = (() => {
       case 'bot_restarted': return ['🔁', 'Bot restarted automatically'];
       case 'flatten_fill': return e.status === 'filled' ? ['🌙', `Closed ${e.filled_qty} ${e.symbol} at ${e.fill_price} (${e.filled_at ? new Date(e.filled_at).toLocaleTimeString() : ''})`] : ['⚠️', `${e.symbol} close order ${e.status}`];
       case 'flat_confirmed': return ['✅', `Flat for the day at ${e.at_et} ET`];
+      case 'entry_skipped_event': return ['📅', `${e.symbol} entry skipped: ${e.reason}`];
       case 'selftest': return [e.overall === 'ok' ? '🧪' : '⚠️', `Self-test ${e.full ? '(full) ' : ''}finished: ${e.overall}`];
       case 'streak_lockout_active': return ['🧊', `${e.losses} losing trades in a row: new entries paused until ${e.until_et} ET`];
       case 'slippage_timeout': return ['💨', `${e.symbol} entry cancelled: ${e.reason}`];
@@ -880,6 +884,28 @@ const Control = (() => {
     $('modal-cancel').addEventListener('click', close);
     if (check) $('modal-check').addEventListener('change', (e) => { $('modal-ok').disabled = !e.target.checked; });
     $('modal-ok').addEventListener('click', async () => { $('modal-ok').disabled = true; await onConfirm(); close(); });
+  }
+
+  /* ── Earnings / event blackouts ── */
+  async function loadEvents(mode) {
+    const note = $(`${mode}-event-note`);
+    const symbols = $(`${mode}-symbols`).value.split(/[\s,]+/).filter(Boolean).join(',');
+    if (!symbols) { note.textContent = ''; return; }
+    try {
+      const r = await api('GET', `/control/events?symbols=${encodeURIComponent(symbols)}`);
+      if (!r.enabled) { note.textContent = ''; return; }
+      const fmt = (d) => new Date(`${d}T12:00:00`).toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' });
+      const parts = r.earnings.map((e) => `${e.symbol} ${fmt(e.date)}`);
+      note.innerHTML = parts.length
+        ? `📅 Earnings soon: <b>${esc(parts.join(', '))}</b>. No new entries in a stock ${r.days_before ? `${r.days_before} day(s) before, ` : ''}on the day and ${r.days_after} day(s) after.`
+        : '📅 No earnings for these stocks in the next two weeks.';
+      const missing = r.unavailable || [];
+      if (missing.length) {
+        note.innerHTML = parts.length ? note.innerHTML : '';
+        note.innerHTML += ` ⚠️ Earnings dates unavailable right now for ${esc(missing.join(', '))}; those aren't filtered until they load.`;
+      }
+      if (r.blackouts.length) note.innerHTML += ` Event blackouts: ${esc(r.blackouts.join('; '))}.`;
+    } catch { note.textContent = ''; }
   }
 
   /* ── Go-live scorecard ── */

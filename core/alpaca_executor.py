@@ -175,6 +175,8 @@ class AlpacaExecutor:
         self.chase = chase or ChaseConfig.from_env()
         # Optional order-update cache from the trade_updates stream (core.stream_listener).
         self.order_updates: Optional[Callable[[str], Optional[Dict[str, Any]]]] = None
+        # Optional core.event_calendar.EventCalendar: no entries around earnings / listed events.
+        self.events: Optional[Any] = None
         self.quote_lookup = quote_lookup
         self.risk_manager = risk_manager or RiskManager()
         # Optional intraday session rules (opening lockout / EOD cutoff) for entries.
@@ -353,6 +355,16 @@ class AlpacaExecutor:
             if phase is not SessionPhase.OPEN:
                 logger.info(f"Session phase {phase.value}: skipping entry {quantity} {symbol}")
                 return ExecutionResult(skipped_reason=f"Entries not allowed during {phase.value}")
+        if action == "BUY" and self.events is not None:
+            try:
+                event = self.events.block_reason(symbol)
+            except Exception as exc:  # the filter must never block trading by crashing
+                logger.warning(f"Event filter failed for {symbol}: {exc}")
+                event = None
+            if event:
+                self.telemetry.record("entry_skipped_event", symbol=symbol, reason=event)
+                logger.info(event)
+                return ExecutionResult(skipped_reason=event)
 
         risk = signal.get("risk_parameters") or {}
         position = self.get_position(symbol)

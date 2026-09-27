@@ -34,7 +34,7 @@ from config.api.dependencies import get_portfolio_manager
 from config.api.settings import KEY_GROUPS, require_local
 from core.alpaca_executor import AlpacaExecutor, live_trading_armed
 from core.alpaca_executor_provider import clear_alpaca_executor_cache
-from core.bot_manager import MODES, PROJECT_ROOT, BotManager, mode_env
+from core.bot_manager import MODES, PROJECT_ROOT, BotManager, clean_symbols, mode_env
 from core.performance import PERIODS, compare_with_backtest, equity_series, load_live_trades, summarize, trades_csv
 from core.edge_gate import report_path
 from core.env_store import update_env
@@ -433,6 +433,34 @@ def live_readiness(root: Path = PROJECT_ROOT) -> Dict[str, Any]:
 async def readiness(current_user: User = Depends(get_admin_user)):
     """Ready for real money? The paper record as a go-live checklist."""
     return await run_in_threadpool(live_readiness)
+
+
+def _upcoming_events(symbols: List[str], root: Path = PROJECT_ROOT) -> Dict[str, Any]:
+    from core.event_calendar import EventCalendar, event_filter_enabled, parse_blackouts
+
+    if not event_filter_enabled():
+        return {"enabled": False, "earnings": [], "blackouts": []}
+    calendar = EventCalendar.from_env(cache_path=root / "data" / "earnings_cache.json")
+    today = datetime.now(timezone.utc).date()
+    return {
+        "enabled": True,
+        "days_before": calendar.days_before,
+        "days_after": calendar.days_after,
+        "earnings": calendar.upcoming(symbols),
+        # Unknown, not "no earnings": entries in these aren't filtered right now.
+        "unavailable": [s for s in symbols if calendar.earnings_dates(s) is None],
+        "blackouts": [w.text for w in parse_blackouts(os.getenv("EVENT_BLACKOUT", "")) if w.day >= today],
+    }
+
+
+@router.get("/events")
+async def upcoming_events(symbols: str = "", current_user: User = Depends(get_admin_user)):
+    """Earnings in the next two weeks for these symbols, and listed event blackouts."""
+    try:
+        cleaned = clean_symbols(symbols) if symbols.strip() else []
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return await run_in_threadpool(_upcoming_events, cleaned)
 
 
 class SelfTestRequest(BaseModel):

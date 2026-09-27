@@ -493,6 +493,22 @@ python bot.py --timeframe 1h --overnight                                        
   pause starts. The streak is rebuilt from today's Alpaca fills each cycle, so
   a restart doesn't forget it. Exits are never blocked. The backtester applies
   the same rule (`--max-consecutive-losses`, `--streak-cooldown-minutes`).
+- **Event-risk filter** (`core/event_calendar.py`): no new entries in a stock on
+  its earnings day and the next trading day, because an after-close report gaps the
+  next morning (`EARNINGS_BLACKOUT_DAYS_AFTER`). In swing mode the day before is
+  paused too, so a position is never held into a report
+  (`EARNINGS_BLACKOUT_DAYS_BEFORE`).
+  - Add your own market-wide windows, in ET, with `EVENT_BLACKOUT`, e.g.
+    `2026-10-28 13:45-15:00; 2026-11-12` for a Fed decision or CPI day.
+  - Earnings dates come from Yahoo Finance and are cached for 12 hours. If they can't
+    be fetched, the filter lets entries through and logs it, so a data outage never
+    freezes trading.
+  - Exits, stops and the end-of-day close are never affected.
+  - The Paper and Live tabs list earnings in the next two weeks under **Stocks to
+    trade**, and skipped entries show in Activity.
+  - The validation backtest doesn't simulate this filter. It only removes trades, so
+    live results can differ slightly from the test.
+  - `EVENT_FILTER=false` turns it off.
 - **Real-time fills** (`core/stream_listener.py`): the bot listens to
   Alpaca's `trade_updates` WebSocket. When a stop-loss or take-profit leg
   fills, it re-syncs within a second instead of at the next bar: local book,

@@ -268,6 +268,10 @@ def main(argv: list[str] | None = None) -> int:
         # and intraday entries are checked against the PDT rule.
         broker.session_clock = session_clock
         broker.risk_manager.limits = replace(broker.risk_manager.limits, day_trading=no_overnight)
+        from core.event_calendar import EventCalendar, event_filter_enabled
+
+        if event_filter_enabled():
+            broker.events = EventCalendar.from_env(day_trading=no_overnight)
         # Reconcile every cycle (report-only in dry run); trail stops only when executing.
         trailing = TrailingStopManager(broker) if args.execute else None
         if args.execute:
