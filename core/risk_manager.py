@@ -74,6 +74,9 @@ class RiskLimits:
     # entries for streak_cooldown_minutes (0 disables). A winning close resets it.
     max_consecutive_losses: int = 2
     streak_cooldown_minutes: float = 45.0
+    # "Start small": the most money the bot may have in positions at once
+    # (0 = the whole account). Loss limits and caps then scale to this amount.
+    max_capital: float = 0.0
 
     @classmethod
     def from_env(cls) -> "RiskLimits":
@@ -247,6 +250,7 @@ class PortfolioRisk:
 
     open_positions: int = 0
     open_risk: float = 0.0   # $ lost if every open position hit its stop
+    market_value: float = 0.0  # $ currently held across all long positions
 
 
 def portfolio_risk(
@@ -264,19 +268,20 @@ def portfolio_risk(
         if str(order.get("side", "")).lower() == "sell" and kind in _STOP_TYPES and order.get("stop_price"):
             symbol = order.get("symbol")
             stops[symbol] = max(stops.get(symbol, 0.0), _to_float(order.get("stop_price")))
-    count, risk = 0, 0.0
+    count, risk, value = 0, 0.0, 0.0
     for position in positions or []:
         qty = _to_float(position.get("qty"))
         if qty <= 0:
             continue
         count += 1
         price = _to_float(position.get("current_price")) or _to_float(position.get("avg_entry_price"))
+        value += abs(_to_float(position.get("market_value"))) or price * qty
         stop = stops.get(position.get("symbol"))
         if stop:
             risk += max(0.0, price - stop) * qty
         else:
             risk += price * qty * default_stop_pct / 100
-    return PortfolioRisk(count, round(risk, 2))
+    return PortfolioRisk(count, round(risk, 2), round(value, 2))
 
 
 class RiskManager:
@@ -307,13 +312,19 @@ class RiskManager:
             return self._breaker_reason
         equity, start = _to_float(account.get("equity")), _to_float(account.get("last_equity"))
         if equity > 0 and start > 0:
-            drawdown = (equity - start) / start * 100
+            drawdown = (equity - start) / self._capital_base(start) * 100
             if drawdown <= -limit:
                 self._breaker_reason = (
                     f"Intraday drawdown breaker tripped ({drawdown:.2f}% vs -{limit:.2f}% of starting equity); "
                     f"no new entries for the rest of the {session_date} session"
                 )
         return self._breaker_reason
+
+    def _capital_base(self, equity: float) -> float:
+        """The equity the bot's limits are measured against: the account, or
+        MAX_CAPITAL when that is smaller ("start small")."""
+        cap = self.limits.max_capital
+        return min(equity, cap) if cap > 0 else equity
 
     def _pdt_block(self, account: Dict[str, Any], equity: float) -> Optional[str]:
         """Reject intraday entries that would trip (or trade through) the PDT rule."""
@@ -387,7 +398,7 @@ class RiskManager:
 
 
         if last_equity > 0:
-            day_change_pct = (equity - last_equity) / last_equity * 100
+            day_change_pct = (equity - last_equity) / self._capital_base(last_equity) * 100
             if day_change_pct <= -limits.max_daily_loss_pct:
                 return RiskDecision(
                     False,
@@ -430,9 +441,13 @@ class RiskManager:
         if margin.block:
             return RiskDecision(False, reason=margin.block)
 
-        # Cap the total position (existing + new) at max_position_pct of equity.
+        # Cap the total position (existing + new) at max_position_pct of equity
+        # (of MAX_CAPITAL when that is smaller).
+        base = self._capital_base(equity)
         held_value = abs(_to_float((position or {}).get("market_value")))
-        room = equity * limits.max_position_pct - held_value
+        room = base * limits.max_position_pct - held_value
+        if limits.max_capital > 0 and portfolio is not None:
+            room = min(room, limits.max_capital - portfolio.market_value)
         buying_power = _to_float(account.get("buying_power"))
         max_qty = int(max(0.0, min(room, margin.max_value)) // price)
         approved_qty = min(quantity, max_qty)
@@ -442,8 +457,10 @@ class RiskManager:
             return RiskDecision(
                 False,
                 reason=(
-                    f"No room for {symbol}: position cap ${equity * limits.max_position_pct:,.2f}, "
+                    f"No room for {symbol}: position cap ${base * limits.max_position_pct:,.2f}, "
                     f"held ${held_value:,.2f}, buying power ${buying_power:,.2f}"
+                    + (f", capital limit ${limits.max_capital:,.0f} with ${portfolio.market_value:,.2f} in use"
+                       if limits.max_capital > 0 and portfolio is not None else "")
                 ),
             )
 
@@ -458,7 +475,7 @@ class RiskManager:
                     False, reason=f"Max open positions reached ({portfolio.open_positions}/{limits.max_open_positions})"
                 )
             if limits.max_portfolio_heat_pct > 0:
-                budget = equity * limits.max_portfolio_heat_pct / 100 - portfolio.open_risk
+                budget = base * limits.max_portfolio_heat_pct / 100 - portfolio.open_risk
                 per_share = price - stop_loss
                 heat_qty = int(budget // per_share) if per_share > 0 and budget > 0 else 0
                 if heat_qty <= 0:
@@ -466,7 +483,7 @@ class RiskManager:
                         False,
                         reason=(
                             f"Portfolio heat limit: ${portfolio.open_risk:,.2f} already at risk "
-                            f"(cap {limits.max_portfolio_heat_pct:g}% = ${equity * limits.max_portfolio_heat_pct / 100:,.2f})"
+                            f"(cap {limits.max_portfolio_heat_pct:g}% = ${base * limits.max_portfolio_heat_pct / 100:,.2f})"
                         ),
                     )
                 if heat_qty < approved_qty:

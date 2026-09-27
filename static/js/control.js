@@ -466,6 +466,14 @@ const Control = (() => {
               <input class="form-input mono" id="${mode}-symbols" value="AAPL,MSFT,NVDA,AMD,META,AMZN,GOOGL,TSLA"></label>
             <div class="muted small event-note" id="${mode}-event-note"></div>
             <label class="field"><span>Bar size</span><select class="form-input" id="${mode}-timeframe">${tfOptions}</select></label>
+            <div class="field"><span>Most money the bot may use${live ? ' (start small)' : ''}</span>
+              <div class="inline-row">
+                <span class="prefix">$</span>
+                <input class="form-input" type="number" min="0" step="100" id="${mode}-capital" placeholder="whole account">
+                <button type="button" class="btn btn-outline btn-sm" id="${mode}-capital-save">Save</button>
+              </div>
+              <span class="muted small" id="${mode}-capital-note">Empty or 0 = the whole account. Loss limits scale to this amount.</span>
+            </div>
             <div class="radio-row">
               <label class="check"><input type="radio" name="${mode}-exec" value="1" checked> Place ${live ? 'real' : 'paper'} orders</label>
               <label class="check"><input type="radio" name="${mode}-exec" value="0"> Watch only (signals, no orders)</label>
@@ -579,6 +587,8 @@ const Control = (() => {
       if (saved) { $(`${mode}-symbols`).value = saved.symbols; $(`${mode}-timeframe`).value = saved.timeframe; }
     } catch {}
     $(`${mode}-symbols`).addEventListener('change', () => loadEvents(mode));
+    $(`${mode}-capital-save`).addEventListener('click', () => saveCapital(mode));
+    api('GET', `/control/${mode}/capital`).then((r) => { $(`${mode}-capital`).value = r.max_capital || ''; }).catch(() => {});
     loadEvents(mode);
   }
 
@@ -886,6 +896,18 @@ const Control = (() => {
     $('modal-ok').addEventListener('click', async () => { $('modal-ok').disabled = true; await onConfirm(); close(); });
   }
 
+  /* ── Capital limit ("start small") ── */
+  async function saveCapital(mode) {
+    const raw = $(`${mode}-capital`).value.trim();
+    const amount = raw === '' ? 0 : Number(raw);
+    if (!(amount >= 0)) { toast('Enter a dollar amount, or leave it empty for the whole account.', 'error'); return; }
+    try {
+      const r = await api('POST', `/control/${mode}/capital`, { max_capital: amount });
+      toast(r.max_capital ? `The ${mode} bot will use at most $${r.max_capital.toLocaleString()}. ${r.message}`
+                          : `The ${mode} bot may use the whole account. ${r.message}`, 'success');
+    } catch (ex) { toast(ex.message, 'error'); }
+  }
+
   /* ── Earnings / event blackouts ── */
   async function loadEvents(mode) {
     const note = $(`${mode}-event-note`);
@@ -958,6 +980,9 @@ const Control = (() => {
         ${unready ? `<div class="notice bad"><b>Paper trading hasn't shown this strategy is ready.</b> See "Ready for real
           money?" above: the ✗ items mean the evidence isn't there yet. Most strategies that skip this step lose money.</div>` : ''}
         <p>The bot will place <b>real orders</b> in your live Alpaca account on: <b class="mono">${esc(symbols.join(', '))}</b>.</p>
+        ${Number($('live-capital').value) > 0
+          ? `<p>It may use at most <b>$${Number($('live-capital').value).toLocaleString()}</b>; loss limits scale to that amount.</p>`
+          : '<div class="notice warn">It may use your <b>whole account</b>. Consider setting "Most money the bot may use" first, e.g. $1,000.</div>'}
         <p class="muted small">Risk limits stay on (per-trade risk, 2% daily drawdown stop, total-risk cap, closing everything before the close).</p>`,
       go, { confirmText: 'Start live trading', danger: true,
             check: unready ? 'I understand this trades real money, I can lose it, and I am going live before paper trading proved the strategy.'

@@ -151,6 +151,14 @@ class EdgeGateWatch:
         return self._block
 
 
+def mode_capital_limit(mode: str) -> float:
+    """LIVE_MAX_CAPITAL / PAPER_MAX_CAPITAL (0 or unset = the whole account)."""
+    try:
+        return max(0.0, float(os.getenv(f"{mode.upper()}_MAX_CAPITAL", "0") or 0))
+    except ValueError:
+        return 0.0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="AI Day Trader scheduled bot")
     parser.add_argument(
@@ -267,7 +275,11 @@ def main(argv: list[str] | None = None) -> int:
         # Entries obey the session rules at the executor too (the final gate),
         # and intraday entries are checked against the PDT rule.
         broker.session_clock = session_clock
-        broker.risk_manager.limits = replace(broker.risk_manager.limits, day_trading=no_overnight)
+        broker.risk_manager.limits = replace(broker.risk_manager.limits, day_trading=no_overnight,
+                                             max_capital=mode_capital_limit(args.mode))
+        if broker.risk_manager.limits.max_capital > 0:
+            log.info(f"Capital limit: the bot uses at most ${broker.risk_manager.limits.max_capital:,.0f} "
+                     f"({args.mode.upper()}_MAX_CAPITAL); loss limits scale to it")
         from core.event_calendar import EventCalendar, event_filter_enabled
 
         if event_filter_enabled():

@@ -81,6 +81,13 @@ Your browser opens the dashboard at http://127.0.0.1:8000/dashboard. From there:
    - a passing validation;
    - a confirmation tick box every time you start the bot.
 
+   **Start small:** set **Most money the bot may use** on the Live tab
+   (`LIVE_MAX_CAPITAL`, e.g. $1,000). It's a hard cap on the total value of open
+   positions. The per-position cap, the total-risk cap, the daily-loss limit and the
+   drawdown breaker all scale to that amount instead of the whole account: with $1,000,
+   the 2% breaker trips at a $20 loss. `PAPER_MAX_CAPITAL` does the same on paper, so
+   you can rehearse the sizing. It applies from the bot's next start.
+
    The tab also has a **Ready for real money?** scorecard built from your paper
    account. It checks:
    - a passing validation and a recent passing self-test;

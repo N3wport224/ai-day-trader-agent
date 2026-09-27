@@ -463,6 +463,41 @@ async def upcoming_events(symbols: str = "", current_user: User = Depends(get_ad
     return await run_in_threadpool(_upcoming_events, cleaned)
 
 
+class CapitalRequest(BaseModel):
+    max_capital: float = Field(..., ge=0, le=100_000_000)   # 0 = the whole account
+
+
+def capital_limit(mode: str) -> float:
+    try:
+        return max(0.0, float(os.getenv(f"{mode.upper()}_MAX_CAPITAL", "0") or 0))
+    except ValueError:
+        return 0.0
+
+
+@router.get("/{mode}/capital")
+async def get_capital(mode: str, current_user: User = Depends(get_admin_user)):
+    _check_mode(mode)
+    return {"mode": mode, "max_capital": capital_limit(mode)}
+
+
+@router.post("/{mode}/capital")
+async def set_capital(mode: str, body: CapitalRequest, request: Request,
+                      current_user: User = Depends(get_admin_user),
+                      manager: BotManager = Depends(get_bot_manager)):
+    """How much money the bot may use ("start small"); applies from the bot's next start."""
+    _check_mode(mode)
+    if mode == "live":
+        require_local(request)
+    amount = round(body.max_capital, 2)
+    update_env({f"{mode.upper()}_MAX_CAPITAL": f"{amount:g}" if amount else None})
+    running = manager.bots[mode].running()
+    logger.warning(f"{current_user.username} set the {mode} capital limit to "
+                   f"{'the whole account' if not amount else f'${amount:,.2f}'}")
+    return {"mode": mode, "max_capital": amount, "restart_needed": running,
+            "message": ("Saved. Restart the bot to apply it now." if running else
+                        "Saved. It applies when the bot starts.")}
+
+
 class SelfTestRequest(BaseModel):
     confirm: bool = False
     full: bool = False            # also buy and sell 1 share (paper)
