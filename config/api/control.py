@@ -203,6 +203,7 @@ def _run_health(manager: BotManager) -> Dict[str, Any]:
         load_model=lambda: load_artifact(model_path),
         report_file=report_path(),
         autostart_enabled=bool(autostart.status()["enabled"]),
+        selftest_file=selftest_path(manager.root),
     )
 
 
@@ -393,6 +394,53 @@ async def stop_bot(mode: str, current_user: User = Depends(get_admin_user),
     stopped = manager.stop_bot(mode)
     return {"stopping": stopped, "message": "Stopping after the current cycle; open positions keep their "
                                             "broker-side stops." if stopped else "The bot was not running."}
+
+
+class SelfTestRequest(BaseModel):
+    confirm: bool = False
+    full: bool = False            # also buy and sell 1 share (paper)
+    symbol: str = Field("SPY", max_length=10, pattern=r"^[A-Za-z.]{1,10}$")
+
+
+def selftest_path(root: Path = PROJECT_ROOT) -> Path:
+    return root / "logs" / "selftest.json"
+
+
+def _run_selftest(symbol: str, full: bool) -> Dict[str, Any]:
+    from core.selftest import run_selftest
+    from core.stream_listener import TradeUpdateStream, stream_enabled
+
+    executor = AlpacaExecutor(mode="paper", telemetry=EventLog(mode_env("paper")["EXECUTION_LOG_PATH"]),
+                              price_lookup=lambda s: 0.0)
+    factory = (lambda ex: TradeUpdateStream.for_executor(ex, telemetry=ex.telemetry)) if stream_enabled() else None
+    result = run_selftest(executor, symbol=symbol, full=full, stream_factory=factory)
+    path = selftest_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(result, indent=2), encoding="utf-8")
+    return result
+
+
+@router.post("/paper/selftest")
+async def run_paper_selftest(body: SelfTestRequest, current_user: User = Depends(get_admin_user),
+                             manager: BotManager = Depends(get_bot_manager)):
+    """Check the paper setup end to end (keys, quote, order stream, and during
+    market hours a non-filling test order that is re-priced and cancelled;
+    ``full`` adds a real 1-share paper buy and sell)."""
+    if not body.confirm:
+        raise HTTPException(status_code=400, detail="Confirm the self-test.")
+    if not _keys_configured("paper"):
+        raise HTTPException(status_code=400, detail="Save your paper API keys first (API Keys tab).")
+    if manager.bots["paper"].running():
+        raise HTTPException(status_code=409, detail="Stop the paper bot first; the test places its own orders.")
+    return await run_in_threadpool(_run_selftest, body.symbol.upper(), body.full)
+
+
+@router.get("/paper/selftest")
+async def last_paper_selftest(current_user: User = Depends(get_admin_user)):
+    try:
+        return json.loads(selftest_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"overall": None, "steps": []}
 
 
 def _performance(mode: str, period: str, root: Path = PROJECT_ROOT) -> Dict[str, Any]:

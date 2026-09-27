@@ -477,6 +477,19 @@ const Control = (() => {
           </div>
         </div>
 
+        ${live ? '' : `
+        <div class="card" id="paper-selftest-card">
+          <h3>Test my setup</h3>
+          <p class="muted small">Checks your paper keys, live prices and the real-time order stream. During market hours
+            (9:30 to 4:00 ET) it also places a 1-share test order priced 5% below the market, so it cannot fill,
+            re-prices it the way the bot does and cancels it. Nothing is bought. Stop the paper bot first.</p>
+          <div class="btn-row">
+            <button class="btn btn-primary" id="paper-selftest-quick">Run quick test</button>
+            <button class="btn btn-outline" id="paper-selftest-full">Full test (buys and sells 1 share)</button>
+          </div>
+          <div id="paper-selftest-result"></div>
+        </div>`}
+
         <div class="card">
           <h3>Open positions</h3>
           <div id="${mode}-positions"><div class="empty-state">No positions</div></div>
@@ -540,7 +553,15 @@ const Control = (() => {
       loadPerformance(mode, true);
     });
     $(`${mode}-csv`).addEventListener('click', () => downloadCsv(mode));
-    if (!live) $('paper-order-submit').addEventListener('click', submitPaperOrder);
+    if (!live) {
+      $('paper-order-submit').addEventListener('click', submitPaperOrder);
+      $('paper-selftest-quick').addEventListener('click', () => runSelfTest(false));
+      $('paper-selftest-full').addEventListener('click', () => modal(`<h3>Run the full paper test?</h3>
+        <p>This buys 1 share of SPY in your <b>paper</b> account using the bot's smart limit order, checks the
+        stop-loss and take-profit, then sells the share. It uses fake money and takes up to a minute.</p>`,
+      () => runSelfTest(true), { confirmText: 'Run full test' }));
+      api('GET', '/control/paper/selftest').then((r) => { if (r.overall) renderSelfTest(r); }).catch(() => {});
+    }
     try {
       const saved = JSON.parse(localStorage.getItem(`adt_${mode}_settings`) || 'null');
       if (saved) { $(`${mode}-symbols`).value = saved.symbols; $(`${mode}-timeframe`).value = saved.timeframe; }
@@ -674,6 +695,7 @@ const Control = (() => {
       case 'bot_restarted': return ['🔁', 'Bot restarted automatically'];
       case 'flatten_fill': return e.status === 'filled' ? ['🌙', `Closed ${e.filled_qty} ${e.symbol} at ${e.fill_price} (${e.filled_at ? new Date(e.filled_at).toLocaleTimeString() : ''})`] : ['⚠️', `${e.symbol} close order ${e.status}`];
       case 'flat_confirmed': return ['✅', `Flat for the day at ${e.at_et} ET`];
+      case 'selftest': return [e.overall === 'ok' ? '🧪' : '⚠️', `Self-test ${e.full ? '(full) ' : ''}finished: ${e.overall}`];
       case 'streak_lockout_active': return ['🧊', `${e.losses} losing trades in a row: new entries paused until ${e.until_et} ET`];
       case 'slippage_timeout': return ['💨', `${e.symbol} entry cancelled: ${e.reason}`];
       case 'entry_unfilled': return ['⌛', `${e.symbol} entry not filled: ${e.reason}`];
@@ -908,6 +930,39 @@ const Control = (() => {
       $('live-arm-card').dataset.state = '';
       loadMode('live'); loadOverview();
     } catch (ex) { toast(ex.message, 'error'); }
+  }
+
+  /* ── Paper self-test ── */
+  async function runSelfTest(full) {
+    const buttons = ['paper-selftest-quick', 'paper-selftest-full'].map($);
+    buttons.forEach((b) => { b.disabled = true; });
+    $('paper-selftest-result').innerHTML = `<div class="notice">Testing… this takes ${full ? 'up to a minute' : 'about 20 seconds'}.</div>`;
+    try {
+      renderSelfTest(await api('POST', '/control/paper/selftest', { confirm: true, full }));
+      lastAccountLoad.paper = 0; loadMode('paper');
+    } catch (ex) {
+      $('paper-selftest-result').innerHTML = `<div class="notice bad">${esc(ex.message)}</div>`;
+    } finally {
+      buttons.forEach((b) => { b.disabled = false; });
+    }
+  }
+
+  function renderSelfTest(r) {
+    const icon = { ok: '✓', warn: '!', fail: '✗', info: 'i' };
+    const headline = r.overall === 'fail'
+      ? '<div class="notice bad"><b>Something needs fixing</b> before the bot can trade. See the steps marked ✗.</div>'
+      : r.overall === 'warn'
+        ? '<div class="notice warn"><b>Works, with warnings.</b> The bot can trade; the notes below explain what it does instead.</div>'
+        : '<div class="notice ok"><b>All good.</b> Orders, prices and live updates work on your paper account.</div>';
+    $('paper-selftest-result').innerHTML = `${headline}
+      <ul class="checks">${(r.steps || []).map((c) => `
+        <li class="check-row ${esc(c.status)}">
+          <span class="check-icon">${icon[c.status] || '?'}</span>
+          <div><b>${esc(c.label)}</b> <span class="muted">${esc(c.detail)}</span>
+            ${c.fix && c.status !== 'ok' ? `<div class="fix">${esc(c.fix)}</div>` : ''}</div>
+        </li>`).join('')}</ul>
+      <p class="muted small">${r.full ? 'Full test' : 'Quick test'} on ${esc(r.symbol)},
+        ${esc(new Date(r.checked_at).toLocaleString())}.</p>`;
   }
 
   async function submitPaperOrder() {

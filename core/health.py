@@ -195,6 +195,30 @@ def check_alerts() -> Check:
                  "Add a Discord or Slack webhook on the API Keys tab.")
 
 
+def check_selftest(result: Dict[str, Any], now: datetime, max_age_days: float = 14) -> Check:
+    """The last paper self-test (Paper tab > Test my setup)."""
+    label = "Paper self-test"
+    checked = _parse(result.get("checked_at"))
+    if not result.get("overall") or checked is None:
+        return Check("selftest", label, "info", "Not run yet",
+                     "On the Paper tab, click Test my setup (order steps need market hours).")
+    ran_orders = any(step.get("id") == "order_cancel" and step.get("status") != "info"
+                     for step in result.get("steps") or [])
+    age = (now - checked).days
+    when = "today" if age < 1 else f"{age} day{'s' if age != 1 else ''} ago"
+    if result["overall"] == "fail":
+        failed = [s.get("label") for s in result.get("steps") or [] if s.get("status") == "fail"]
+        return Check("selftest", label, "warn", f"Last run {when} found problems: {', '.join(failed)}",
+                     "Fix them (see the Paper tab), then run the test again.")
+    if not ran_orders:
+        return Check("selftest", label, "info", f"Last run {when} outside market hours, so no test order was placed",
+                     "Run it again between 9:30 and 4:00 ET to check the order path too.")
+    if age > max_age_days:
+        return Check("selftest", label, "info", f"Last passed {when}", "Worth re-running after updates.")
+    return Check("selftest", label, "ok", f"Passed {when}"
+                 + (" (with warnings; see the Paper tab)" if result["overall"] == "warn" else ""))
+
+
 # ---------------------------------------------------------------------------
 # Run everything
 # ---------------------------------------------------------------------------
@@ -209,6 +233,7 @@ def run_checks(
     report_file: Path,
     autostart_enabled: bool,
     now_fn: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+    selftest_file: Optional[Path] = None,
 ) -> Dict[str, Any]:
     now = now_fn()
     checks: List[Check] = [check_python(), check_ml_library()]
@@ -233,6 +258,12 @@ def run_checks(
     checks += [check_disk(manager.root)]
     checks += check_bots(manager, market_open)
     checks += [check_unattended(autostart_enabled), check_alerts()]
+    if selftest_file is not None:
+        try:
+            selftest = json.loads(Path(selftest_file).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            selftest = {}
+        checks.append(check_selftest(selftest, now))
 
     worst = min((ORDER[c.status] for c in checks), default=3)
     overall = {0: "fail", 1: "warn"}.get(worst, "ok")

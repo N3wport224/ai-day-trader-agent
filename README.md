@@ -56,11 +56,25 @@ Your browser opens the dashboard at http://127.0.0.1:8000/dashboard. From there:
 3. **Get Started tab → Validate strategy:** a walk-forward test on real data. The bot
    only places trades if this test finds an edge; if it does, the model is trained
    automatically.
-4. **Paper Trading tab** (green, fake money): start or stop the auto-trader, watch it in
+4. **Paper Trading tab → Test my setup** (do this first, during market hours). It
+   checks, on your own paper account:
+   - that the keys work and live prices come through;
+   - that the real-time order stream logs in;
+   - the bot's order handling: it places a 1-share SPY buy priced 5% under the market
+     (so it can't fill) with a stop-loss and take-profit, re-prices it the way the smart
+     limit entry does, and cancels it. Nothing is bought.
+
+   Every step shows ✓, ! or ✗, with the fix. **Full test** also buys and sells 1 real
+   paper share through the smart limit entry, checking the fill, the stop-loss and
+   take-profit, and the stream. The test cleans up every order it makes, refuses the
+   live account, and won't run while the paper bot is running. From a terminal:
+   `python scripts/selftest.py` (add `--full` for the round trip). The last result shows
+   in System check.
+5. **Paper Trading tab** (green, fake money): start or stop the auto-trader, watch it in
    one of two modes (placing paper orders, or watch-only), see positions, activity and
    the day's P&L, place manual paper orders, and use the emergency **Close everything**
    button.
-5. **Live Trading tab** (red, real money), optional and only after weeks of paper
+6. **Live Trading tab** (red, real money), optional and only after weeks of paper
    trading. It requires all of these:
    - separate live keys;
    - **arming**: type `I UNDERSTAND THIS USES REAL MONEY` plus your password;
