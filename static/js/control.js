@@ -464,7 +464,7 @@ const Control = (() => {
             <div id="${mode}-gate-note"></div>
             <label class="field"><span>Stocks to trade</span>
               <input class="form-input mono" id="${mode}-symbols" value="AAPL,MSFT,NVDA,AMD,META,AMZN,GOOGL,TSLA"></label>
-            <div class="muted small" id="${mode}-event-note"></div>
+            <div class="muted small event-note" id="${mode}-event-note"></div>
             <label class="field"><span>Bar size</span><select class="form-input" id="${mode}-timeframe">${tfOptions}</select></label>
             <div class="radio-row">
               <label class="check"><input type="radio" name="${mode}-exec" value="1" checked> Place ${live ? 'real' : 'paper'} orders</label>

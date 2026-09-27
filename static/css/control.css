@@ -194,6 +194,8 @@ select.form-input { cursor: pointer; }
 .stats b { font-size: 18px; font-weight: 600; }
 .stats small { font-size: 12px; font-weight: 500; }
 .heartbeat { font-size: 12px; color: var(--text-secondary); margin-top: 6px; }
+.event-note { margin: -6px 0 12px; line-height: 1.5; }
+.event-note:empty { display: none; }
 
 .table { width: 100%; border-collapse: collapse; font-size: 13px; }
 .table th { text-align: left; color: var(--text-secondary); font-weight: 500; padding: 6px 8px; border-bottom: 1px solid var(--border); }
