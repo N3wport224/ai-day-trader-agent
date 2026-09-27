@@ -214,7 +214,10 @@ def test_live_requires_arming_edge_and_confirmation(client, manager, portfolio_m
     assert "Confirm" in client.post("/api/control/live/start",
                                     json={**start, "confirm_live": False}).json()["detail"]
     assert remote(client).post("/api/control/live/start", json=start).status_code == 403
-    resp = client.post("/api/control/live/start", json=start)
+    # No paper record yet: the go-live scorecard needs an explicit acknowledgment.
+    unready = client.post("/api/control/live/start", json=start)
+    assert unready.status_code == 409 and "Paper trading hasn't shown" in unready.json()["detail"]
+    resp = client.post("/api/control/live/start", json={**start, "accept_unready": True})
     assert resp.status_code == 200 and "--mode" in manager.bots["live"].tracked.command
     assert manager.bots["live"].tracked.command[manager.bots["live"].tracked.command.index("--mode") + 1] == "live"
 

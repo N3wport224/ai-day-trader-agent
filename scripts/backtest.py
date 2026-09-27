@@ -609,6 +609,8 @@ def main(argv: list[str] | None = None) -> int:
             "consistent across periods."
         )
 
+    # Record the cost assumption so live fills can be checked against it (go-live scorecard).
+    m = {**m, "cost_bps_per_side": round(args.slippage_bps + args.spread_bps / 2, 2)}
     verdict = build_verdict(m, audits[main_name]["setup"], list(bars))
     print("\n== Edge gate (live trading requires a pass) ==")
     if verdict.passed:

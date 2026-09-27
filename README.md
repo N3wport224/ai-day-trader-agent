@@ -81,6 +81,20 @@ Your browser opens the dashboard at http://127.0.0.1:8000/dashboard. From there:
    - a passing validation;
    - a confirmation tick box every time you start the bot.
 
+   The tab also has a **Ready for real money?** scorecard built from your paper
+   account. It checks:
+   - a passing validation and a recent passing self-test;
+   - at least 20 closed paper trades over at least 10 days;
+   - paper results in line with the validation test;
+   - real fill costs within the test's cost assumption;
+   - no safety incidents in the last 30 days (a position without a stop, or not flat at
+     the close).
+
+   Starting the live bot while any item fails needs an extra, explicit acknowledgment
+   (`LIVE_REQUIRE_READINESS=false` turns this off; `READINESS_MIN_TRADES`,
+   `READINESS_MIN_DAYS` and `READINESS_SLIPPAGE_TOLERANCE_BPS` tune it). Automatic
+   restarts of a bot you already started are not blocked.
+
    **Disarm** stops the live bot instantly. Real-money trading can't be switched on from
    another machine, and the edge gate can't be bypassed in live mode.
 

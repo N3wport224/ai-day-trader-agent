@@ -449,7 +449,14 @@ const Control = (() => {
           <span class="pill big" id="${mode}-run-pill">…</span>
         </div>
 
-        ${live ? `<div class="card" id="live-arm-card"></div>` : ''}
+        ${live ? `<div class="card" id="live-arm-card"></div>
+        <div class="card" id="live-readiness-card">
+          <div class="card-head"><h3>Ready for real money?</h3>
+            <button type="button" class="btn btn-outline btn-sm" id="live-readiness-refresh">Check again</button></div>
+          <p class="muted small">Built from your <b>paper</b> account: has the strategy traded long enough, and like the
+            test said it would, without safety problems? Going live before this passes needs an extra confirmation.</p>
+          <div id="live-readiness"><div class="empty-state">Loading…</div></div>
+        </div>` : ''}
 
         <div class="grid-2">
           <div class="card">
@@ -553,6 +560,10 @@ const Control = (() => {
       loadPerformance(mode, true);
     });
     $(`${mode}-csv`).addEventListener('click', () => downloadCsv(mode));
+    if (live) {
+      $('live-readiness-refresh').addEventListener('click', loadReadiness);
+      loadReadiness();
+    }
     if (!live) {
       $('paper-order-submit').addEventListener('click', submitPaperOrder);
       $('paper-selftest-quick').addEventListener('click', () => runSelfTest(false));
@@ -871,24 +882,60 @@ const Control = (() => {
     $('modal-ok').addEventListener('click', async () => { $('modal-ok').disabled = true; await onConfirm(); close(); });
   }
 
-  function startBot(mode) {
+  /* ── Go-live scorecard ── */
+  let readinessCache = null;
+  async function loadReadiness() {
+    try {
+      readinessCache = await api('GET', '/control/live/readiness');
+      renderReadiness(readinessCache);
+    } catch (ex) {
+      $('live-readiness').innerHTML = `<div class="notice bad">${esc(ex.message)}</div>`;
+    }
+    return readinessCache;
+  }
+
+  function renderReadiness(r) {
+    const icon = { ok: '✓', warn: '!', fail: '✗', info: 'i' };
+    const headline = r.ready
+      ? `<div class="notice ok"><b>Ready.</b> ${r.passed} of ${r.total} checks pass. Still start small.</div>`
+      : `<div class="notice bad"><b>Not ready yet.</b> ${r.passed} of ${r.total} checks pass. Keep paper trading until the ✗ items clear.</div>`;
+    $('live-readiness').innerHTML = `${headline}
+      <ul class="checks">${r.checks.map((c) => `
+        <li class="check-row ${esc(c.status)}">
+          <span class="check-icon">${icon[c.status] || '?'}</span>
+          <div><b>${esc(c.label)}</b> <span class="muted">${esc(c.detail)}</span>
+            ${c.fix && c.status !== 'ok' ? `<div class="fix">${esc(c.fix)}</div>` : ''}</div>
+        </li>`).join('')}</ul>`;
+  }
+
+  async function startBot(mode) {
     const live = mode === 'live';
     const symbols = $(`${mode}-symbols`).value.split(/[\s,]+/).filter(Boolean);
     const timeframe = $(`${mode}-timeframe`).value;
     const execute = document.querySelector(`input[name="${mode}-exec"]:checked`).value === '1';
     try { localStorage.setItem(`adt_${mode}_settings`, JSON.stringify({ symbols: symbols.join(','), timeframe })); } catch {}
+    let unready = false;
+    if (live && execute) {
+      const r = await loadReadiness();
+      unready = Boolean(r && r.required && !r.ready);
+    }
     const go = async () => {
       try {
-        await api('POST', `/control/${mode}/start`, { symbols, timeframe, execute, confirm_live: live && execute });
+        await api('POST', `/control/${mode}/start`, { symbols, timeframe, execute, confirm_live: live && execute,
+                                                      accept_unready: unready });
         toast(`${live ? 'LIVE' : 'Paper'} bot started${execute ? '' : ' (watch only)'}.`, 'success');
         loadMode(mode); loadOverview();
       } catch (ex) { toast(ex.message, 'error'); }
     };
     if (live && execute) {
       modal(`<h3>Start trading with real money?</h3>
+        ${unready ? `<div class="notice bad"><b>Paper trading hasn't shown this strategy is ready.</b> See "Ready for real
+          money?" above: the ✗ items mean the evidence isn't there yet. Most strategies that skip this step lose money.</div>` : ''}
         <p>The bot will place <b>real orders</b> in your live Alpaca account on: <b class="mono">${esc(symbols.join(', '))}</b>.</p>
         <p class="muted small">Risk limits stay on (per-trade risk, 2% daily drawdown stop, total-risk cap, closing everything before the close).</p>`,
-      go, { confirmText: 'Start live trading', danger: true, check: 'I understand this trades real money and I can lose it.' });
+      go, { confirmText: 'Start live trading', danger: true,
+            check: unready ? 'I understand this trades real money, I can lose it, and I am going live before paper trading proved the strategy.'
+                           : 'I understand this trades real money and I can lose it.' });
     } else {
       go();
     }

@@ -40,6 +40,7 @@ from core.edge_gate import report_path
 from core.env_store import update_env
 from core.execution_telemetry import EventLog, default_alert_sink
 from core.portfolio_manager import PortfolioManager
+from core.readiness import readiness_required
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -83,7 +84,8 @@ def edge_report_summary() -> Dict[str, Any]:
         "symbols": report.get("symbols") or [],
         "timeframe": (report.get("setup") or {}).get("timeframe"),
         "metrics": {k: metrics.get(k) for k in ("trades", "profit_factor", "avg_r", "win_rate_pct",
-                                               "max_drawdown_pct", "positive_folds", "folds")},
+                                               "max_drawdown_pct", "positive_folds", "folds",
+                                               "cost_bps_per_side")},
     }
 
 
@@ -292,6 +294,7 @@ class StartRequest(BaseModel):
     timeframe: str = "5m"
     execute: bool = True            # False = watch only (analyse, never order)
     confirm_live: bool = False      # the live tab's "Yes, trade real money" confirmation
+    accept_unready: bool = False    # go live although the paper scorecard isn't ready (explicit)
 
 
 def _ensure_portfolio(db: PortfolioManager, mode: str) -> None:
@@ -376,6 +379,18 @@ async def start_bot(mode: str, body: StartRequest, request: Request,
     blocked = start_block_reason(mode, body.execute)
     if blocked:
         raise HTTPException(status_code=400, detail=blocked)
+    if mode == "live" and body.execute and readiness_required():
+        # Manual starts only: an automatic restart of a bot you already started
+        # isn't a new decision to go live.
+        scorecard = await run_in_threadpool(live_readiness)
+        if not scorecard["ready"] and not body.accept_unready:
+            failing = [c["label"] for c in scorecard["checks"] if c["status"] == "fail"]
+            raise HTTPException(status_code=409, detail="Paper trading hasn't shown the strategy is ready for real "
+                                                        f"money yet ({', '.join(failing)}). Review 'Ready for real "
+                                                        "money?' on this tab, or confirm that you accept the risk.")
+        if not scorecard["ready"]:
+            logger.warning(f"{current_user.username} started the LIVE bot although the go-live scorecard is not "
+                           f"ready: {[c['label'] for c in scorecard['checks'] if c['status'] == 'fail']}")
     if body.execute:
         await run_in_threadpool(_ensure_portfolio, db, mode)
     try:
@@ -394,6 +409,30 @@ async def stop_bot(mode: str, current_user: User = Depends(get_admin_user),
     stopped = manager.stop_bot(mode)
     return {"stopping": stopped, "message": "Stopping after the current cycle; open positions keep their "
                                             "broker-side stops." if stopped else "The bot was not running."}
+
+
+def live_readiness(root: Path = PROJECT_ROOT) -> Dict[str, Any]:
+    """The go-live scorecard, built from the paper account's record."""
+    from core.readiness import assess, incident_and_fill_events
+
+    paths = mode_env("paper", root)
+    trades = load_live_trades(Path(paths["EDGE_MONITOR_STATE_PATH"]))
+    summary = summarize(trades)
+    edge = edge_report_summary()
+    try:
+        selftest = json.loads(selftest_path(root).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        selftest = {}
+    return assess(trades=trades, summary=summary,
+                  comparison=compare_with_backtest(summary, edge.get("metrics") if edge.get("passed") else None),
+                  edge=edge, selftest=selftest,
+                  events=incident_and_fill_events(Path(paths["EXECUTION_LOG_PATH"])))
+
+
+@router.get("/live/readiness")
+async def readiness(current_user: User = Depends(get_admin_user)):
+    """Ready for real money? The paper record as a go-live checklist."""
+    return await run_in_threadpool(live_readiness)
 
 
 class SelfTestRequest(BaseModel):
