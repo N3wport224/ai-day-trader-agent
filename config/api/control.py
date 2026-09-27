@@ -35,7 +35,8 @@ from config.api.settings import KEY_GROUPS, require_local
 from core.alpaca_executor import AlpacaExecutor, live_trading_armed
 from core.alpaca_executor_provider import clear_alpaca_executor_cache
 from core.bot_manager import MODES, PROJECT_ROOT, BotManager, clean_symbols, mode_env
-from core.performance import PERIODS, compare_with_backtest, equity_series, load_live_trades, summarize, trades_csv
+from core.performance import (PERIODS, attach_explanations, compare_with_backtest, equity_series,
+                              load_live_trades, summarize, trades_csv)
 from core.edge_gate import report_path
 from core.env_store import update_env
 from core.execution_telemetry import EventLog, default_alert_sink
@@ -545,8 +546,21 @@ async def last_paper_selftest(current_user: User = Depends(get_admin_user)):
         return {"overall": None, "steps": []}
 
 
+def _explained_trades(mode: str, root: Path = PROJECT_ROOT) -> List[Dict[str, Any]]:
+    """Closed trades with the entry reasoning and exit reason attached."""
+    from datetime import timedelta
+
+    from core.readiness import read_events
+
+    paths = mode_env(mode, root)
+    trades = load_live_trades(Path(paths["EDGE_MONITOR_STATE_PATH"]))
+    attach_explanations(trades, read_events(Path(paths["EXECUTION_LOG_PATH"]),
+                                            datetime.now(timezone.utc) - timedelta(days=400), {"entry_context"}))
+    return trades
+
+
 def _performance(mode: str, period: str, root: Path = PROJECT_ROOT) -> Dict[str, Any]:
-    trades = load_live_trades(Path(mode_env(mode, root)["EDGE_MONITOR_STATE_PATH"]))
+    trades = _explained_trades(mode, root)
     live = summarize(trades)
     edge = edge_report_summary()
     backtest = edge.get("metrics") if edge.get("passed") else None
@@ -587,7 +601,7 @@ async def performance(mode: str, period: str = "1M", current_user: User = Depend
 async def trades_csv_download(mode: str, current_user: User = Depends(get_admin_user),
                               manager: BotManager = Depends(get_bot_manager)):
     _check_mode(mode)
-    trades = load_live_trades(Path(mode_env(mode, manager.root)["EDGE_MONITOR_STATE_PATH"]))
+    trades = await run_in_threadpool(_explained_trades, mode, manager.root)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
     return Response(
         content=trades_csv(trades),

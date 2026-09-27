@@ -441,18 +441,33 @@ class AlpacaExecutor:
             self._record_submitted(order, symbol, "buy", decision.quantity, decision.stop_loss,
                                    decision.take_profit, expected_price=price)
             if not chasing:
+                self._record_context(signal, symbol, [order.get("id")], decision.stop_loss, decision.take_profit)
                 return ExecutionResult(order=order)
         except requests.exceptions.HTTPError as exc:
             return self._recover_from_rejection(exc, action, symbol, decision.quantity, price)
         try:
-            return self._chase_entry(order, symbol, decision.quantity, decision.stop_loss,
-                                     decision.take_profit, arrival_ask)
+            result = self._chase_entry(order, symbol, decision.quantity, decision.stop_loss,
+                                       decision.take_profit, arrival_ask)
+            if result.order:
+                chase = result.chase
+                self._record_context(signal, symbol, [order.get("id"), chase.order_id if chase else None],
+                                     (chase.stop if chase else None) or decision.stop_loss,
+                                     (chase.target if chase else None) or decision.take_profit)
+            return result
         except Exception as exc:
             # The order is live with its bracket; the TTL sweep still cancels it if unfilled.
             logger.error(f"Entry chase for {symbol} failed ({exc}); order left working with its bracket")
             self.telemetry.record("entry_chase_error", logging.ERROR, symbol=symbol,
                                   order_id=order.get("id"), error=str(exc))
             return ExecutionResult(order=order)
+
+    def _record_context(self, signal: Dict, symbol: str, order_ids: List[Optional[str]],
+                        stop: Optional[float], target: Optional[float]) -> None:
+        """Why this entry was taken, for the trade journal (joined by order id)."""
+        self.telemetry.record("entry_context", symbol=symbol,
+                              order_ids=[i for i in dict.fromkeys(order_ids) if i],
+                              stop=stop, target=target, confidence=signal.get("confidence"),
+                              context=signal.get("decision_context") or {"reasons": [signal.get("reason")]})
 
     def _chasing(self, arrival_ask: float) -> bool:
         """Smart limit entries need a live ask to price and re-peg against."""

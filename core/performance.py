@@ -13,9 +13,11 @@ import io
 import json
 import math
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+MARKET_TZ = ZoneInfo("America/New_York")
 MIN_TRADES_TO_JUDGE = 20
 PERIODS = {  # dashboard range -> (Alpaca period, bar timeframe)
     "1D": ("1D", "5Min"),
@@ -51,8 +53,72 @@ def load_live_trades(state_path: Path) -> List[Dict[str, Any]]:
             "pnl": round((exit_ - entry) * qty, 2),
             "return_pct": round((exit_ / entry - 1) * 100, 3) if entry else None,
             "r_multiple": round((exit_ - entry) / risk, 3) if risk > 0 else None,
+            "entry_order_id": t.get("entry_order_id"),
+            "exit_type": t.get("exit_type"),
         })
     return trades
+
+
+STOP_TYPES = {"stop", "stop_limit", "trailing_stop"}
+REGIME_WORDS = {"TRENDING_BULL": "uptrend", "TRENDING_BEAR": "downtrend", "CHOPPY": "choppy market"}
+
+
+def exit_reason(trade: Dict[str, Any]) -> Optional[str]:
+    """How a round trip ended, in plain words (None when unknown, e.g. older trades)."""
+    kind = str(trade.get("exit_type") or "").lower()
+    if not kind:
+        return None
+    try:
+        closed = datetime.fromisoformat(str(trade.get("exit_at")).replace("Z", "+00:00")).astimezone(MARKET_TZ)
+    except ValueError:
+        closed = None
+    if kind in STOP_TYPES:
+        if trade["exit_price"] > trade["entry_price"]:
+            return "Trailing stop: locked in profit"
+        return "Stop-loss hit"
+    if closed is not None and (closed.hour, closed.minute) >= (15, 49):
+        return "End-of-day close (never held overnight)"
+    if kind == "limit":
+        return "Take-profit hit"
+    return "Sold at market (sell signal or manual close)"
+
+
+def explain_entry(context: Dict[str, Any]) -> List[str]:
+    """What the bot saw when it bought, as short plain-language points."""
+    points = []
+    p, threshold = context.get("probability_up"), context.get("threshold")
+    if p is not None:
+        points.append(f"Model: {p * 100:.0f}% chance of reaching the target before the stop"
+                      + (f" (needs {threshold * 100:.0f}%)" if threshold else ""))
+    if context.get("regime") in REGIME_WORDS:
+        points.append(f"Market regime: {REGIME_WORDS[context['regime']]}")
+    if context.get("vwap_dist_pct") is not None:
+        side = "above" if context["vwap_dist_pct"] >= 0 else "below"
+        points.append(f"Price {abs(context['vwap_dist_pct']):.2f}% {side} VWAP"
+                      + (f" ({context['vwap_zone']})" if context.get("vwap_zone") else ""))
+    if context.get("rvol") is not None:
+        points.append(f"Volume {context['rvol']:.1f}x normal for this time of day")
+    if context.get("above_orb_high"):
+        points.append("Trading above the opening range (breakout)")
+    if context.get("minutes_from_open") is not None:
+        points.append(f"{context['minutes_from_open']:.0f} min after the open")
+    if context.get("market_ok") == 0.0:
+        points.append("Note: the overall market (SPY) was weak")
+    if not points:
+        points = [r for r in context.get("reasons") or [] if r]
+    return points
+
+
+def attach_explanations(trades: List[Dict[str, Any]], context_events: List[Dict[str, Any]]) -> None:
+    """Add "why" (entry reasoning) and "exit_reason" to each trade, in place."""
+    by_order: Dict[str, Dict[str, Any]] = {}
+    for event in context_events:
+        for order_id in event.get("order_ids") or []:
+            by_order[order_id] = event
+    for trade in trades:
+        event = by_order.get(trade.get("entry_order_id") or "")
+        trade["why"] = explain_entry(event.get("context") or {}) if event else []
+        trade["exit_reason"] = exit_reason(trade)
 
 
 def summarize(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -125,7 +191,7 @@ def equity_series(history: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 CSV_COLUMNS = ["symbol", "qty", "entry_at", "entry_price", "exit_at", "exit_price", "stop_price",
-               "pnl", "return_pct", "r_multiple"]
+               "pnl", "return_pct", "r_multiple", "exit_reason", "why"]
 
 
 def trades_csv(trades: List[Dict[str, Any]]) -> str:
@@ -133,5 +199,6 @@ def trades_csv(trades: List[Dict[str, Any]]) -> str:
     writer = csv.DictWriter(out, fieldnames=CSV_COLUMNS, extrasaction="ignore")
     writer.writeheader()
     for trade in trades:
-        writer.writerow({k: ("" if trade.get(k) is None else trade.get(k)) for k in CSV_COLUMNS})
+        row = {**trade, "why": "; ".join(trade.get("why") or [])}
+        writer.writerow({k: ("" if row.get(k) is None else row.get(k)) for k in CSV_COLUMNS})
     return out.getvalue()

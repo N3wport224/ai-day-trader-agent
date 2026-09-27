@@ -780,11 +780,15 @@ const Control = (() => {
     const trades = p.recent_trades || [];
     $(`${mode}-journal-count`).textContent = trades.length ? `(latest ${trades.length})` : '(none yet)';
     $(`${mode}-journal`).innerHTML = trades.length
-      ? `<table class="table journal-table"><thead><tr><th>Symbol</th><th>Shares</th><th>Entry</th><th>Exit</th><th>P&amp;L</th><th>R</th><th>Closed</th></tr></thead><tbody>
+      ? `<table class="table journal-table"><thead><tr><th>Symbol</th><th>Shares</th><th>Entry</th><th>Exit</th><th>P&amp;L</th><th>R</th><th>How it ended</th><th>Closed</th><th>Why it bought</th></tr></thead><tbody>
         ${trades.map((t) => `<tr><td class="mono">${esc(t.symbol)}</td><td>${esc(t.qty)}</td><td>${money(t.entry_price)}</td>
           <td>${money(t.exit_price)}</td><td class="${signCls(t.pnl)}">${money(t.pnl)}</td>
           <td>${t.r_multiple == null ? '—' : (t.r_multiple >= 0 ? '+' : '') + Number(t.r_multiple).toFixed(2)}</td>
-          <td>${t.exit_at ? esc(new Date(t.exit_at).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })) : ''}</td></tr>`).join('')}
+          <td>${esc(t.exit_reason || '—')}</td>
+          <td>${t.exit_at ? esc(new Date(t.exit_at).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })) : ''}</td>
+          <td>${(t.why || []).length
+            ? `<details class="why"><summary>Why</summary><ul>${t.why.map((w) => `<li>${esc(w)}</li>`).join('')}</ul></details>`
+            : '<span class="muted small">not recorded</span>'}</td></tr>`).join('')}
         </tbody></table>`
       : '<div class="empty-state">Closed trades appear here. R = profit measured in units of the risk taken (1R = the stop distance).</div>';
   }

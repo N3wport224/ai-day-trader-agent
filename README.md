@@ -125,7 +125,12 @@ Git checkouts update with `git pull --ff-only`. It refuses if you've edited trac
   the validation test predicted;
 - a plain-language verdict: *on track*, *keep watching*, *behind the test* or *too early
   to tell* (it needs about 20 trades before judging);
-- a trade journal with CSV download.
+- a trade journal with CSV download. Each trade shows **how it ended**: take-profit,
+  stop-loss, a trailing stop that locked in profit, the end-of-day close, or a sell
+  signal. It also shows **why the bot bought**: the model's probability against its
+  threshold, the market regime, the price against VWAP, relative volume, an
+  opening-range breakout and the time since the open. Trades from before this was
+  added show "not recorded".
 
 **Staying validated.** The validation expires after 30 days. Once it's 7 days old, the
 dashboard re-runs it automatically, with the settings you last used, outside market hours

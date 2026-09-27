@@ -50,6 +50,31 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _decision_context(ml: MLSignal, latest: pd.Series, threshold: Optional[float]) -> Dict[str, Any]:
+    """What the bot saw when it decided (for the trade journal's "why")."""
+    from core.features import vwap_zone
+
+    def num(key: str, digits: int = 4) -> Optional[float]:
+        value = latest.get(key)
+        return None if value is None or pd.isna(value) else round(float(value), digits)
+
+    return {
+        "probability_up": round(ml.probability_up, 4),
+        "threshold": threshold,
+        "mode": ml.mode,
+        "regime": ml.regime,
+        "vwap_zone": vwap_zone(latest.get("vwap_z")),
+        "vwap_dist_pct": None if num("vwap_dist") is None else round(num("vwap_dist") * 100, 2),
+        "rvol": num("rvol", 2),
+        "minutes_from_open": num("minutes_from_open", 0),
+        "above_orb_high": None if num("close_vs_orb_high") is None else num("close_vs_orb_high") > 0,
+        "macro_aligned": ml.macro_aligned,
+        "market_ok": ml.market_ok,
+        "sentiment": ml.sentiment.score if ml.sentiment.available else None,
+        "reasons": list(ml.reasons),
+    }
+
+
 class MLSignalEngine:
     """Callable with the TradingWorkflow ``AnalysisRunner`` signature."""
 
@@ -259,6 +284,7 @@ class MLSignalEngine:
                 "ml": ml.as_dict(),
             },
             "portfolio_context": {"portfolio_name": portfolio_name},
+            "decision_context": _decision_context(ml, latest, getattr(self.strategy, "threshold", None)),
         }
 
     @staticmethod

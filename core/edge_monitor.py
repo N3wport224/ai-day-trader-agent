@@ -52,6 +52,9 @@ class LiveTrade:
     stop_price: Optional[float]
     entry_at: str
     exit_at: str
+    entry_order_id: Optional[str] = None
+    exit_order_id: Optional[str] = None
+    exit_type: Optional[str] = None      # the closing order's type: stop / limit / market / trailing_stop
 
     @property
     def pnl(self) -> float:
@@ -109,7 +112,8 @@ class EdgeMonitor:
         except (OSError, ValueError):
             return
         self.open_lots = state.get("open_lots") or {}
-        self.trades = [LiveTrade(**t) for t in state.get("trades") or []]
+        fields = set(LiveTrade.__dataclass_fields__)
+        self.trades = [LiveTrade(**{k: v for k, v in t.items() if k in fields}) for t in state.get("trades") or []]
         self.paused = state.get("paused")
 
     def _save(self) -> None:
@@ -143,14 +147,15 @@ class EdgeMonitor:
             lots = self.open_lots.setdefault(fill.symbol, [])
             if fill.side == "buy":
                 lots.append({"qty": fill.qty, "price": fill.fill_price, "stop": fill.stop_price,
-                             "at": fill.filled_at})
+                             "at": fill.filled_at, "order_id": fill.order_id})
                 continue
             remaining = fill.qty
             while remaining > 1e-9 and lots:
                 lot = lots[0]
                 take = min(remaining, lot["qty"])
                 closed.append(LiveTrade(fill.symbol, take, lot["price"], fill.fill_price, lot["stop"],
-                                        lot["at"], fill.filled_at))
+                                        lot["at"], fill.filled_at, lot.get("order_id"), fill.order_id,
+                                        fill.order_type))
                 lot["qty"] -= take
                 remaining -= take
                 if lot["qty"] <= 1e-9:

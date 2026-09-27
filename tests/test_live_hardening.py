@@ -126,7 +126,8 @@ def test_executor_records_expected_price_for_fills(monkeypatch, executor) -> Non
     monkeypatch.setattr(AlpacaExecutor, "get_orders_today", lambda self: [])
     executor.submit({"symbol": "AAPL", "recommendation": "BUY", "quantity": 10})
     assert executor.expected_prices == {"o1": 100.0}
-    assert executor.telemetry.events[-1]["expected_price"] == 100.0
+    submitted = [e for e in executor.telemetry.events if e["event"] == "order_submitted"][-1]
+    assert submitted["expected_price"] == 100.0
 
 
 def test_backtester_applies_cooldown_after_stop_out() -> None:
